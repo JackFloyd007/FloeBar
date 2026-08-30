@@ -113,10 +113,12 @@ final class LayoutBarPaddingView: NSView {
             return
         }
         Task {
-            try await Task.sleep(for: .milliseconds(25))
             do {
+                try await Task.sleep(for: .milliseconds(25))
                 try await appState.itemManager.move(item: item, to: destination)
                 appState.itemManager.removeTemporarilyShownItemFromCache(with: item.tag)
+            } catch is CancellationError {
+                return
             } catch {
                 Logger.default.error("Error moving menu bar item: \(error, privacy: .public)")
                 let alert = NSAlert(error: error)
@@ -128,10 +130,12 @@ final class LayoutBarPaddingView: NSView {
     private func move(item: MenuBarItem, toSection section: MenuBarSection.Name) {
         guard let appState = container.appState else { return }
         Task {
-            try? await Task.sleep(for: .milliseconds(25))
             do {
+                try await Task.sleep(for: .milliseconds(25))
                 try await appState.itemManager.move(item: item, toSection: section)
                 appState.itemManager.removeTemporarilyShownItemFromCache(with: item.tag)
+            } catch is CancellationError {
+                return
             } catch {
                 Logger.default.error("Error moving menu bar item: \(error, privacy: .public)")
                 NSAlert(error: error).runModal()

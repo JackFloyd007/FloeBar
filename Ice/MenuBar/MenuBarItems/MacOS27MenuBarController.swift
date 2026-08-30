@@ -326,10 +326,12 @@ final class MacOS27MenuBarController {
     func knownItemsForReordering() -> [MenuBarItem] {
         Array(
             Dictionary(
-                (lastSourceItems + lastManagedItems + Array(snapshots.values)).map {
+                (Array(snapshots.values) + lastSourceItems + lastManagedItems + lastLiveItems).map {
                     ($0.tag.persistentIdentifier, $0)
                 },
-                uniquingKeysWith: { current, _ in current }
+                // Later arrays are progressively fresher. Never let a retained
+                // concealed snapshot overwrite a newly published AX frame.
+                uniquingKeysWith: { _, newer in newer }
             ).values
         )
     }

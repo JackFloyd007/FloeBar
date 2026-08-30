@@ -144,6 +144,12 @@ final class ControlItem {
     /// Storage for internal observers.
     private var cancellables = Set<AnyCancellable>()
 
+    /// Restores the normal status-item length after a one-frame macOS 27
+    /// MenuBarAgent layout invalidation.
+    private var macOS27PositionRefreshTask: Task<Void, Never>?
+    private var macOS27PositionRefreshBaseline: CGFloat?
+    private var macOS27PositionRefreshGeneration = 0
+
     /// The control item's underlying status item.
     private var statusItem: NSStatusItem {
         storage.statusItem
@@ -424,6 +430,63 @@ final class ControlItem {
                 button.appearsDisabled = true
                 button.isHighlighted = false
             }
+        }
+    }
+
+    /// Makes MenuBarAgent consume a synchronized preferred-position update
+    /// without restarting it or moving the pointer. Switching the visible Ice
+    /// item from variable length to its already-rendered width invalidates the
+    /// hosted layout while keeping the item's geometry unchanged.
+    func requestMacOS27PositionRefresh() {
+        guard #available(macOS 27.0, *), identifier == .visible else { return }
+
+        macOS27PositionRefreshGeneration += 1
+        let generation = macOS27PositionRefreshGeneration
+        macOS27PositionRefreshTask?.cancel()
+        if let baseline = macOS27PositionRefreshBaseline {
+            statusItem.length = baseline
+            macOS27PositionRefreshBaseline = nil
+        }
+
+        macOS27PositionRefreshTask = Task { @MainActor [weak self] in
+            // Let cfprefsd deliver the cross-process write before asking
+            // MenuBarAgent to recalculate the hosted item order.
+            try? await Task.sleep(for: .milliseconds(50))
+            guard
+                let self,
+                !Task.isCancelled,
+                generation == macOS27PositionRefreshGeneration
+            else {
+                return
+            }
+
+            let baseline = statusItem.length
+            let renderedWidth = statusItem.button?.bounds.width ?? 0
+            guard renderedWidth > 0 else {
+                macOS27PositionRefreshTask = nil
+                return
+            }
+            let temporaryLength = if
+                baseline == NSStatusItem.variableLength ||
+                abs(baseline - renderedWidth) > 0.25
+            {
+                renderedWidth
+            } else {
+                renderedWidth + 0.5
+            }
+
+            macOS27PositionRefreshBaseline = baseline
+            statusItem.length = temporaryLength
+            try? await Task.sleep(for: .milliseconds(16))
+            guard
+                !Task.isCancelled,
+                generation == macOS27PositionRefreshGeneration
+            else {
+                return
+            }
+            statusItem.length = baseline
+            macOS27PositionRefreshBaseline = nil
+            macOS27PositionRefreshTask = nil
         }
     }
 

@@ -12,17 +12,29 @@ enum AXHelpers {
         qos: .userInteractive
     )
 
+    /// Child AX elements do not inherit a timeout set on an application's
+    /// root element. Configure the process-wide fallback once so a child that
+    /// disappears while MenuBarAgent is recomposing cannot block the serialized
+    /// scan for the Accessibility API's multi-second default timeout.
+    private static let globalMessagingTimeoutConfiguration: Void = {
+        AXUIElementSetMessagingTimeout(systemWideElement.element, 0.25)
+    }()
+
     @discardableResult
     static func isProcessTrusted(prompt: Bool = false) -> Bool {
         queue.sync { checkIsProcessTrusted(prompt: prompt) }
     }
 
     static func element(at point: CGPoint) -> UIElement? {
-        queue.sync { try? systemWideElement.elementAtPosition(Float(point.x), Float(point.y)) }
+        queue.sync {
+            _ = globalMessagingTimeoutConfiguration
+            return try? systemWideElement.elementAtPosition(Float(point.x), Float(point.y))
+        }
     }
 
     static func application(for runningApp: NSRunningApplication) -> Application? {
         queue.sync {
+            _ = globalMessagingTimeoutConfiguration
             let application = Application(runningApp)
             if let application {
                 // A stalled application's accessibility server must not block

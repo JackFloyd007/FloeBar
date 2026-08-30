@@ -50,9 +50,7 @@ enum MacOS27MenuBarItemProvider {
         defer { operationLock.unlock() }
 
         guard AXHelpers.isProcessTrusted(), !sourcePIDs.isEmpty else { return [] }
-        let applications = NSWorkspace.shared.runningApplications.filter {
-            sourcePIDs.contains($0.processIdentifier)
-        }
+        let applications = sourcePIDs.compactMap(NSRunningApplication.init(processIdentifier:))
         return menuBarItems(from: applications, displayBounds: nil)
     }
 
@@ -88,9 +86,9 @@ enum MacOS27MenuBarItemProvider {
 
                 let descendants = AXHelpers.children(for: child)
                 let identifier = nonEmpty(AXHelpers.identifier(for: child))
-                    ?? descendants.lazy.compactMap { nonEmpty(AXHelpers.identifier(for: $0)) }.first
+                    ?? descendants.compactMap { nonEmpty(AXHelpers.identifier(for: $0)) }.first
                 let accessibilityDescription = nonEmpty(AXHelpers.description(for: child))
-                    ?? descendants.lazy.compactMap { nonEmpty(AXHelpers.description(for: $0)) }.first
+                    ?? descendants.compactMap { nonEmpty(AXHelpers.description(for: $0)) }.first
                 let accessibilityTitle = nonEmpty(AXHelpers.title(for: child))
                 let fallbackTitle = "Item-\(fallbackIndex)"
                 let displayTitle = accessibilityTitle ?? accessibilityDescription ?? identifier ?? fallbackTitle
@@ -138,9 +136,9 @@ enum MacOS27MenuBarItemProvider {
                 }
                 let descendants = AXHelpers.children(for: child)
                 let identifier = nonEmpty(AXHelpers.identifier(for: child))
-                    ?? descendants.lazy.compactMap { nonEmpty(AXHelpers.identifier(for: $0)) }.first
+                    ?? descendants.compactMap { nonEmpty(AXHelpers.identifier(for: $0)) }.first
                 let accessibilityDescription = nonEmpty(AXHelpers.description(for: child))
-                    ?? descendants.lazy.compactMap { nonEmpty(AXHelpers.description(for: $0)) }.first
+                    ?? descendants.compactMap { nonEmpty(AXHelpers.description(for: $0)) }.first
                 let title = identifier
                     ?? accessibilityDescription
                     ?? nonEmpty(AXHelpers.title(for: child))

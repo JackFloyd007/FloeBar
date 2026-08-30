@@ -400,6 +400,14 @@ final class MenuBarManager: ObservableObject {
     func controlItem(withName name: MenuBarSection.Name) -> ControlItem? {
         section(withName: name)?.controlItem
     }
+
+    /// Invalidates MenuBarAgent's hosted status-item layout after Ice writes
+    /// macOS 27 preferred positions. The visible control remains the stable
+    /// user-facing anchor while the compositor re-sorts surrounding items.
+    func requestMacOS27PositionRefresh() {
+        guard #available(macOS 27.0, *) else { return }
+        controlItem(withName: .visible)?.requestMacOS27PositionRefresh()
+    }
 }
 
 // MARK: - MenuBarAverageColorInfo

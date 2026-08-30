@@ -168,51 +168,71 @@ enum MacOS27MenuBarAgentPositionStore {
     ) -> Bool {
         var positions = readPositions()
         let keys = Array(positions.keys)
+        let currentOrder = liveItems.sorted { lhs, rhs in
+            if lhs.bounds.minX == rhs.bounds.minX {
+                return lhs.bounds.minY < rhs.bounds.minY
+            }
+            return lhs.bounds.minX < rhs.bounds.minX
+        }
         guard
-            let itemKey = resolveKey(for: item, existingKeys: keys),
-            let targetKey = resolveKey(for: destination.targetItem, existingKeys: keys),
-            let targetWeight = positions[targetKey]
+            let sourceIndex = currentOrder.firstIndex(where: { $0.tag == item.tag })
         else {
             return false
         }
 
-        let ordered = liveItems
-            .filter { $0.tag != item.tag }
-            .sorted { $0.bounds.minX < $1.bounds.minX }
-        guard let targetIndex = ordered.firstIndex(where: { $0.tag == destination.targetItem.tag }) else {
+        var desiredOrder = currentOrder
+        let movedItem = desiredOrder.remove(at: sourceIndex)
+        guard let targetIndex = desiredOrder.firstIndex(where: {
+            $0.tag == destination.targetItem.tag
+        }) else {
             return false
         }
-
-        let farItem: MenuBarItem? = switch destination {
-        case .leftOfItem:
-            targetIndex > ordered.startIndex ? ordered[targetIndex - 1] : nil
-        case .rightOfItem:
-            targetIndex + 1 < ordered.endIndex ? ordered[targetIndex + 1] : nil
+        let insertionIndex = switch destination {
+        case .leftOfItem: targetIndex
+        case .rightOfItem: targetIndex + 1
         }
+        desiredOrder.insert(movedItem, at: insertionIndex)
+        guard desiredOrder.map(\.tag) != currentOrder.map(\.tag) else { return true }
 
-        let newWeight: Double
-        if
-            let farItem,
-            let farKey = resolveKey(for: farItem, existingKeys: keys),
-            let farWeight = positions[farKey],
-            farWeight != targetWeight
-        {
-            newWeight = targetWeight + (farWeight - targetWeight) / 2
-        } else {
-            let weightsIncreaseRight = observedWeightsIncreaseRight(
-                liveItems: liveItems,
-                positions: positions,
-                keys: keys
-            )
-            let rightward = if case .rightOfItem = destination { true } else { false }
-            let delta = rightward == weightsIncreaseRight ? 10.0 : -10.0
-            newWeight = targetWeight + delta
+        // Treat the existing weights as physical slots and rotate the item
+        // identities through those slots. Midpoint insertion eventually runs
+        // out of precision and can also cross an unrelated owner-specific
+        // rank; permuting the already accepted weights works for adjacent and
+        // multi-icon moves without inventing any new rank.
+        let lowerBound = min(sourceIndex, insertionIndex)
+        let upperBound = max(sourceIndex, insertionIndex)
+        let currentSegment = currentOrder[lowerBound ... upperBound]
+        let desiredSegment = desiredOrder[lowerBound ... upperBound]
+
+        var slotWeights = [Double]()
+        var resolvedKeys = [String]()
+        for currentItem in currentSegment {
+            guard
+                let key = resolveKey(for: currentItem, existingKeys: keys),
+                let weight = positions[key]
+            else {
+                return false
+            }
+            resolvedKeys.append(key)
+            slotWeights.append(weight)
         }
+        guard Set(resolvedKeys).count == resolvedKeys.count else { return false }
 
-        guard positions[itemKey] != newWeight else { return true }
-        positions[itemKey] = newWeight
+        var changedKeys = [String]()
+        for (desiredItem, slotWeight) in zip(desiredSegment, slotWeights) {
+            guard let key = resolveKey(for: desiredItem, existingKeys: keys) else {
+                return false
+            }
+            if positions[key] != slotWeight {
+                positions[key] = slotWeight
+                changedKeys.append(key)
+            }
+        }
+        guard !changedKeys.isEmpty else { return true }
         writePositions(positions)
-        logger.info("Reordered \(item.logString, privacy: .public) using \(itemKey, privacy: .public)")
+        logger.info(
+            "Reordered \(item.logString, privacy: .public) across \(changedKeys.count, privacy: .public) preferred-position slots"
+        )
         return true
     }
 
@@ -452,6 +472,29 @@ enum MacOS27MenuBarAgentPositionStore {
         let bundleIdentifier = item.sourceApplication?.bundleIdentifier
             ?? item.owningApplication?.bundleIdentifier
             ?? item.tag.namespace.description
+
+        // Golden Gate's Spotlight/Siri host publishes localized AX names but
+        // persists opaque Item-N keys. `搜索` is the visible Spotlight control
+        // on the tested macOS 27 builds; resolving it explicitly avoids the
+        // three same-owner candidates left behind by older system revisions.
+        if bundleIdentifier == "com.apple.campo" {
+            let identity = [item.tag.title, item.title]
+                .compactMap { $0?.lowercased() }
+                .joined(separator: " ")
+            let aliases: [String]
+            if identity.contains("spotlight") || identity.contains("search") || identity.contains("搜索") {
+                aliases = ["Item-0"]
+            } else if identity.contains("siri") {
+                aliases = ["Item-1"]
+            } else {
+                aliases = []
+            }
+            for alias in aliases {
+                let key = "status:\(bundleIdentifier)::\(alias)"
+                if existingKeys.contains(key) { return key }
+            }
+        }
+
         let exact = "status:\(bundleIdentifier)::\(item.tag.title)"
         if existingKeys.contains(exact) { return exact }
 

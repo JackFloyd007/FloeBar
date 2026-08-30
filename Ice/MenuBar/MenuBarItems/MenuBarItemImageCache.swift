@@ -248,7 +248,8 @@ final class MenuBarItemImageCache: ObservableObject {
         of items: [MenuBarItem],
         displayID: CGDirectDisplayID,
         exactItemTags: Set<MenuBarItemTag>,
-        fallbackScale: CGFloat
+        fallbackScale: CGFloat,
+        allowSemanticFallback: Bool = true
     ) async -> CaptureResult {
         let capturable = items.filter { !$0.isControlItem || $0.tag == .visibleControlItem }
         guard !capturable.isEmpty else { return CaptureResult() }
@@ -268,12 +269,25 @@ final class MenuBarItemImageCache: ObservableObject {
             )
             var cropOwners = [CGRect: MenuBarItemTag]()
 
+            // Layout reveals concealed items before capture. Refresh their AX
+            // frames here so each crop follows the icon's current physical
+            // position rather than its last hidden snapshot.
+            let sourcePIDs = Set(exactItems.map { $0.sourcePID ?? $0.ownerPID })
+            let liveItems = await Task.detached(priority: .userInitiated) {
+                MacOS27MenuBarItemProvider.menuBarItems(sourcePIDs: sourcePIDs)
+            }.value
+            let liveItemsByTag = Dictionary(
+                liveItems.map { ($0.tag, $0) },
+                uniquingKeysWith: { current, _ in current }
+            )
+
             for item in exactItems {
+                let liveItem = liveItemsByTag[item.tag] ?? item
                 let rawCropRect = CGRect(
-                    x: (item.bounds.minX - capture.windowFrame.minX) * capture.scale,
-                    y: (item.bounds.minY - capture.windowFrame.minY) * capture.scale,
-                    width: item.bounds.width * capture.scale,
-                    height: item.bounds.height * capture.scale
+                    x: (liveItem.bounds.minX - capture.windowFrame.minX) * capture.scale,
+                    y: (liveItem.bounds.minY - capture.windowFrame.minY) * capture.scale,
+                    width: liveItem.bounds.width * capture.scale,
+                    height: liveItem.bounds.height * capture.scale
                 )
                 let expectedCropRect = rawCropRect.integral
                 let cropRect = expectedCropRect.intersection(imageBounds)
@@ -300,7 +314,9 @@ final class MenuBarItemImageCache: ObservableObject {
         }
 
         for item in capturable where result.images[item.tag] == nil {
-            if let fallback = menuBarReplicaImage(for: item, scale: fallbackScale) {
+            if allowSemanticFallback,
+               let fallback = menuBarReplicaImage(for: item, scale: fallbackScale)
+            {
                 result.images[item.tag] = fallback
             } else {
                 result.excluded.append(item)
@@ -555,7 +571,10 @@ final class MenuBarItemImageCache: ObservableObject {
                 of: allItems,
                 displayID: displayID,
                 exactItemTags: exactItemTags,
-                fallbackScale: scale
+                fallbackScale: scale,
+                // Layout must display the status item's real pixels. Showing a
+                // guessed SF Symbol here makes a failed capture look correct.
+                allowSemanticFallback: !isLayoutEditing
             )
             newImages = result.images
         } else {
@@ -586,6 +605,13 @@ final class MenuBarItemImageCache: ObservableObject {
                 new.isSemanticReplica && !old.isSemanticReplica ? old : new
             }
         }
+    }
+
+    /// Removes guessed macOS 27 images before the Layout editor requests an
+    /// exact capture, preventing an old replica from surviving a failed crop.
+    @MainActor
+    func removeSemanticReplicas() {
+        images = images.filter { !$0.value.isSemanticReplica }
     }
 
     /// Updates the cache for the given sections, if necessary.

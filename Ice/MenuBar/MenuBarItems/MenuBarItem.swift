@@ -129,6 +129,20 @@ struct MenuBarItem: CustomStringConvertible {
 
         lazy var bestName = sourceName ?? title
 
+        // macOS 27 hosts Spotlight in the `com.apple.campo` process, whose
+        // localized application name is "Siri" on current seeds. Prefer the
+        // button's own AX title so Layout does not label the magnifying-glass
+        // status item as Siri.
+        if sourceApplication.bundleIdentifier == "com.apple.campo" {
+            let normalizedTitle = title.lowercased()
+            if normalizedTitle.contains("spotlight") ||
+                normalizedTitle.contains("search") ||
+                title.contains("搜索")
+            {
+                return title
+            }
+        }
+
         guard !isBentoBox else {
             if tag == .controlCenter {
                 return bestName
