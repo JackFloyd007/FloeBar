@@ -22,7 +22,7 @@ final class ControlItem {
 
         /// A tag for the control item with this identifier.
         var tag: MenuBarItemTag {
-            switch self {
+            return switch self {
             case .visible: .visibleControlItem
             case .hidden: .hiddenControlItem
             case .alwaysHidden: .alwaysHiddenControlItem
@@ -32,7 +32,12 @@ final class ControlItem {
         /// Returns the length associated with this identifier and
         /// the given hiding state.
         func length(for state: HidingState) -> CGFloat {
-            switch self {
+            if #available(macOS 27.0, *) {
+                // macOS 27 no longer reflows adjacent items around an oversized
+                // status item. Logical section hiding is handled separately.
+                return Lengths.standard
+            }
+            return switch self {
             case .visible:
                 Lengths.standard
             case .hidden, .alwaysHidden:
@@ -70,6 +75,7 @@ final class ControlItem {
             self.statusItem.autosaveName = controlItem.identifier.rawValue
 
             if let button = statusItem.button {
+                button.setAccessibilityIdentifier(controlItem.identifier.rawValue)
                 // This could break in a new macOS release, but we need this constraint in order to
                 // be able to hide the status item when the `ShowSectionDividers` setting is disabled.
                 // A previous implementation used `statusItem.isVisible`, which was more robust, but
@@ -429,6 +435,26 @@ final class ControlItem {
         }
     }
 
+    /// Re-publishes Ice's visible status item after a macOS 27 assessment-mode
+    /// reflow. MenuBarAgent can temporarily drop an otherwise-allowed item.
+    func restoreAfterMacOS27RestrictionChange() {
+        guard #available(macOS 27.0, *), identifier == .visible, let appState else {
+            return
+        }
+        guard appState.settings.general.showIceIcon else { return }
+
+        let autosaveName = identifier.rawValue
+        ControlItemDefaults[.visible, autosaveName] = true
+        ControlItemDefaults[.visibleCC, autosaveName] = true
+        if let position = ControlItemDefaults[.preferredPosition, autosaveName], position <= 0 {
+            ControlItemDefaults[.preferredPosition, autosaveName] = nil
+        }
+        statusItem.isVisible = true
+        constraint?.isActive = true
+        statusItem.length = identifier.length(for: state)
+        updateStatusItem()
+    }
+
     /// Adds the control item to the menu bar.
     private func addToMenuBar() {
         guard !isAddedToMenuBar else {
@@ -664,6 +690,17 @@ enum ControlItemDefaults {
             ControlItemDefaults[.visibleCC, autosaveName] == nil
         {
             ControlItemDefaults[.visibleCC, autosaveName] = true
+        }
+        if #available(macOS 27.0, *), controlItem.identifier != .alwaysHidden {
+            ControlItemDefaults[.visible, autosaveName] = true
+            ControlItemDefaults[.visibleCC, autosaveName] = true
+            if
+                controlItem.identifier == .visible,
+                let position = ControlItemDefaults[.preferredPosition, autosaveName],
+                position <= 0
+            {
+                ControlItemDefaults[.preferredPosition, autosaveName] = nil
+            }
         }
     }
 }

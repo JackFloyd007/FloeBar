@@ -28,6 +28,29 @@ struct MenuBarItem: CustomStringConvertible {
     /// A Boolean value that indicates whether the item is on screen.
     let isOnScreen: Bool
 
+    /// Creates a structural item from a non-WindowServer provider.
+    ///
+    /// macOS 27 menu bar items are composited by MenuBarAgent and no longer
+    /// have individual WindowServer windows, so the accessibility provider
+    /// supplies these fields directly.
+    init(
+        tag: MenuBarItemTag,
+        windowID: CGWindowID,
+        ownerPID: pid_t,
+        sourcePID: pid_t?,
+        bounds: CGRect,
+        title: String?,
+        isOnScreen: Bool
+    ) {
+        self.tag = tag
+        self.windowID = windowID
+        self.ownerPID = ownerPID
+        self.sourcePID = sourcePID
+        self.bounds = bounds
+        self.title = title
+        self.isOnScreen = isOnScreen
+    }
+
     /// A Boolean value that indicates whether this item can be moved.
     var isMovable: Bool {
         tag.isMovable
@@ -269,10 +292,14 @@ extension MenuBarItem {
     ///   - option: Options that filter the returned list. Pass an empty option set
     ///     to return all available menu bar items.
     static func getMenuBarItems(on display: CGDirectDisplayID? = nil, option: ListOption) async -> [MenuBarItem] {
-        if #available(macOS 26.0, *) {
-            await getMenuBarItemsExperimental(on: display, option: option)
+        if #available(macOS 27.0, *) {
+            return await Task.detached(priority: .userInitiated) {
+                MacOS27MenuBarItemProvider.menuBarItems(on: display, option: option)
+            }.value
+        } else if #available(macOS 26.0, *) {
+            return await getMenuBarItemsExperimental(on: display, option: option)
         } else {
-            getMenuBarItemsLegacyMethod(on: display, option: option)
+            return getMenuBarItemsLegacyMethod(on: display, option: option)
         }
     }
 }
@@ -313,6 +340,7 @@ private extension MenuBarItemTag {
     init(uncheckedItemWindow itemWindow: WindowInfo) {
         self.namespace = Namespace(uncheckedItemWindow: itemWindow)
         self.title = itemWindow.title ?? ""
+        self.instanceIndex = 0
     }
 
     /// Creates a tag without checks.
@@ -324,6 +352,7 @@ private extension MenuBarItemTag {
     init(uncheckedItemWindow itemWindow: WindowInfo, sourcePID: pid_t?) {
         self.namespace = Namespace(uncheckedItemWindow: itemWindow, sourcePID: sourcePID)
         self.title = itemWindow.title ?? ""
+        self.instanceIndex = 0
     }
 }
 

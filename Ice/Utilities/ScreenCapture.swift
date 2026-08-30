@@ -4,7 +4,7 @@
 //
 
 import CoreGraphics
-import ScreenCaptureKit
+@preconcurrency import ScreenCaptureKit
 
 /// A namespace for screen capture operations.
 enum ScreenCapture {
@@ -90,5 +90,102 @@ enum ScreenCapture {
     ///   - option: Options that specify which parts of the window are captured.
     static func captureWindow(with windowID: CGWindowID, screenBounds: CGRect? = nil, option: CGWindowImageOption = []) -> CGImage? {
         captureWindows(with: [windowID], screenBounds: screenBounds, option: option)
+    }
+
+    // MARK: macOS 27 MenuBarAgent Capture
+
+    @available(macOS 27.0, *)
+    struct MenuBarHostingCapture {
+        let image: CGImage
+        let windowFrame: CGRect
+        let scale: CGFloat
+    }
+
+    /// Captures the full-width MenuBarAgent window that composites status
+    /// items on macOS 27. Falls back to the top strip of the display if the
+    /// private hosting window is not exposed by ScreenCaptureKit.
+    @available(macOS 27.0, *)
+    static func captureMenuBarHostingWindow(
+        displayID: CGDirectDisplayID
+    ) async -> MenuBarHostingCapture? {
+        let content: SCShareableContent
+        do {
+            content = try await shareableContent()
+        } catch {
+            return nil
+        }
+
+        guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
+            return nil
+        }
+        let displayFrame = display.frame
+        let hostingWindow = content.windows
+            .filter { window in
+                window.owningApplication?.bundleIdentifier == "com.apple.MenuBarAgent" &&
+                window.frame.height > 0 &&
+                window.frame.height <= 40 &&
+                window.frame.width > displayFrame.width * 0.8 &&
+                abs(window.frame.minX - displayFrame.minX) < 2 &&
+                abs(window.frame.minY - displayFrame.minY) < 2
+            }
+            .max { $0.windowID < $1.windowID }
+
+        let filter: SCContentFilter
+        let captureFrame: CGRect
+        let configuration = SCStreamConfiguration()
+        configuration.showsCursor = false
+
+        if let hostingWindow {
+            filter = SCContentFilter(desktopIndependentWindow: hostingWindow)
+            captureFrame = hostingWindow.frame
+            configuration.ignoreShadowsSingleWindow = true
+        } else {
+            filter = SCContentFilter(display: display, excludingWindows: [])
+            captureFrame = CGRect(
+                x: displayFrame.minX,
+                y: displayFrame.minY,
+                width: displayFrame.width,
+                height: min(40, displayFrame.height)
+            )
+            configuration.sourceRect = CGRect(
+                x: 0,
+                y: 0,
+                width: captureFrame.width,
+                height: captureFrame.height
+            )
+        }
+
+        let scale = CGFloat(filter.pointPixelScale)
+        configuration.width = Int((captureFrame.width * scale).rounded())
+        configuration.height = Int((captureFrame.height * scale).rounded())
+
+        do {
+            let image = try await SCScreenshotManager.captureImage(
+                contentFilter: filter,
+                configuration: configuration
+            )
+            return MenuBarHostingCapture(image: image, windowFrame: captureFrame, scale: scale)
+        } catch {
+            return nil
+        }
+    }
+
+    @available(macOS 27.0, *)
+    private static func shareableContent() async throws -> SCShareableContent {
+        try await withCheckedThrowingContinuation { continuation in
+            SCShareableContent.getWithCompletionHandler { content, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else if let content {
+                    continuation.resume(returning: content)
+                } else {
+                    continuation.resume(throwing: CaptureError.noShareableContent)
+                }
+            }
+        }
+    }
+
+    private enum CaptureError: Error {
+        case noShareableContent
     }
 }

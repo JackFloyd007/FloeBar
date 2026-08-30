@@ -187,6 +187,10 @@ final class MenuBarItemImageCache: ObservableObject {
 
     /// Captures the images of the given menu bar items and returns the result.
     private nonisolated func captureImages(of items: [MenuBarItem], scale: CGFloat, appState: AppState) async -> CaptureResult {
+        if #available(macOS 27.0, *) {
+            return await captureMacOS27Images(of: items, fallbackScale: scale)
+        }
+
         // Use individual capture after a move operation, since composite capture
         // doesn't account for overlapping items.
         if await appState.itemManager.lastMoveOperationOccurred(within: .seconds(2)) {
@@ -216,6 +220,80 @@ final class MenuBarItemImageCache: ObservableObject {
         return individualResult
     }
 
+    /// Captures macOS 27 items from MenuBarAgent's composite hosting window.
+    /// Items that are currently concealed, or systems without Screen Recording
+    /// permission, receive their owning application's icon as a usable fallback.
+    @available(macOS 27.0, *)
+    private nonisolated func captureMacOS27Images(
+        of items: [MenuBarItem],
+        fallbackScale: CGFloat
+    ) async -> CaptureResult {
+        let capturable = items.filter { !$0.isControlItem || $0.tag == .visibleControlItem }
+        guard !capturable.isEmpty else { return CaptureResult() }
+
+        let displayID = Bridging.getActiveMenuBarDisplayID() ?? CGMainDisplayID()
+        let capture = await ScreenCapture.captureMenuBarHostingWindow(displayID: displayID)
+        var result = CaptureResult()
+
+        if let capture {
+            let imageBounds = CGRect(
+                x: 0,
+                y: 0,
+                width: capture.image.width,
+                height: capture.image.height
+            )
+            for item in capturable where capture.windowFrame.intersects(item.bounds) {
+                let rawCropRect = CGRect(
+                    x: (item.bounds.minX - capture.windowFrame.minX) * capture.scale,
+                    y: (item.bounds.minY - capture.windowFrame.minY) * capture.scale,
+                    width: item.bounds.width * capture.scale,
+                    height: item.bounds.height * capture.scale
+                )
+                let cropRect = rawCropRect.integral.intersection(imageBounds)
+                guard
+                    !cropRect.isNull,
+                    !cropRect.isEmpty,
+                    let image = capture.image.cropping(to: cropRect),
+                    !image.isTransparent(alphaThreshold: 0.05)
+                else {
+                    continue
+                }
+                result.images[item.tag] = CapturedImage(cgImage: image, scale: capture.scale)
+            }
+        }
+
+        for item in capturable where result.images[item.tag] == nil {
+            if let fallback = fallbackImage(for: item, scale: fallbackScale) {
+                result.images[item.tag] = fallback
+            } else {
+                result.excluded.append(item)
+            }
+        }
+        return result
+    }
+
+    private nonisolated func fallbackImage(
+        for item: MenuBarItem,
+        scale: CGFloat
+    ) -> CapturedImage? {
+        let icon = item.sourceApplication?.icon
+            ?? item.owningApplication?.icon
+            ?? NSImage(systemSymbolName: "app", accessibilityDescription: nil)
+        guard let icon else { return nil }
+
+        var proposedRect = CGRect(
+            origin: .zero,
+            size: CGSize(width: max(item.bounds.width, 18), height: max(item.bounds.height, 18))
+        )
+        guard let image = icon.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil) else {
+            return nil
+        }
+        let effectiveScale = image.width > 0 && proposedRect.width > 0
+            ? CGFloat(image.width) / proposedRect.width
+            : scale
+        return CapturedImage(cgImage: image, scale: effectiveScale)
+    }
+
     /// Captures the images of the menu bar items in the given section and returns
     /// a dictionary containing the images, keyed by their menu bar item tags.
     private func captureImages(for section: MenuBarSection.Name, scale: CGFloat, appState: AppState) async -> [MenuBarItemTag: CapturedImage] {
@@ -232,11 +310,12 @@ final class MenuBarItemImageCache: ObservableObject {
     /// Updates the cache for the given sections, without checking whether
     /// caching is necessary.
     func updateCacheWithoutChecks(sections: [MenuBarSection.Name]) async {
-        guard
-            let appState,
-            await appState.hasPermission(.screenRecording)
-        else {
+        guard let appState else {
             return
+        }
+
+        if #unavailable(macOS 27.0) {
+            guard await appState.hasPermission(.screenRecording) else { return }
         }
 
         guard
@@ -326,8 +405,8 @@ final class MenuBarItemImageCache: ObservableObject {
     /// failed for the given section.
     @MainActor
     func cacheFailed(for section: MenuBarSection.Name) -> Bool {
-        guard ScreenCapture.cachedCheckPermissions() else {
-            return true
+        if #unavailable(macOS 27.0) {
+            guard ScreenCapture.cachedCheckPermissions() else { return true }
         }
         let items = appState?.itemManager.itemCache[section] ?? []
         guard !items.isEmpty else {

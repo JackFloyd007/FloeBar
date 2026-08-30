@@ -356,6 +356,23 @@ extension MenuBarItemManager {
             let itemWindowIDs = currentItemWindowIDs ?? items.reversed().map { $0.windowID }
             await cacheActor.updateCachedItemWindowIDs(itemWindowIDs)
 
+            if #available(macOS 27.0, *) {
+                let managedItems = items.filter { item in
+                    guard item.canBeHidden, !item.isSystemClone else { return false }
+                    return !item.isControlItem || item.tag == .visibleControlItem
+                }
+                let updatedCache = appState?.menuBarManager.macOS27Controller.makeCache(
+                    liveItems: managedItems,
+                    displayID: displayID
+                ) ?? ItemCache(displayID: displayID)
+                if itemCache != updatedCache {
+                    itemCache = updatedCache
+                    logger.debug("Updated macOS 27 assignment-backed menu bar item cache")
+                }
+                appState?.menuBarManager.restoreMacOS27ControlItems()
+                return
+            }
+
             guard let controlItems = ControlItemPair(items: &items) else {
                 // ???: Is clearing the cache the best thing to do here?
                 logger.warning("Missing control item for hidden section, clearing menu bar item cache")
@@ -375,6 +392,10 @@ extension MenuBarItemManager {
     /// the hidden and always-hidden sections are correctly ordered,
     /// arranging them into valid positions if needed.
     func cacheItemsIfNeeded() async {
+        if #available(macOS 27.0, *) {
+            await cacheItemsRegardless()
+            return
+        }
         let itemWindowIDs = Bridging.getMenuBarWindowList(option: [.itemsOnly, .activeSpace])
         if await cacheActor.cachedItemWindowIDs != itemWindowIDs {
             await cacheItemsRegardless(itemWindowIDs)
@@ -509,6 +530,10 @@ extension MenuBarItemManager {
 
     /// Returns the current bounds for the given item.
     private nonisolated func getCurrentBounds(for item: MenuBarItem) async throws -> CGRect {
+        if #available(macOS 27.0, *) {
+            let items = await MenuBarItem.getMenuBarItems(option: .activeSpace)
+            return items.first(where: { $0.tag == item.tag })?.bounds ?? item.bounds
+        }
         let task = Task.detached(priority: .userInitiated) {
             guard let bounds = Bridging.getWindowBounds(for: item.windowID) else {
                 throw EventError.missingItemBounds(item)
@@ -1081,6 +1106,37 @@ extension MenuBarItemManager {
             throw EventError.cannotComplete
         }
 
+        if #available(macOS 27.0, *) {
+            logger.log(
+                "Assigning \(item.logString, privacy: .public) to \(destination.logString, privacy: .public) on macOS 27"
+            )
+            appState.menuBarManager.macOS27Controller.move(
+                item: item,
+                to: destination,
+                currentCache: itemCache
+            )
+            // The assignment can reveal an item that was absent from AX. Give
+            // MenuBarAgent a moment to reflow, then persist its native order.
+            await eventSleep(for: .milliseconds(300))
+            let liveItems = await MenuBarItem.getMenuBarItems(option: .activeSpace)
+            if
+                let liveItem = liveItems.first(where: { $0.tag == item.tag }),
+                let liveTarget = liveItems.first(where: { $0.tag == destination.targetItem.tag })
+            {
+                let liveDestination: MoveDestination = switch destination {
+                case .leftOfItem: .leftOfItem(liveTarget)
+                case .rightOfItem: .rightOfItem(liveTarget)
+                }
+                _ = MacOS27MenuBarAgentPositionStore.move(
+                    item: liveItem,
+                    to: liveDestination,
+                    liveItems: liveItems
+                )
+            }
+            await cacheItemsRegardless()
+            return
+        }
+
         try await waitForUserToPauseInput()
 
         appState.hidEventManager.stopAll()
@@ -1233,6 +1289,16 @@ extension MenuBarItemManager {
             throw EventError.cannotComplete
         }
 
+        if #available(macOS 27.0, *), mouseButton == .left {
+            let pressed = await Task.detached(priority: .userInitiated) {
+                MacOS27MenuBarItemProvider.press(item)
+            }.value
+            if pressed {
+                logger.debug("Pressed \(item.logString, privacy: .public) through Accessibility")
+                return
+            }
+        }
+
         try await waitForUserToPauseInput()
 
         logger.log(
@@ -1363,6 +1429,31 @@ extension MenuBarItemManager {
     func temporarilyShow(item: MenuBarItem, clickingWith mouseButton: CGMouseButton) async {
         guard let appState else {
             logger.error("Missing AppState, so not showing \(item.logString, privacy: .public)")
+            return
+        }
+
+        if #available(macOS 27.0, *) {
+            appState.menuBarManager.macOS27Controller.temporarilyRevealAll()
+            await eventSleep(for: .milliseconds(300))
+            let liveItems = await MenuBarItem.getMenuBarItems(option: .activeSpace)
+            guard let liveItem = liveItems.first(where: { $0.tag == item.tag }) else {
+                logger.error("Could not reveal \(item.logString, privacy: .public) on macOS 27")
+                appState.menuBarManager.syncMacOS27Visibility()
+                return
+            }
+            do {
+                try await click(item: liveItem, with: mouseButton)
+            } catch {
+                logger.error("Error clicking revealed item: \(error, privacy: .public)")
+            }
+
+            let interval = appState.settings.advanced.tempShowInterval
+            Task { @MainActor [weak self, weak appState] in
+                try? await Task.sleep(for: .seconds(interval))
+                guard let self, let appState else { return }
+                appState.menuBarManager.syncMacOS27Visibility()
+                await self.cacheItemsRegardless()
+            }
             return
         }
         guard let screen = NSScreen.screenWithActiveMenuBar else {

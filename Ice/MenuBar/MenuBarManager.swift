@@ -50,6 +50,9 @@ final class MenuBarManager: ObservableObject {
     /// appearance editor interface
     let appearanceEditorPanel = MenuBarAppearanceEditorPanel()
 
+    /// macOS 27's assignment-backed menu bar compatibility controller.
+    let macOS27Controller = MacOS27MenuBarController()
+
     /// The managed sections in the menu bar.
     let sections = [
         MenuBarSection(name: .visible),
@@ -73,11 +76,19 @@ final class MenuBarManager: ObservableObject {
         for section in sections {
             section.performSetup(with: appState)
         }
+        syncMacOS27Visibility()
     }
 
     /// Configures the internal observers for the manager.
     private func configureCancellables() {
         var c = Set<AnyCancellable>()
+
+        Publishers.MergeMany(sections.map { $0.controlItem.$state })
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.syncMacOS27Visibility()
+            }
+            .store(in: &c)
 
         NSApp.publisher(for: \.currentSystemPresentationOptions)
             .receive(on: DispatchQueue.main)
@@ -218,6 +229,36 @@ final class MenuBarManager: ObservableObject {
             .store(in: &c)
 
         cancellables = c
+    }
+
+    /// Mirrors the section controls into macOS 27's explicit visibility model.
+    func syncMacOS27Visibility() {
+        guard #available(macOS 27.0, *), let appState else { return }
+
+        // Ice Bar shows cached items without revealing them in the native bar.
+        guard !appState.settings.general.useIceBar else {
+            macOS27Controller.setRevealedSection(nil)
+            return
+        }
+
+        if section(withName: .alwaysHidden)?.controlItem.state == .showSection {
+            macOS27Controller.setRevealedSection(.alwaysHidden)
+        } else if section(withName: .hidden)?.controlItem.state == .showSection {
+            macOS27Controller.setRevealedSection(.hidden)
+        } else {
+            macOS27Controller.setRevealedSection(nil)
+        }
+        restoreMacOS27ControlItems()
+    }
+
+    /// Restores the user-facing Ice icon after MenuBarAgent recomposites the bar.
+    func restoreMacOS27ControlItems() {
+        guard #available(macOS 27.0, *) else { return }
+        section(withName: .visible)?.controlItem.restoreAfterMacOS27RestrictionChange()
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(350))
+            self?.section(withName: .visible)?.controlItem.restoreAfterMacOS27RestrictionChange()
+        }
     }
 
     /// Updates the ``averageColorInfo`` property with the current average color

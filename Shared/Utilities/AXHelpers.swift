@@ -3,7 +3,7 @@
 //  Shared
 //
 
-import AXSwift
+@preconcurrency import AXSwift
 import Cocoa
 
 enum AXHelpers {
@@ -23,7 +23,15 @@ enum AXHelpers {
     }
 
     static func application(for runningApp: NSRunningApplication) -> Application? {
-        queue.sync { Application(runningApp) }
+        queue.sync {
+            let application = Application(runningApp)
+            if let application {
+                // A stalled application's accessibility server must not block
+                // the complete menu bar scan indefinitely.
+                AXUIElementSetMessagingTimeout(application.element, 0.25)
+            }
+            return application
+        }
     }
 
     static func extrasMenuBar(for app: Application) -> UIElement? {
@@ -44,5 +52,36 @@ enum AXHelpers {
 
     static func role(for element: UIElement) -> Role? {
         queue.sync { try? element.role() }
+    }
+
+    static func title(for element: UIElement) -> String? {
+        queue.sync { try? element.attribute(.title) }
+    }
+
+    static func identifier(for element: UIElement) -> String? {
+        queue.sync { try? element.attribute(.identifier) }
+    }
+
+    static func description(for element: UIElement) -> String? {
+        queue.sync { try? element.attribute(.description) }
+    }
+
+    static func pid(for element: UIElement) -> pid_t? {
+        queue.sync {
+            var pid: pid_t = 0
+            return AXUIElementGetPid(element.element, &pid) == .success ? pid : nil
+        }
+    }
+
+    @discardableResult
+    static func press(_ element: UIElement) -> Bool {
+        queue.sync {
+            do {
+                try element.performAction(.press)
+                return true
+            } catch {
+                return false
+            }
+        }
     }
 }

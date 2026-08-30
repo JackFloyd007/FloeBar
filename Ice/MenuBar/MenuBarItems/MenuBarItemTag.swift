@@ -16,6 +16,10 @@ struct MenuBarItemTag: Hashable, CustomStringConvertible {
     /// The title of the item identified by this tag.
     let title: String
 
+    /// A stable positional disambiguator for items from the same application
+    /// that expose the same accessibility identity on macOS 27.
+    let instanceIndex: Int
+
     /// A Boolean value that indicates whether the item identified
     /// by this tag can be moved.
     var isMovable: Bool {
@@ -25,8 +29,29 @@ struct MenuBarItemTag: Hashable, CustomStringConvertible {
     /// A Boolean value that indicates whether the item identified
     /// by this tag can be hidden.
     var canBeHidden: Bool {
-        !MenuBarItemTag.nonHideableItems.contains(self) &&
+        if #available(macOS 27.0, *), namespace == .controlCenter {
+            return macOS27SystemItemIdentifier != nil &&
+                !MenuBarItemTag.immovableItems.contains(self)
+        }
+        return !MenuBarItemTag.nonHideableItems.contains(self) &&
         !(namespace.isUUID && title == "AudioVideoModule")
+    }
+
+    /// The private macOS 27 system-item allowlist identifier, when this item
+    /// can be independently hidden without affecting other system extras.
+    var macOS27SystemItemIdentifier: Int? {
+        switch title {
+        case "Battery", "com.apple.menuextra.battery": 0
+        case "Bluetooth", "com.apple.menuextra.bluetooth": 1
+        case "Clock", "com.apple.menuextra.clock": 2
+        case "Displays", "Display", "com.apple.menuextra.displays": 3
+        case "Keyboard", "com.apple.menuextra.keyboard": 4
+        case "Sound", "Volume", "com.apple.menuextra.volume": 5
+        case "WiFi", "Wi-Fi", "com.apple.menuextra.wifi": 6
+        case "ScreenMirroring", "Screen Mirroring", "com.apple.menuextra.screenmirroring": 7
+        case "BentoBox-0", "ControlCenter", "com.apple.menuextra.controlcenter": 8
+        default: nil
+        }
     }
 
     /// A Boolean value that indicates whether the item identified
@@ -54,13 +79,22 @@ struct MenuBarItemTag: Hashable, CustomStringConvertible {
         if !title.isEmpty {
             result.append(":\(title)")
         }
+        if instanceIndex > 0 {
+            result.append("#\(instanceIndex)")
+        }
         return result
     }
 
     /// Creates a tag with the given namespace and title.
-    init(namespace: Namespace, title: String) {
+    init(namespace: Namespace, title: String, instanceIndex: Int = 0) {
         self.namespace = namespace
         self.title = title
+        self.instanceIndex = instanceIndex
+    }
+
+    /// A deterministic identifier suitable for persisted macOS 27 layout data.
+    var persistentIdentifier: String {
+        "\(namespace):\(title)#\(instanceIndex)"
     }
 
     /// Creates a tag for the control item with the given identifier.
@@ -128,10 +162,16 @@ extension MenuBarItemTag {
     static let audioVideoModule = MenuBarItemTag(namespace: .controlCenter, title: "AudioVideoModule")
 
     /// The tag for the system "Clock" item.
-    static let clock = MenuBarItemTag(namespace: .controlCenter, title: "Clock")
+    static let clock = if #available(macOS 27.0, *) {
+        MenuBarItemTag(namespace: .controlCenter, title: "com.apple.menuextra.clock")
+    } else {
+        MenuBarItemTag(namespace: .controlCenter, title: "Clock")
+    }
 
     /// The tag for the system "Control Center" item.
-    static let controlCenter = if #available(macOS 26.0, *) {
+    static let controlCenter = if #available(macOS 27.0, *) {
+        MenuBarItemTag(namespace: .controlCenter, title: "com.apple.menuextra.controlcenter")
+    } else if #available(macOS 26.0, *) {
         MenuBarItemTag(namespace: .controlCenter, title: "BentoBox-0")
     } else {
         MenuBarItemTag(namespace: .controlCenter, title: "BentoBox")
