@@ -44,7 +44,11 @@ final class MacOS27MenuBarController {
     private var knownSystemItemIdentifiers = [String: Int]()
     private var lastLiveItems = [MenuBarItem]()
     private var lastSourceItems = [MenuBarItem]()
+    private var lastManagedItems = [MenuBarItem]()
+    private var requestedRevealedSection: MenuBarSection.Name?
     private var revealedSection: MenuBarSection.Name?
+    private var visibilityUpdateTask: Task<Void, Never>?
+    private var sectionsWithPendingMove = Set<MenuBarSection.Name>()
     private var assertionHandle: UnsafeMutableRawPointer?
     private var retiringAssertionHandles = [UnsafeMutableRawPointer]()
     private var appliedAllowedBundleIdentifiers = Set<String>()
@@ -66,6 +70,7 @@ final class MacOS27MenuBarController {
     }
 
     isolated deinit {
+        visibilityUpdateTask?.cancel()
         if #available(macOS 27.0, *) {
             MacOS27MenuBarAgentPositionStore.revealAll()
         }
@@ -82,9 +87,22 @@ final class MacOS27MenuBarController {
 
     func setRevealedSection(_ section: MenuBarSection.Name?) {
         guard #available(macOS 27.0, *) else { return }
-        guard revealedSection != section else { return }
-        revealedSection = section
-        applyVisibility(liveItems: lastLiveItems)
+        guard requestedRevealedSection != section else { return }
+        requestedRevealedSection = section
+        visibilityUpdateTask?.cancel()
+
+        // MenuBarAgent recomposes every hosted status-item scene whenever the
+        // assessment allowlist changes. Coalesce a rapid click burst to its
+        // final state so obsolete intermediate assertions never reach the
+        // compositor and make every icon flash.
+        visibilityUpdateTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(140))
+            guard let self, !Task.isCancelled else { return }
+            visibilityUpdateTask = nil
+            guard revealedSection != requestedRevealedSection else { return }
+            revealedSection = requestedRevealedSection
+            applyVisibility(liveItems: lastLiveItems)
+        }
     }
 
     func makeCache(
@@ -139,32 +157,61 @@ final class MacOS27MenuBarController {
             }
             itemsByIdentifier[identifier] = item
         }
+        lastManagedItems = Array(itemsByIdentifier.values)
 
         var cache = MenuBarItemManager.ItemCache(displayID: displayID)
+        let liveIdentifiers = Set(liveItems.map { $0.tag.persistentIdentifier })
         for section in MenuBarSection.Name.allCases {
             let savedOrder = layout.order[section, default: []]
-            var seen = Set<String>()
-            var sectionItems = [MenuBarItem]()
-
-            for identifier in savedOrder {
-                guard
-                    layout.assignments[identifier, default: .visible] == section,
-                    let item = itemsByIdentifier[identifier]
-                else {
-                    continue
-                }
-                sectionItems.append(item)
-                seen.insert(identifier)
+            let unorderedItems = itemsByIdentifier.values.filter { item in
+                layout.assignments[item.tag.persistentIdentifier, default: .visible] == section
             }
+            let sectionItems: [MenuBarItem]
 
-            let newItems = itemsByIdentifier.values
-                .filter { item in
-                    let identifier = item.tag.persistentIdentifier
-                    return !seen.contains(identifier) &&
-                        layout.assignments[identifier, default: .visible] == section
+            if sectionsWithPendingMove.contains(section) {
+                let savedIndices = Dictionary(
+                    uniqueKeysWithValues: savedOrder.enumerated().map { ($0.element, $0.offset) }
+                )
+                sectionItems = unorderedItems.sorted { lhs, rhs in
+                    let lhsIndex = savedIndices[lhs.tag.persistentIdentifier]
+                    let rhsIndex = savedIndices[rhs.tag.persistentIdentifier]
+                    switch (lhsIndex, rhsIndex) {
+                    case let (lhsIndex?, rhsIndex?): return lhsIndex < rhsIndex
+                    case (_?, nil): return true
+                    case (nil, _?): return false
+                    case (nil, nil): return Self.isOrderedLeftToRight(lhs, rhs)
+                    }
                 }
-                .sorted { $0.bounds.minX < $1.bounds.minX }
-            sectionItems.append(contentsOf: newItems)
+            } else if unorderedItems.allSatisfy({ liveIdentifiers.contains($0.tag.persistentIdentifier) }) {
+                // AX bounds are the source of truth for anything the user can
+                // currently see in the real menu bar.
+                sectionItems = unorderedItems.sorted(by: Self.isOrderedLeftToRight)
+            } else if
+                #available(macOS 27.0, *),
+                let preferredOrder = MacOS27MenuBarAgentPositionStore.itemsInMenuBarOrder(
+                    Array(unorderedItems)
+                )
+            {
+                // Concealed items have no live AX element. MenuBarAgent's own
+                // preferred positions are the authoritative equivalent.
+                sectionItems = preferredOrder
+            } else {
+                // Preserve the last explicit drag order for an item whose
+                // private MenuBarAgent key cannot be resolved.
+                let savedIndices = Dictionary(
+                    uniqueKeysWithValues: savedOrder.enumerated().map { ($0.element, $0.offset) }
+                )
+                sectionItems = unorderedItems.sorted { lhs, rhs in
+                    let lhsIndex = savedIndices[lhs.tag.persistentIdentifier]
+                    let rhsIndex = savedIndices[rhs.tag.persistentIdentifier]
+                    switch (lhsIndex, rhsIndex) {
+                    case let (lhsIndex?, rhsIndex?): return lhsIndex < rhsIndex
+                    case (_?, nil): return true
+                    case (nil, _?): return false
+                    case (nil, nil): return Self.isOrderedLeftToRight(lhs, rhs)
+                    }
+                }
+            }
             cache[section] = sectionItems
             layout.order[section] = sectionItems.map { $0.tag.persistentIdentifier }
         }
@@ -178,13 +225,14 @@ final class MacOS27MenuBarController {
         item: MenuBarItem,
         to destination: MenuBarItemManager.MoveDestination,
         currentCache: MenuBarItemManager.ItemCache
-    ) {
-        guard #available(macOS 27.0, *) else { return }
+    ) -> MenuBarSection.Name {
+        guard #available(macOS 27.0, *) else { return .visible }
 
         let identifier = item.tag.persistentIdentifier
         let target = destination.targetItem
         let targetIdentifier = target.tag.persistentIdentifier
         let targetSection: MenuBarSection.Name
+        let previousSection = layout.assignments[identifier, default: .visible]
 
         if target.tag == .hiddenControlItem {
             targetSection = switch destination {
@@ -226,13 +274,65 @@ final class MacOS27MenuBarController {
         }
 
         snapshots[identifier] = item
+        sectionsWithPendingMove.formUnion([previousSection, targetSection])
+        persist()
+        applyVisibility(liveItems: lastLiveItems)
+        return targetSection
+    }
+
+    func move(item: MenuBarItem, to section: MenuBarSection.Name) {
+        guard #available(macOS 27.0, *) else { return }
+
+        let identifier = item.tag.persistentIdentifier
+        let previousSection = layout.assignments[identifier, default: .visible]
+        for existingSection in MenuBarSection.Name.allCases {
+            layout.order[existingSection, default: []].removeAll { $0 == identifier }
+        }
+        layout.assignments[identifier] = section
+        layout.order[section, default: []].append(identifier)
+        snapshots[identifier] = item
+        sectionsWithPendingMove.formUnion([previousSection, section])
         persist()
         applyVisibility(liveItems: lastLiveItems)
     }
 
+    func completePendingMove() {
+        sectionsWithPendingMove.removeAll()
+    }
+
     func temporarilyRevealAll() {
         guard #available(macOS 27.0, *) else { return }
+        visibilityUpdateTask?.cancel()
+        visibilityUpdateTask = nil
+        requestedRevealedSection = .alwaysHidden
         revealedSection = .alwaysHidden
+        applyVisibility(liveItems: lastLiveItems)
+    }
+
+    /// Republishing a hosted status item creates a new scene at an off-screen
+    /// staging position. MenuBarAgent only places it after a real visibility
+    /// transition, so temporarily apply the opposite state and then restore
+    /// the caller's state after a short compositor interval.
+    func beginVisibilityRefreshForRepublishedItems() -> MenuBarSection.Name? {
+        guard #available(macOS 27.0, *) else { return revealedSection }
+        let previousSection = revealedSection
+        let refreshSection: MenuBarSection.Name = previousSection == .alwaysHidden
+            ? .visible
+            : .alwaysHidden
+        visibilityUpdateTask?.cancel()
+        visibilityUpdateTask = nil
+        requestedRevealedSection = refreshSection
+        revealedSection = refreshSection
+        applyVisibility(liveItems: lastLiveItems)
+        return previousSection
+    }
+
+    func finishVisibilityRefreshForRepublishedItems(
+        restoring section: MenuBarSection.Name?
+    ) {
+        guard #available(macOS 27.0, *) else { return }
+        requestedRevealedSection = section
+        revealedSection = section
         applyVisibility(liveItems: lastLiveItems)
     }
 
@@ -243,10 +343,16 @@ final class MacOS27MenuBarController {
         if !liveItems.isEmpty { lastLiveItems = liveItems }
 
         let visibilityItems = lastSourceItems.isEmpty ? lastLiveItems : lastSourceItems
+        let positionItems = Dictionary(
+            (visibilityItems + lastManagedItems).map {
+                ($0.tag.persistentIdentifier, $0)
+            },
+            uniquingKeysWith: { current, _ in current }
+        ).values
         let didWritePositions = MacOS27MenuBarAgentPositionStore.applySectionBoundary(
             assignments: layout.assignments,
             order: layout.order,
-            items: visibilityItems
+            items: Array(positionItems)
         )
         if didWritePositions {
             logger.notice(
@@ -326,6 +432,10 @@ final class MacOS27MenuBarController {
             return
         }
 
+        logger.debug(
+            "Applying macOS 27 visibility for section \(String(describing: self.revealedSection), privacy: .public) with \(allowedBundleIdentifiers.count, privacy: .public) application identifiers"
+        )
+
         assertionHandle = replacementHandle
         appliedAllowedBundleIdentifiers = allowedBundleIdentifiers
         appliedAllowedSystemItemIdentifiers = allowedSystemIdentifiers
@@ -371,6 +481,13 @@ final class MacOS27MenuBarController {
     private func persist() {
         guard let data = try? JSONEncoder().encode(layout) else { return }
         UserDefaults.standard.set(data, forKey: Self.defaultsKey)
+    }
+
+    private static func isOrderedLeftToRight(_ lhs: MenuBarItem, _ rhs: MenuBarItem) -> Bool {
+        if lhs.bounds.minX == rhs.bounds.minX {
+            return lhs.bounds.minY < rhs.bounds.minY
+        }
+        return lhs.bounds.minX < rhs.bounds.minX
     }
 
     /// Migrates Ice's physical divider layout into macOS 27's explicit section

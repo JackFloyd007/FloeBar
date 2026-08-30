@@ -23,7 +23,11 @@ enum MacOS27MenuBarAgentPositionStore {
     // almost adjacent to the visible edge; newly reintroduced items without
     // an autosave key are then laid out on the concealed side of the boundary.
     private static let boundaryInset = 0.001
-    private static let sectionStep = 0.1
+    // AppKit republishes hosted NSStatusItems from an owner-local preferred
+    // position and rounds away sub-point ordering differences. Native menu bar
+    // ranks are normally spaced by roughly 10 or more, so use the same scale
+    // to keep the order stable after hide/reveal recompositions.
+    private static let sectionStep = 10.0
     private static let visibleControlKey =
         "status:\(Constants.bundleIdentifier)::\(ControlItem.Identifier.visible.rawValue)"
 
@@ -208,8 +212,158 @@ enum MacOS27MenuBarAgentPositionStore {
         guard positions[itemKey] != newWeight else { return true }
         positions[itemKey] = newWeight
         writePositions(positions)
-        nudgeMenuBarAgent()
         logger.info("Reordered \(item.logString, privacy: .public) using \(itemKey, privacy: .public)")
+        return true
+    }
+
+    /// Returns the items in MenuBarAgent's current physical left-to-right
+    /// order. This is used for concealed items, whose AX frames disappear
+    /// while the visibility restriction is active.
+    static func itemsInMenuBarOrder(_ items: [MenuBarItem]) -> [MenuBarItem]? {
+        guard items.count > 1 else { return items }
+
+        let positions = readPositions()
+        let keys = Array(positions.keys)
+        let weightedItems = items.compactMap { item -> (MenuBarItem, Double)? in
+            guard
+                let key = resolveKey(for: item, existingKeys: keys),
+                let weight = positions[key]
+            else {
+                return nil
+            }
+            return (item, weight)
+        }
+        guard weightedItems.count == items.count else { return nil }
+
+        let weightsIncreaseRight = observedWeightsIncreaseRight(
+            liveItems: items,
+            positions: positions,
+            keys: keys
+        )
+        return weightedItems.sorted { lhs, rhs in
+            if lhs.1 == rhs.1 {
+                return lhs.0.bounds.minX < rhs.0.bounds.minX
+            }
+            return weightsIncreaseRight ? lhs.1 < rhs.1 : lhs.1 > rhs.1
+        }.map(\.0)
+    }
+
+    /// Mirrors MenuBarAgent's desired weights into each owner's AppKit
+    /// `NSStatusItem` preference. Hosted macOS 27 items read that owner-local
+    /// value when their scene is published; updating MenuBarAgent alone is not
+    /// enough to move them.
+    static func synchronizeOwnerPreferredPositions(
+        for items: [MenuBarItem],
+        among liveItems: [MenuBarItem]
+    ) -> [NSRunningApplication] {
+        let positions = readPositions()
+        let positionKeys = Array(positions.keys)
+        var applicationsByPID = [pid_t: NSRunningApplication]()
+
+        // AppKit stores an NSStatusItem's preferred position as the slot on
+        // its right, while MenuBarAgent stores a weight for the item itself.
+        // Resolve the complete desired order and mirror the right neighbor's
+        // weight so the owner republishes into the same physical slot.
+        let weightsIncreaseRight = observedWeightsIncreaseRight(
+            liveItems: liveItems,
+            positions: positions,
+            keys: positionKeys
+        )
+        let weightedLiveItems = liveItems.compactMap { item -> (MenuBarItem, Double)? in
+            guard
+                let key = resolveKey(for: item, existingKeys: positionKeys),
+                let weight = positions[key]
+            else {
+                return nil
+            }
+            return (item, weight)
+        }.sorted { lhs, rhs in
+            if lhs.1 == rhs.1 {
+                return lhs.0.bounds.minX < rhs.0.bounds.minX
+            }
+            return weightsIncreaseRight ? lhs.1 < rhs.1 : lhs.1 > rhs.1
+        }
+
+        for item in items {
+            guard
+                !item.isControlItem,
+                let itemIndex = weightedLiveItems.firstIndex(where: { $0.0.tag == item.tag }),
+                let application = item.sourceApplication ?? item.owningApplication,
+                let bundleIdentifier = application.bundleIdentifier,
+                !bundleIdentifier.hasPrefix("com.apple."),
+                application.bundleURL?.path.hasPrefix("/System/") != true
+            else {
+                continue
+            }
+
+            let itemWeight = weightedLiveItems[itemIndex].1
+            let ownerWeight = if itemIndex + 1 < weightedLiveItems.endIndex {
+                weightedLiveItems[itemIndex + 1].1
+            } else {
+                itemWeight + (weightsIncreaseRight ? 10.0 : -10.0)
+            }
+            guard
+                writeOwnerPreferredPosition(
+                    ownerWeight,
+                    item: item,
+                    domain: bundleIdentifier as CFString
+                )
+            else {
+                continue
+            }
+            applicationsByPID[application.processIdentifier] = application
+        }
+        return Array(applicationsByPID.values)
+    }
+
+    private static func writeOwnerPreferredPosition(
+        _ weight: Double,
+        item: MenuBarItem,
+        domain: CFString
+    ) -> Bool {
+        let prefix = "NSStatusItem Preferred Position "
+        let keys = (CFPreferencesCopyKeyList(
+            domain,
+            kCFPreferencesCurrentUser,
+            kCFPreferencesAnyHost
+        ) as? [String] ?? []).filter { $0.hasPrefix(prefix) }
+        guard !keys.isEmpty else { return false }
+
+        let identityCandidates = [item.tag.title, item.title, item.displayName]
+            .compactMap { $0?.lowercased() }
+            .filter { !$0.isEmpty }
+        let matchedKeys = keys.filter { key in
+            let normalized = key.lowercased()
+            return identityCandidates.contains { normalized.contains($0) }
+        }
+        guard let key = matchedKeys.count == 1 ? matchedKeys[0] : (keys.count == 1 ? keys[0] : nil) else {
+            return false
+        }
+
+        let existing = CFPreferencesCopyValue(
+            key as CFString,
+            domain,
+            kCFPreferencesCurrentUser,
+            kCFPreferencesAnyHost
+        )
+        // The running NSStatusItem scene may still be using the value it read
+        // at launch even when the preference already equals the desired
+        // weight. Report the owner as synchronizable so the caller can
+        // republish that third-party scene and make the physical order match.
+        guard numericValue(existing) != weight else { return true }
+
+        CFPreferencesSetValue(
+            key as CFString,
+            NSNumber(value: weight),
+            domain,
+            kCFPreferencesCurrentUser,
+            kCFPreferencesAnyHost
+        )
+        guard CFPreferencesSynchronize(domain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost) else {
+            logger.error("Could not synchronize owner status-item position for \(item.logString, privacy: .public)")
+            return false
+        }
+        logger.info("Updated owner status-item position for \(item.logString, privacy: .public)")
         return true
     }
 
@@ -318,9 +472,10 @@ enum MacOS27MenuBarAgentPositionStore {
             if existingKeys.contains(displayNameKey) { return displayNameKey }
         }
 
-        // A plausible key is not necessarily the internal key MenuBarAgent
-        // sorts. Fabricating it makes the preference write appear successful
-        // while leaving the icon on the wrong side of Ice.
+        // Status items without an autosave name do not appear in the position
+        // dictionary until they are moved. MenuBarAgent accepts the canonical
+        // bundle/title key and persists it from that point forward.
+        if isThirdPartyItem(item) { return exact }
         return nil
     }
 
@@ -346,9 +501,4 @@ enum MacOS27MenuBarAgentPositionStore {
         return left.1 < right.1
     }
 
-    private static func nudgeMenuBarAgent() {
-        for app in NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.MenuBarAgent") {
-            kill(app.processIdentifier, SIGTERM)
-        }
-    }
 }

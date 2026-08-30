@@ -75,6 +75,10 @@ final class LayoutBarPaddingView: NSView {
 
         if let index = arrangedViews.firstIndex(of: draggingSource) {
             if arrangedViews.count == 1 {
+                if #available(macOS 27.0, *) {
+                    move(item: draggingSource.item, toSection: container.section)
+                    return true
+                }
                 Task {
                     // dragging source is the only view in the layout bar, so we
                     // need to find a target item
@@ -117,6 +121,20 @@ final class LayoutBarPaddingView: NSView {
                 Logger.default.error("Error moving menu bar item: \(error, privacy: .public)")
                 let alert = NSAlert(error: error)
                 alert.runModal()
+            }
+        }
+    }
+
+    private func move(item: MenuBarItem, toSection section: MenuBarSection.Name) {
+        guard let appState = container.appState else { return }
+        Task {
+            try? await Task.sleep(for: .milliseconds(25))
+            do {
+                try await appState.itemManager.move(item: item, toSection: section)
+                appState.itemManager.removeTemporarilyShownItemFromCache(with: item.tag)
+            } catch {
+                Logger.default.error("Error moving menu bar item: \(error, privacy: .public)")
+                NSAlert(error: error).runModal()
             }
         }
     }

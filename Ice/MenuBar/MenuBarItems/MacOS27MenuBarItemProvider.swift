@@ -18,11 +18,18 @@ import OSLog
 enum MacOS27MenuBarItemProvider {
     private static let logger = Logger(category: "MacOS27MenuBarItemProvider")
     private static let maxItemHeight: CGFloat = 40
+    /// AXSwift's Core Foundation value conversion is not safe when multiple
+    /// complete `AXExtrasMenuBar` walks overlap on macOS 27. Keep each walk
+    /// atomic; callers already run this work away from the main actor.
+    private static let operationLock = NSLock()
 
     static func menuBarItems(
         on display: CGDirectDisplayID? = nil,
         option _: MenuBarItem.ListOption
     ) -> [MenuBarItem] {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+
         guard AXHelpers.isProcessTrusted() else {
             logger.warning("Accessibility permission is missing; cannot enumerate macOS 27 menu bar items")
             return []
@@ -87,6 +94,9 @@ enum MacOS27MenuBarItemProvider {
     /// Performs the semantic accessibility press action for an item.
     /// This is more reliable than targeting a synthetic WindowServer ID.
     static func press(_ item: MenuBarItem) -> Bool {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+
         guard AXHelpers.isProcessTrusted() else { return false }
 
         for runningApp in NSWorkspace.shared.runningApplications

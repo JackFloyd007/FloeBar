@@ -21,7 +21,9 @@ enum ScreenCapture {
             else {
                 continue
             }
-            return window.title != nil
+            if window.title != nil {
+                return true
+            }
         }
         // CGPreflightScreenCaptureAccess() only returns an initial value,
         // but we can use it as a fallback.
@@ -38,8 +40,11 @@ enum ScreenCapture {
         enum Context {
             static var cachedResult: Bool?
         }
-        if !reset, let result = Context.cachedResult {
-            return result
+        // A positive result can be cached indefinitely. Recheck a negative
+        // result so granting permission while Ice is running takes effect and
+        // exact Layout images replace semantic fallbacks without a relaunch.
+        if !reset, Context.cachedResult == true {
+            return true
         }
         let result = checkPermissions()
         Context.cachedResult = result

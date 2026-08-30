@@ -9,8 +9,7 @@ import Cocoa
 enum AXHelpers {
     private static let queue = DispatchQueue.targetingGlobal(
         label: "AXHelpers.queue",
-        qos: .userInteractive,
-        attributes: .concurrent
+        qos: .userInteractive
     )
 
     @discardableResult

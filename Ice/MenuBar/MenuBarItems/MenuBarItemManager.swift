@@ -953,6 +953,161 @@ extension MenuBarItemManager {
         }
     }
 
+    /// Checks a hosted macOS 27 menu bar move using one AX snapshot. Comparing
+    /// exact frame edges is unreliable because MenuBarAgent reflows both the
+    /// moved item and its target; their ordinal adjacency is the stable result.
+    @available(macOS 27.0, *)
+    private func macOS27ItemHasCorrectPosition(
+        item: MenuBarItem,
+        for destination: MoveDestination
+    ) async -> Bool {
+        let items = await MenuBarItem.getMenuBarItems(option: .activeSpace)
+            .sorted { $0.bounds.minX < $1.bounds.minX }
+
+        func index(of needle: MenuBarItem) -> Int? {
+            items.firstIndex { $0.windowID == needle.windowID }
+                ?? items.firstIndex(matching: needle.tag)
+        }
+
+        guard
+            let itemIndex = index(of: item),
+            let targetIndex = index(of: destination.targetItem)
+        else {
+            return false
+        }
+        return switch destination {
+        case .leftOfItem: itemIndex == targetIndex - 1
+        case .rightOfItem: itemIndex == targetIndex + 1
+        }
+    }
+
+    /// Performs the same Command-drag gesture the user can use to reorder a
+    /// status item. macOS 27 hosts third-party status-item scenes in
+    /// MenuBarAgent, so their synthetic compatibility IDs cannot be used as
+    /// WindowServer move targets. Their AX frames remain accurate hit targets.
+    @available(macOS 27.0, *)
+    private nonisolated func postMacOS27CommandDrag(
+        item: MenuBarItem,
+        destination: MoveDestination
+    ) async throws {
+        let itemBounds = try await getCurrentBounds(for: item)
+        let targetBounds = try await getCurrentBounds(for: destination.targetItem)
+        let start = itemBounds.center
+        let endX = switch destination {
+        case .leftOfItem: targetBounds.minX - 2
+        case .rightOfItem: targetBounds.maxX + 2
+        }
+        let end = CGPoint(
+            x: endX,
+            y: targetBounds.midY
+        )
+        let originalMouseLocation = try getMouseLocation()
+        let source = try getEventSource(with: .combinedSessionState)
+        try permitLocalEvents()
+
+        func event(_ type: CGEventType, at point: CGPoint) throws -> CGEvent {
+            guard let event = CGEvent(
+                mouseEventSource: source,
+                mouseType: type,
+                mouseCursorPosition: point,
+                mouseButton: .left
+            ) else {
+                throw EventError.eventCreationFailure(item)
+            }
+            event.flags = .maskCommand
+            return event
+        }
+
+        MouseHelpers.hideCursor()
+        defer {
+            MouseHelpers.warpCursor(to: originalMouseLocation)
+            MouseHelpers.showCursor()
+        }
+
+        MouseHelpers.warpCursor(to: start)
+        await eventSleep(for: .milliseconds(40))
+        try event(.leftMouseDown, at: start).post(tap: .cghidEventTap)
+        await eventSleep(for: .milliseconds(90))
+
+        // A short eased path gives MenuBarAgent time to enter its native
+        // reorder tracking state before the pointer crosses the target.
+        for step in 1...10 {
+            let progress = CGFloat(step) / 10
+            let eased = progress * progress * (3 - 2 * progress)
+            let point = CGPoint(
+                x: start.x + (end.x - start.x) * eased,
+                y: start.y + (end.y - start.y) * eased
+            )
+            try event(.leftMouseDragged, at: point).post(tap: .cghidEventTap)
+            await eventSleep(for: .milliseconds(24))
+        }
+
+        try event(.leftMouseUp, at: end).post(tap: .cghidEventTap)
+        await eventSleep(for: .milliseconds(180))
+    }
+
+    /// Re-publishes accessory-style status-item applications after their
+    /// owner-local AppKit position was updated. Regular applications are left
+    /// running so arranging a menu bar never closes a user's document app.
+    @available(macOS 27.0, *)
+    private func relaunchMacOS27StatusItemOwners(
+        _ applications: [NSRunningApplication]
+    ) async {
+        for application in applications {
+            guard
+                application.activationPolicy != .regular,
+                let bundleURL = application.bundleURL,
+                let bundleIdentifier = application.bundleIdentifier,
+                !application.isTerminated
+            else {
+                continue
+            }
+
+            let oldPID = application.processIdentifier
+            guard application.terminate() else {
+                logger.warning("Could not terminate status-item owner \(oldPID, privacy: .public) for reorder")
+                continue
+            }
+            for _ in 0..<20 where NSRunningApplication(processIdentifier: oldPID) != nil {
+                await eventSleep(for: .milliseconds(50))
+            }
+            guard NSRunningApplication(processIdentifier: oldPID) == nil else {
+                logger.warning("Status-item owner \(oldPID, privacy: .public) did not terminate for reorder")
+                continue
+            }
+
+            // Login-item helpers commonly republish themselves as soon as the
+            // old process exits. In that case there is nothing left for
+            // NSWorkspace to open, and waiting for a redundant completion
+            // callback can stall the entire move operation.
+            var didRelaunchAutomatically = false
+            for _ in 0..<20 {
+                if NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
+                    .contains(where: { !$0.isTerminated })
+                {
+                    didRelaunchAutomatically = true
+                    break
+                }
+                await eventSleep(for: .milliseconds(50))
+            }
+            if didRelaunchAutomatically { continue }
+
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = false
+            NSWorkspace.shared.openApplication(
+                at: bundleURL,
+                configuration: configuration
+            ) { [weak self] _, error in
+                if let error {
+                    self?.logger.error(
+                        "Could not relaunch status-item owner after reorder: \(error, privacy: .public)"
+                    )
+                }
+            }
+            await eventSleep(for: .milliseconds(250))
+        }
+    }
+
     /// Waits for a menu bar item to respond to a series of previously
     /// posted move events.
     ///
@@ -976,6 +1131,9 @@ extension MenuBarItemManager {
                 if origin != initialOrigin {
                     return origin
                 }
+                // Give the target application time to process the move and,
+                // on macOS 27, avoid hammering the serialized AX item scan.
+                try await Task.sleep(for: .milliseconds(10))
             }
         }
         let timeoutTask = Task(timeout: timeout) {
@@ -1009,14 +1167,31 @@ extension MenuBarItemManager {
     /// - Parameters:
     ///   - item: The menu bar item to move.
     ///   - destination: The destination to move the menu bar item.
-    private func postMoveEvents(item: MenuBarItem, destination: MoveDestination) async throws {
+    private func postMoveEvents(
+        item: MenuBarItem,
+        destination: MoveDestination,
+        hostedByMenuBarAgent: Bool = false
+    ) async throws {
         try await eventSemaphore.waitUnlessCancelled()
         defer {
             eventSemaphore.signal()
         }
 
         var itemOrigin = try await getCurrentBounds(for: item).origin
-        let targetPoints = try await getTargetPoints(forMoving: item, to: destination)
+        let targetPoints: (start: CGPoint, end: CGPoint)
+        if hostedByMenuBarAgent {
+            let targetBounds = try await getCurrentBounds(for: destination.targetItem)
+            // macOS 27's hosted status items respond to a press/release at the
+            // destination edge with the moved item's window ID stamped on the
+            // press. A conventional drag gesture is ignored by MenuBarAgent.
+            let point = switch destination {
+            case .leftOfItem: CGPoint(x: targetBounds.minX, y: targetBounds.minY)
+            case .rightOfItem: CGPoint(x: targetBounds.maxX, y: targetBounds.minY)
+            }
+            targetPoints = (point, point)
+        } else {
+            targetPoints = try await getTargetPoints(forMoving: item, to: destination)
+        }
         let mouseLocation = try getMouseLocation()
         let source = try getEventSource()
 
@@ -1040,6 +1215,13 @@ extension MenuBarItemManager {
         }
 
         var timeout = getMoveOperationTimeout(for: item)
+        if hostedByMenuBarAgent {
+            // Hosted items need noticeably longer than legacy WindowServer
+            // items when MenuBarAgent is recomposing the bar.
+            timeout = max(timeout, .milliseconds(350))
+            MouseHelpers.warpCursor(to: targetPoints.start)
+            await eventSleep(for: .milliseconds(20))
+        }
         logger.debug("Move operation timeout: \(timeout)")
 
         lastMoveOperationTimestamp = .now
@@ -1110,7 +1292,7 @@ extension MenuBarItemManager {
             logger.log(
                 "Assigning \(item.logString, privacy: .public) to \(destination.logString, privacy: .public) on macOS 27"
             )
-            appState.menuBarManager.macOS27Controller.move(
+            let destinationSection = appState.menuBarManager.macOS27Controller.move(
                 item: item,
                 to: destination,
                 currentCache: itemCache
@@ -1118,22 +1300,118 @@ extension MenuBarItemManager {
             // The assignment can reveal an item that was absent from AX. Give
             // MenuBarAgent a moment to reflow, then persist its native order.
             await eventSleep(for: .milliseconds(300))
-            let liveItems = await MenuBarItem.getMenuBarItems(option: .activeSpace)
-            if
-                let liveItem = liveItems.first(where: { $0.tag == item.tag }),
-                let liveTarget = liveItems.first(where: { $0.tag == destination.targetItem.tag })
-            {
-                let liveDestination: MoveDestination = switch destination {
+            var liveItems = await MenuBarItem.getMenuBarItems(option: .activeSpace)
+            var liveItem = liveItems.first(where: { $0.tag == item.tag })
+            var liveTarget = liveItems.first(where: { $0.tag == destination.targetItem.tag })
+            var temporarilyRevealedAll = false
+            if liveItem == nil || liveTarget == nil {
+                appState.menuBarManager.macOS27Controller.temporarilyRevealAll()
+                temporarilyRevealedAll = true
+                await eventSleep(for: .milliseconds(300))
+                liveItems = await MenuBarItem.getMenuBarItems(option: .activeSpace)
+                liveItem = liveItems.first(where: { $0.tag == item.tag })
+                liveTarget = liveItems.first(where: { $0.tag == destination.targetItem.tag })
+            }
+
+            do {
+                guard var liveItem, var liveTarget else {
+                    throw EventError.cannotComplete
+                }
+                var liveDestination: MoveDestination = switch destination {
                 case .leftOfItem: .leftOfItem(liveTarget)
                 case .rightOfItem: .rightOfItem(liveTarget)
                 }
-                _ = MacOS27MenuBarAgentPositionStore.move(
+
+                // Visible items are not normalized around Ice's section
+                // boundary, so compute their new MenuBarAgent rank directly.
+                if destinationSection == .visible {
+                    _ = MacOS27MenuBarAgentPositionStore.move(
+                        item: liveItem,
+                        to: liveDestination,
+                        liveItems: liveItems
+                    )
+                }
+
+                let ownersToRelaunch = MacOS27MenuBarAgentPositionStore
+                    .synchronizeOwnerPreferredPositions(
+                        for: [liveItem, liveTarget],
+                        among: liveItems
+                    )
+                if !ownersToRelaunch.isEmpty {
+                    await relaunchMacOS27StatusItemOwners(ownersToRelaunch)
+                    let sectionToRestore = appState.menuBarManager.macOS27Controller
+                        .beginVisibilityRefreshForRepublishedItems()
+                    await eventSleep(for: .milliseconds(250))
+                    appState.menuBarManager.macOS27Controller
+                        .finishVisibilityRefreshForRepublishedItems(restoring: sectionToRestore)
+                    await eventSleep(for: .milliseconds(700))
+                    liveItems = await MenuBarItem.getMenuBarItems(option: .activeSpace)
+                    guard
+                        let refreshedItem = liveItems.first(where: { $0.tag == item.tag }),
+                        let refreshedTarget = liveItems.first(where: { $0.tag == destination.targetItem.tag })
+                    else {
+                        throw EventError.cannotComplete
+                    }
+                    liveItem = refreshedItem
+                    liveTarget = refreshedTarget
+                    liveDestination = switch destination {
+                    case .leftOfItem: .leftOfItem(liveTarget)
+                    case .rightOfItem: .rightOfItem(liveTarget)
+                    }
+                }
+
+                var didReachDestination = await macOS27ItemHasCorrectPosition(
                     item: liveItem,
-                    to: liveDestination,
-                    liveItems: liveItems
+                    for: liveDestination
                 )
+                if !didReachDestination {
+                    try await waitForUserToPauseInput()
+                    appState.hidEventManager.stopAll()
+                    defer { appState.hidEventManager.startAll() }
+
+                    var lastError: Error?
+                    for attempt in 1...3 where !didReachDestination {
+                        do {
+                            try await waitForMoveOperationBuffer()
+                            try await postMacOS27CommandDrag(
+                                item: liveItem,
+                                destination: liveDestination
+                            )
+                        } catch {
+                            lastError = error
+                            logger.debug(
+                                "macOS 27 hosted move attempt \(attempt, privacy: .public) failed: \(error, privacy: .public)"
+                            )
+                        }
+                        await eventSleep(for: .milliseconds(75))
+                        didReachDestination = await macOS27ItemHasCorrectPosition(
+                            item: liveItem,
+                            for: liveDestination
+                        )
+                    }
+                    guard didReachDestination else {
+                        throw lastError ?? EventError.cannotComplete
+                    }
+                }
+
+                let reorderedItems = await MenuBarItem.getMenuBarItems(option: .activeSpace)
+                    .sorted { $0.bounds.minX < $1.bounds.minX }
+                logger.notice(
+                    "macOS 27 live order after move: \(reorderedItems.map(\.displayName), privacy: .public)"
+                )
+            } catch {
+                appState.menuBarManager.macOS27Controller.completePendingMove()
+                if temporarilyRevealedAll {
+                    appState.menuBarManager.syncMacOS27Visibility()
+                }
+                throw error
+            }
+            if temporarilyRevealedAll {
+                appState.menuBarManager.syncMacOS27Visibility()
+                await eventSleep(for: .milliseconds(200))
             }
             await cacheItemsRegardless()
+            appState.menuBarManager.macOS27Controller.completePendingMove()
             return
         }
 
@@ -1188,6 +1466,86 @@ extension MenuBarItemManager {
                 throw EventError.cannotComplete
             }
         }
+    }
+
+    /// Moves an item into a section that currently has no other item to use as
+    /// a Layout drag destination.
+    func move(item: MenuBarItem, toSection section: MenuBarSection.Name) async throws {
+        guard #available(macOS 27.0, *), let appState else {
+            throw EventError.cannotComplete
+        }
+
+        appState.menuBarManager.macOS27Controller.move(item: item, to: section)
+        appState.menuBarManager.macOS27Controller.temporarilyRevealAll()
+        await eventSleep(for: .milliseconds(300))
+
+        do {
+            var liveItems = await MenuBarItem.getMenuBarItems(option: .activeSpace)
+            guard
+                var liveItem = liveItems.first(where: { $0.tag == item.tag }),
+                var iceItem = liveItems.first(matching: .visibleControlItem)
+            else {
+                throw EventError.cannotComplete
+            }
+            var destination: MoveDestination = section == .visible
+                ? .rightOfItem(iceItem)
+                : .leftOfItem(iceItem)
+            if section == .visible {
+                _ = MacOS27MenuBarAgentPositionStore.move(
+                    item: liveItem,
+                    to: destination,
+                    liveItems: liveItems
+                )
+            }
+            let ownersToRelaunch = MacOS27MenuBarAgentPositionStore
+                .synchronizeOwnerPreferredPositions(
+                    for: [liveItem],
+                    among: liveItems
+                )
+            if !ownersToRelaunch.isEmpty {
+                await relaunchMacOS27StatusItemOwners(ownersToRelaunch)
+                let sectionToRestore = appState.menuBarManager.macOS27Controller
+                    .beginVisibilityRefreshForRepublishedItems()
+                await eventSleep(for: .milliseconds(250))
+                appState.menuBarManager.macOS27Controller
+                    .finishVisibilityRefreshForRepublishedItems(restoring: sectionToRestore)
+                await eventSleep(for: .milliseconds(700))
+                liveItems = await MenuBarItem.getMenuBarItems(option: .activeSpace)
+                guard
+                    let refreshedItem = liveItems.first(where: { $0.tag == item.tag }),
+                    let refreshedIceItem = liveItems.first(matching: .visibleControlItem)
+                else {
+                    throw EventError.cannotComplete
+                }
+                liveItem = refreshedItem
+                iceItem = refreshedIceItem
+                destination = section == .visible
+                    ? .rightOfItem(iceItem)
+                    : .leftOfItem(iceItem)
+            }
+
+            if !(await macOS27ItemHasCorrectPosition(item: liveItem, for: destination)) {
+                try await waitForUserToPauseInput()
+                appState.hidEventManager.stopAll()
+                defer { appState.hidEventManager.startAll() }
+                try await postMacOS27CommandDrag(
+                    item: liveItem,
+                    destination: destination
+                )
+            }
+            guard await macOS27ItemHasCorrectPosition(item: liveItem, for: destination) else {
+                throw EventError.cannotComplete
+            }
+        } catch {
+            appState.menuBarManager.macOS27Controller.completePendingMove()
+            appState.menuBarManager.syncMacOS27Visibility()
+            throw error
+        }
+
+        appState.menuBarManager.syncMacOS27Visibility()
+        await eventSleep(for: .milliseconds(200))
+        await cacheItemsRegardless()
+        appState.menuBarManager.macOS27Controller.completePendingMove()
     }
 }
 

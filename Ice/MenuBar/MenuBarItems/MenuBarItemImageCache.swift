@@ -17,6 +17,16 @@ final class MenuBarItemImageCache: ObservableObject {
         /// The scale factor of the image at the time of capture.
         let scale: CGFloat
 
+        /// Whether this image was reconstructed from Accessibility metadata
+        /// instead of captured from the actual MenuBarAgent button.
+        let isSemanticReplica: Bool
+
+        init(cgImage: CGImage, scale: CGFloat, isSemanticReplica: Bool = false) {
+            self.cgImage = cgImage
+            self.scale = scale
+            self.isSemanticReplica = isSemanticReplica
+        }
+
         /// The image's size, applying ``scale``.
         var scaledSize: CGSize {
             CGSize(
@@ -263,7 +273,7 @@ final class MenuBarItemImageCache: ObservableObject {
             }
         }
 
-        for item in capturable where result.images[item.tag] == nil {
+        for item in capturable where result.images[item.tag] == nil || prefersSemanticReplica(for: item) {
             if let fallback = menuBarReplicaImage(for: item, scale: fallbackScale) {
                 result.images[item.tag] = fallback
             } else {
@@ -345,11 +355,19 @@ final class MenuBarItemImageCache: ObservableObject {
         let effectiveScale = cgImage.width > 0 && logicalSize.width > 0
             ? CGFloat(cgImage.width) / logicalSize.width
             : scale
-        return CapturedImage(cgImage: cgImage, scale: effectiveScale)
+        return CapturedImage(
+            cgImage: cgImage,
+            scale: effectiveScale,
+            isSemanticReplica: true
+        )
     }
 
     private nonisolated func replicaSymbolName(for item: MenuBarItem) -> String? {
         let value = "\(item.tag.title) \(item.title ?? "") \(item.displayName)".lowercased()
+        if value.contains("spotlight") || value.contains("search") || value.contains("搜索") {
+            return "magnifyingglass"
+        }
+        if value.contains("siri") { return "siri" }
         if value.contains("battery") { return "battery.100" }
         if value.contains("wifi") || value.contains("wi-fi") { return "wifi" }
         if value.contains("bluetooth") { return "bluetooth" }
@@ -369,6 +387,12 @@ final class MenuBarItemImageCache: ObservableObject {
     }
 
     private nonisolated func replicaLabel(for item: MenuBarItem) -> String? {
+        if item.tag.namespace == .textInputMenuAgent,
+           let inputSourceLabel = currentInputSourceLabel()
+        {
+            return inputSourceLabel
+        }
+
         let raw = (item.title ?? "")
             .replacingOccurrences(of: "\n", with: " ")
             .split(whereSeparator: \.isWhitespace)
@@ -391,12 +415,9 @@ final class MenuBarItemImageCache: ObservableObject {
             return String(raw[range])
         }
         if replicaSymbolName(for: item) != nil {
-            if
-                case .string(let bundleIdentifier) = item.tag.namespace,
-                !bundleIdentifier.hasPrefix("com.apple.")
-            {
-                return compact(item.displayName)
-            }
+            // A recognized symbol represents the button itself. Appending the
+            // owning application's name makes the Layout row look unlike the
+            // compact status item and introduces artificial spacing.
             return nil
         }
         let genericTitles = ["item-0", "item-1", "window", "button"]
@@ -404,6 +425,50 @@ final class MenuBarItemImageCache: ObservableObject {
             return compact(item.displayName)
         }
         return compact(raw)
+    }
+
+    /// Some hosted system items expose a generic AX identity instead of their
+    /// actual pixels. Prefer a deterministic menu-bar glyph for those items so
+    /// Layout never falls back to labels such as `Item-0` or `Spotlight`.
+    private nonisolated func prefersSemanticReplica(for item: MenuBarItem) -> Bool {
+        if item.tag.namespace == .textInputMenuAgent { return true }
+        let value = "\(item.tag.title) \(item.title ?? "") \(item.displayName)".lowercased()
+        return value.contains("spotlight") || value.contains("search") || value.contains("搜索")
+    }
+
+    private nonisolated func currentInputSourceLabel() -> String? {
+        let domain = "com.apple.HIToolbox" as CFString
+        let selectedSources = CFPreferencesCopyAppValue(
+            "AppleSelectedInputSources" as CFString,
+            domain
+        ) as? [[String: Any]] ?? []
+        let currentLayout = CFPreferencesCopyAppValue(
+            "AppleCurrentKeyboardLayoutInputSourceID" as CFString,
+            domain
+        ) as? String
+        let identity = (selectedSources.flatMap { source in
+            [source["Bundle ID"] as? String, source["Input Mode"] as? String]
+                .compactMap { $0 }
+        } + [currentLayout].compactMap { $0 })
+            .joined(separator: " ")
+            .lowercased()
+
+        if identity.contains("scim") || identity.contains("itabc") ||
+            identity.contains("pinyin") || identity.contains("simplified")
+        {
+            return "简"
+        }
+        if identity.contains("tcim") || identity.contains("zhuyin") ||
+            identity.contains("traditional")
+        {
+            return "繁"
+        }
+        if identity.contains("japanese") || identity.contains("kotoeri") {
+            return "あ"
+        }
+        if identity.contains("korean") { return "한" }
+        if identity.contains("abc") || identity.contains("us") { return "ABC" }
+        return nil
     }
 
     private nonisolated func compact(_ value: String) -> String? {
@@ -462,7 +527,17 @@ final class MenuBarItemImageCache: ObservableObject {
         }
 
         await MainActor.run { [newImages] in
-            images.merge(newImages) { (_, new) in new }
+            let validTags = Set(appState.itemManager.itemCache.managedItems.map(\.tag))
+            images = images.filter { validTags.contains($0.key) }
+            images.merge(newImages) { current, new in
+                // A concealed item can only produce a semantic fallback. Keep
+                // its last exact capture until it is visible and can be
+                // recaptured, rather than replacing it with a guessed icon.
+                if !current.isSemanticReplica, new.isSemanticReplica {
+                    return current
+                }
+                return new
+            }
         }
     }
 

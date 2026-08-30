@@ -186,7 +186,8 @@ final class LayoutBarContainer: NSView {
         }
         var newViews = [LayoutBarItemView]()
         for item in items {
-            if let existingView = arrangedViews.first(where: { $0.item == item }) {
+            if let existingView = arrangedViews.first(where: { $0.item.tag == item.tag }) {
+                existingView.update(item: item)
                 newViews.append(existingView)
             } else {
                 let view = LayoutBarItemView(appState: appState, item: item)

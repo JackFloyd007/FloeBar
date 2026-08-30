@@ -5,6 +5,7 @@
 
 import Cocoa
 import Combine
+import OSLog
 
 // MARK: - LayoutBarItemView
 
@@ -15,7 +16,7 @@ final class LayoutBarItemView: NSView {
     private var cancellables = Set<AnyCancellable>()
 
     /// The item that the view represents.
-    let item: MenuBarItem
+    private(set) var item: MenuBarItem
 
     /// Temporary information that the item view retains when it is moved outside
     /// of a layout view.
@@ -70,6 +71,21 @@ final class LayoutBarItemView: NSView {
 
         self.toolTip = item.displayName
         self.isEnabled = item.isMovable
+        setAccessibilityElement(true)
+        setAccessibilityLabel(item.displayName)
+        setAccessibilityHelp("Drag to reorder this menu bar item")
+        setAccessibilityCustomActions([
+            NSAccessibilityCustomAction(
+                name: "Move Left"
+            ) { [weak self] in
+                self?.moveOnePosition(left: true) ?? false
+            },
+            NSAccessibilityCustomAction(
+                name: "Move Right"
+            ) { [weak self] in
+                self?.moveOnePosition(left: false) ?? false
+            },
+        ])
 
         configureCancellables()
     }
@@ -85,15 +101,53 @@ final class LayoutBarItemView: NSView {
         if let appState {
             appState.imageCache.$images
                 .sink { [weak self] images in
-                    guard let self, let cachedImage = images[item.tag] else {
-                        return
-                    }
-                    self.cachedImage = cachedImage
+                    guard let self else { return }
+                    self.cachedImage = images[item.tag]
                 }
                 .store(in: &c)
         }
 
         cancellables = c
+    }
+
+    /// Refreshes mutable Accessibility metadata while preserving the view and
+    /// its captured image subscription. Recreating every item view whenever a
+    /// menu bar frame changes produces a visible blink in the layout editor.
+    func update(item: MenuBarItem) {
+        precondition(self.item.tag == item.tag)
+        self.item = item
+        toolTip = item.displayName
+        setAccessibilityLabel(item.displayName)
+        isEnabled = item.isMovable
+        if cachedImage == nil {
+            setFrameSize(item.bounds.size)
+        }
+    }
+
+    private func moveOnePosition(left: Bool) -> Bool {
+        guard
+            let appState,
+            let address = appState.itemManager.itemCache.address(for: item.tag)
+        else {
+            return false
+        }
+
+        let items = appState.itemManager.itemCache[address.section]
+        let targetIndex = left ? address.index - 1 : address.index + 1
+        guard items.indices.contains(targetIndex) else { return false }
+        let destination: MenuBarItemManager.MoveDestination = left
+            ? .leftOfItem(items[targetIndex])
+            : .rightOfItem(items[targetIndex])
+
+        Task { @MainActor [weak self, weak appState] in
+            guard let self, let appState else { return }
+            do {
+                try await appState.itemManager.move(item: item, to: destination)
+            } catch {
+                Logger.default.error("Error moving menu bar item: \(error, privacy: .public)")
+            }
+        }
+        return true
     }
 
     /// Provides an alert to display when the item view is disabled.
