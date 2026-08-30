@@ -208,6 +208,14 @@ final class ControlItem {
                 else {
                     return
                 }
+                if #available(macOS 27.0, *), self.identifier != .visible {
+                    if section.isEnabled {
+                        hotkey.enable()
+                    } else {
+                        hotkey.disable()
+                    }
+                    return
+                }
                 if isVisible {
                     hotkey.enable()
                 } else {
@@ -344,6 +352,18 @@ final class ControlItem {
         button.title = ""
         button.image = nil
 
+        if #available(macOS 27.0, *), identifier != .visible {
+            // Section membership is assignment-backed on macOS 27. Publishing
+            // the old divider status items creates a second Ice-looking item
+            // and AppKit reserves a 16 pt slot for each one even at length 0.
+            // Keep their state objects for hotkeys and toggling, but remove the
+            // obsolete status items from MenuBarAgent entirely.
+            removeFromMenuBar()
+            constraint?.isActive = false
+            statusItem.length = 0
+            return
+        }
+
         switch identifier {
         case .visible:
             updateStatusItemVisibility(true)
@@ -449,6 +469,31 @@ final class ControlItem {
         if let position = ControlItemDefaults[.preferredPosition, autosaveName], position <= 0 {
             ControlItemDefaults[.preferredPosition, autosaveName] = nil
         }
+
+        // MenuBarAgent can remove the scene without changing AppKit's
+        // `isVisible` property. In that state, assigning `true` again is a
+        // no-op. Re-publish the same status item only when AX confirms its
+        // button is actually absent; this avoids periodic flicker and cannot
+        // create a second logical Ice item.
+        let isPublished = NSRunningApplication
+            .runningApplications(withBundleIdentifier: "com.apple.MenuBarAgent")
+            .contains { runningApp in
+                guard
+                    let application = AXHelpers.application(for: runningApp),
+                    let menuBar = AXHelpers.extrasMenuBar(for: application)
+                else {
+                    return false
+                }
+                return AXHelpers.children(for: menuBar).contains { child in
+                    AXHelpers.identifier(for: child) == Identifier.visible.rawValue
+                }
+            }
+        if !isPublished {
+            let cachedPosition = ControlItemDefaults[.preferredPosition, autosaveName]
+            statusItem.isVisible = false
+            ControlItemDefaults[.preferredPosition, autosaveName] = cachedPosition
+            statusItem.isVisible = true
+        }
         statusItem.isVisible = true
         constraint?.isActive = true
         statusItem.length = identifier.length(for: state)
@@ -457,6 +502,9 @@ final class ControlItem {
 
     /// Adds the control item to the menu bar.
     private func addToMenuBar() {
+        if #available(macOS 27.0, *), identifier != .visible {
+            return
+        }
         guard !isAddedToMenuBar else {
             return
         }
@@ -690,11 +738,12 @@ enum ControlItemDefaults {
         {
             ControlItemDefaults[.visibleCC, autosaveName] = true
         }
-        if #available(macOS 27.0, *), controlItem.identifier != .alwaysHidden {
-            ControlItemDefaults[.visible, autosaveName] = true
-            ControlItemDefaults[.visibleCC, autosaveName] = true
+        if #available(macOS 27.0, *) {
+            let isUserFacingToggle = controlItem.identifier == .visible
+            ControlItemDefaults[.visible, autosaveName] = isUserFacingToggle
+            ControlItemDefaults[.visibleCC, autosaveName] = isUserFacingToggle
             if
-                controlItem.identifier == .visible,
+                isUserFacingToggle,
                 let position = ControlItemDefaults[.preferredPosition, autosaveName],
                 position <= 0
             {

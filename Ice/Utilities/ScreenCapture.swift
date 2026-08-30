@@ -113,10 +113,11 @@ enum ScreenCapture {
     static func captureMenuBarHostingWindow(
         displayID: CGDirectDisplayID
     ) async -> MenuBarHostingCapture? {
-        // SCShareableContent itself can trigger a consent alert. Image capture
-        // is optional on macOS 27 because the layout can use application icons,
-        // so never query it until TCC confirms access without prompting.
-        guard CGPreflightScreenCaptureAccess() else {
+        // SCShareableContent itself can trigger a consent alert. Cache the
+        // non-prompting permission check so the layout refresh timer does not
+        // hit TCC every three seconds. The caller has a semantic replica when
+        // capture is unavailable.
+        guard cachedCheckPermissions() else {
             return nil
         }
 

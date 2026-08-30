@@ -16,10 +16,15 @@ menu bar items are no longer exposed as independent WindowServer windows.
   works on wide displays where position changes alone do not cause overflow.
 - Native ordering is persisted through MenuBarAgent's
   `TrailingItemPreferredPositions` preference and restored when Ice exits.
+- The legacy Hidden and Always-Hidden divider status items are not published on
+  macOS 27. The permanent Ice toggle is the only Ice item in the menu bar, so
+  section changes do not create duplicate icons or reserve empty slots.
 - Item images are cropped from MenuBarAgent's composite hosting window, with
-  application icons used when Screen Recording is unavailable.
+  Accessibility-derived menu bar symbols and text used when Screen Recording
+  is unavailable. The layout never substitutes the owning application's icon.
 - Screen Recording is optional on macOS 27. Ice does not request it during
-  startup or ordinary hide/reveal operations.
+  startup or ordinary hide/reveal operations, and permission checks are cached
+  instead of polling TCC on every layout refresh.
 - The obsolete macOS 26 item-attribution XPC service is not started on macOS 27.
 
 ## Limitations

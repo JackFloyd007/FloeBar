@@ -105,11 +105,20 @@ final class MenuBarSection {
 
     /// A Boolean value that indicates whether the section is enabled.
     var isEnabled: Bool {
-        if case .visible = name {
-            // The visible section should always be enabled.
-            return true
+        if #available(macOS 27.0, *) {
+            return switch name {
+            case .visible, .hidden:
+                true
+            case .alwaysHidden:
+                appState?.settings.advanced.enableAlwaysHiddenSection ?? false
+            }
+        } else {
+            if case .visible = name {
+                // The visible section should always be enabled.
+                return true
+            }
+            return controlItem.isAddedToMenuBar
         }
-        return controlItem.isAddedToMenuBar
     }
 
     /// The hotkey to toggle the section.
@@ -155,9 +164,8 @@ final class MenuBarSection {
             return
         }
 
-        guard controlItem.isAddedToMenuBar else {
+        guard isEnabled else {
             // The section is disabled.
-            // TODO: Can we use isEnabled for this check?
             return
         }
 

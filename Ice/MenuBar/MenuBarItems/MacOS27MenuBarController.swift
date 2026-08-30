@@ -27,6 +27,11 @@ final class MacOS27MenuBarController {
     private static let allSystemItemIdentifiers = Set(0 ... 8)
     private static let protectedBundleIdentifiers: Set<String> = [
         Constants.bundleIdentifier,
+        // AppKit publishes NSStatusItem scenes through these clients on
+        // macOS 27. Allow both hosts so Ice's sole user-facing toggle is not
+        // removed when the visibility restriction is recomputed.
+        "com.apple.appkit.status-items",
+        "com.apple.MenuBarAgent.systemservices",
         "com.apple.MenuBarAgent",
         "com.apple.controlcenter",
         "com.apple.systemuiserver",

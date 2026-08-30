@@ -222,7 +222,8 @@ final class MenuBarItemImageCache: ObservableObject {
 
     /// Captures macOS 27 items from MenuBarAgent's composite hosting window.
     /// Items that are currently concealed, or systems without Screen Recording
-    /// permission, receive their owning application's icon as a usable fallback.
+    /// permission, receive a semantic replica of their menu bar button instead
+    /// of the owning application's icon.
     @available(macOS 27.0, *)
     private nonisolated func captureMacOS27Images(
         of items: [MenuBarItem],
@@ -263,7 +264,7 @@ final class MenuBarItemImageCache: ObservableObject {
         }
 
         for item in capturable where result.images[item.tag] == nil {
-            if let fallback = fallbackImage(for: item, scale: fallbackScale) {
+            if let fallback = menuBarReplicaImage(for: item, scale: fallbackScale) {
                 result.images[item.tag] = fallback
             } else {
                 result.excluded.append(item)
@@ -272,26 +273,143 @@ final class MenuBarItemImageCache: ObservableObject {
         return result
     }
 
-    private nonisolated func fallbackImage(
+    /// Draws the information that the status item exposes through Accessibility.
+    /// This intentionally avoids application icons: those often look unrelated
+    /// to the compact symbol or text the application actually puts in the bar.
+    private nonisolated func menuBarReplicaImage(
         for item: MenuBarItem,
         scale: CGFloat
     ) -> CapturedImage? {
-        let icon = item.sourceApplication?.icon
-            ?? item.owningApplication?.icon
-            ?? NSImage(systemSymbolName: "app", accessibilityDescription: nil)
-        guard let icon else { return nil }
+        let symbolName = replicaSymbolName(for: item)
+        let label = replicaLabel(for: item)
+        let pointSize: CGFloat = 14
+        let font = NSFont.menuBarFont(ofSize: pointSize)
 
-        var proposedRect = CGRect(
-            origin: .zero,
-            size: CGSize(width: max(item.bounds.width, 18), height: max(item.bounds.height, 18))
-        )
-        guard let image = icon.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil) else {
+        let symbol = symbolName.flatMap {
+            NSImage(systemSymbolName: $0, accessibilityDescription: item.displayName)?
+                .withSymbolConfiguration(.init(pointSize: pointSize, weight: .regular))
+        }
+        let labelSize = label.map {
+            ($0 as NSString).size(withAttributes: [.font: font])
+        }
+        let logicalSize: CGSize
+        if let symbol {
+            logicalSize = CGSize(
+                width: max(18, symbol.size.width + (labelSize.map { $0.width + 4 } ?? 0)),
+                height: 18
+            )
+        } else if let labelSize {
+            logicalSize = CGSize(width: min(max(18, labelSize.width), 112), height: 18)
+        } else {
             return nil
         }
-        let effectiveScale = image.width > 0 && proposedRect.width > 0
-            ? CGFloat(image.width) / proposedRect.width
+
+        let image = NSImage(size: logicalSize, flipped: false) { bounds in
+            var cursorX = bounds.minX
+            if let symbol {
+                let symbolSize = symbol.size
+                let symbolRect = CGRect(
+                    x: cursorX,
+                    y: bounds.midY - symbolSize.height / 2,
+                    width: symbolSize.width,
+                    height: symbolSize.height
+                )
+                symbol.draw(in: symbolRect)
+                NSColor.labelColor.setFill()
+                symbolRect.fill(using: .sourceIn)
+                cursorX = symbolRect.maxX + 4
+            }
+            if let label {
+                let attributes: [NSAttributedString.Key: Any] = [
+                    .font: font,
+                    .foregroundColor: NSColor.labelColor,
+                ]
+                let labelRect = CGRect(
+                    x: cursorX,
+                    y: bounds.midY - (labelSize?.height ?? 0) / 2,
+                    width: max(0, bounds.maxX - cursorX),
+                    height: labelSize?.height ?? bounds.height
+                )
+                (label as NSString).draw(
+                    in: labelRect,
+                    withAttributes: attributes
+                )
+            }
+            return true
+        }
+
+        var proposedRect = CGRect(origin: .zero, size: logicalSize)
+        guard let cgImage = image.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil) else {
+            return nil
+        }
+        let effectiveScale = cgImage.width > 0 && logicalSize.width > 0
+            ? CGFloat(cgImage.width) / logicalSize.width
             : scale
-        return CapturedImage(cgImage: image, scale: effectiveScale)
+        return CapturedImage(cgImage: cgImage, scale: effectiveScale)
+    }
+
+    private nonisolated func replicaSymbolName(for item: MenuBarItem) -> String? {
+        let value = "\(item.tag.title) \(item.title ?? "") \(item.displayName)".lowercased()
+        if value.contains("battery") { return "battery.100" }
+        if value.contains("wifi") || value.contains("wi-fi") { return "wifi" }
+        if value.contains("bluetooth") { return "bluetooth" }
+        if value.contains("controlcenter") || value.contains("control center") { return "switch.2" }
+        if value.contains("display") || value.contains("screenmirroring") { return "rectangle.on.rectangle" }
+        if value.contains("volume") || value.contains("sound") || value.contains("音量") { return "speaker.wave.2.fill" }
+        if value.contains("audiovideo") || value.contains("audio and video") || value.contains("音频和视频") {
+            return "video.fill"
+        }
+        if value.contains("now-playing") || value.contains("now playing") || value.contains("播放中") {
+            return "play.fill"
+        }
+        if value.contains("fan") || value.contains("rpm") { return "fan.fill" }
+        if value.contains("weather") { return "cloud.sun.fill" }
+        if value.contains("password") { return "key.fill" }
+        return nil
+    }
+
+    private nonisolated func replicaLabel(for item: MenuBarItem) -> String? {
+        let raw = (item.title ?? "")
+            .replacingOccurrences(of: "\n", with: " ")
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        guard !raw.isEmpty else {
+            return replicaSymbolName(for: item) == nil ? compact(item.displayName) : nil
+        }
+
+        if item.tag.namespace == .textInputMenuAgent {
+            if let firstCJK = raw.first(where: { character in
+                character.unicodeScalars.contains { $0.properties.isIdeographic }
+            }) {
+                return String(firstCJK)
+            }
+            return compact(raw)
+        }
+        if raw.localizedCaseInsensitiveContains("rpm"),
+           let range = raw.range(of: #"\d+\s*RPM"#, options: .regularExpression)
+        {
+            return String(raw[range])
+        }
+        if replicaSymbolName(for: item) != nil {
+            if
+                case .string(let bundleIdentifier) = item.tag.namespace,
+                !bundleIdentifier.hasPrefix("com.apple.")
+            {
+                return compact(item.displayName)
+            }
+            return nil
+        }
+        let genericTitles = ["item-0", "item-1", "window", "button"]
+        if genericTitles.contains(raw.lowercased()) || raw.hasPrefix("Ice.ControlItem.") {
+            return compact(item.displayName)
+        }
+        return compact(raw)
+    }
+
+    private nonisolated func compact(_ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return String(trimmed.prefix(12))
     }
 
     /// Captures the images of the menu bar items in the given section and returns
