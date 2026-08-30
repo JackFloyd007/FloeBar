@@ -36,9 +36,33 @@ enum MacOS27MenuBarItemProvider {
         }
 
         let displayBounds = display.map(CGDisplayBounds)
+        return menuBarItems(
+            from: NSWorkspace.shared.runningApplications,
+            displayBounds: displayBounds
+        )
+    }
+
+    /// Reads only the owners involved in a reorder. A complete AX walk can
+    /// spend the per-process timeout on every running app; two targeted owners
+    /// are enough to refresh drag bounds and verify adjacency.
+    static func menuBarItems(sourcePIDs: Set<pid_t>) -> [MenuBarItem] {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+
+        guard AXHelpers.isProcessTrusted(), !sourcePIDs.isEmpty else { return [] }
+        let applications = NSWorkspace.shared.runningApplications.filter {
+            sourcePIDs.contains($0.processIdentifier)
+        }
+        return menuBarItems(from: applications, displayBounds: nil)
+    }
+
+    private static func menuBarItems(
+        from runningApplications: [NSRunningApplication],
+        displayBounds: CGRect?
+    ) -> [MenuBarItem] {
         var rawItems = [RawItem]()
 
-        for runningApp in NSWorkspace.shared.runningApplications {
+        for runningApp in runningApplications {
             guard
                 let application = AXHelpers.application(for: runningApp),
                 let extrasMenuBar = AXHelpers.extrasMenuBar(for: application)

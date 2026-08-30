@@ -255,10 +255,10 @@ enum MacOS27MenuBarAgentPositionStore {
     static func synchronizeOwnerPreferredPositions(
         for items: [MenuBarItem],
         among liveItems: [MenuBarItem]
-    ) -> [NSRunningApplication] {
+    ) -> Bool {
         let positions = readPositions()
         let positionKeys = Array(positions.keys)
-        var applicationsByPID = [pid_t: NSRunningApplication]()
+        var didSynchronize = false
 
         // AppKit stores an NSStatusItem's preferred position as the slot on
         // its right, while MenuBarAgent stores a weight for the item itself.
@@ -311,9 +311,9 @@ enum MacOS27MenuBarAgentPositionStore {
             else {
                 continue
             }
-            applicationsByPID[application.processIdentifier] = application
+            didSynchronize = true
         }
-        return Array(applicationsByPID.values)
+        return didSynchronize
     }
 
     private static func writeOwnerPreferredPosition(
@@ -346,10 +346,9 @@ enum MacOS27MenuBarAgentPositionStore {
             kCFPreferencesCurrentUser,
             kCFPreferencesAnyHost
         )
-        // The running NSStatusItem scene may still be using the value it read
-        // at launch even when the preference already equals the desired
-        // weight. Report the owner as synchronizable so the caller can
-        // republish that third-party scene and make the physical order match.
+        // The running scene may still be using the value it read at launch,
+        // but a matching preference is already durable. The caller handles a
+        // live placement with a short native drag and never restarts the app.
         guard numericValue(existing) != weight else { return true }
 
         CFPreferencesSetValue(

@@ -260,7 +260,6 @@ extension LayoutBarItemView: NSDraggingSource {
             guard let (container, index) = oldContainerInfo else {
                 return
             }
-            container.shouldAnimateNextLayoutPass = false
             container.arrangedViews.insert(self, at: index)
         }
     }

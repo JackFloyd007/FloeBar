@@ -245,10 +245,24 @@ extension HIDEventManager {
         }
 
         let initialSpaceID = Bridging.getActiveSpaceID()
+        let rehideInterval = appState.settings.general.rehideInterval
 
         Task {
-            // Give the window under the mouse a chance to focus.
-            try await Task.sleep(for: .milliseconds(250))
+            // Let the control item's action run before deciding whether this
+            // was an outside click. On macOS 27 the item is hosted by
+            // MenuBarAgent, so event.window cannot identify it reliably.
+            await Task.yield()
+            if appState.menuBarManager.shouldSuppressMacOS27SmartRehide {
+                return
+            }
+
+            // Smart mode still respects the user's configured rehide delay.
+            // The previous fixed 250 ms delay looked like a post-click twitch.
+            do {
+                try await Task.sleep(for: .seconds(rehideInterval))
+            } catch {
+                return
+            }
 
             // Don't bother checking the window if the click caused
             // a space change.

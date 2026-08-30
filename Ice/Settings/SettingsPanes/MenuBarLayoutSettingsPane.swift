@@ -30,6 +30,19 @@ struct MenuBarLayoutSettingsPane: View {
             header
             layoutBars
         }
+        .onAppear {
+            if #available(macOS 27.0, *) {
+                // Concealed hosted items have no live AX element and cannot be
+                // reordered reliably. Reveal them once for the whole editing
+                // session instead of flashing the bar around every drag.
+                appState.menuBarManager.macOS27Controller.temporarilyRevealAll()
+            }
+        }
+        .onDisappear {
+            if #available(macOS 27.0, *) {
+                appState.menuBarManager.syncMacOS27Visibility()
+            }
+        }
     }
 
     @ViewBuilder

@@ -60,19 +60,34 @@ final class MenuBarManager: ObservableObject {
         MenuBarSection(name: .alwaysHidden),
     ]
 
+    /// Prevents the mouse event that opened a macOS 27 section from being
+    /// interpreted as the first outside click by Smart Rehide.
+    private var macOS27ControlToggleTimestamp: ContinuousClock.Instant?
+
     /// A Boolean value that indicates whether at least one of the manager's
     /// sections is visible.
     var hasVisibleSection: Bool {
         sections.contains { !$0.isHidden }
     }
 
+    func noteMacOS27ControlToggle() {
+        guard #available(macOS 27.0, *) else { return }
+        macOS27ControlToggleTimestamp = .now
+    }
+
+    var shouldSuppressMacOS27SmartRehide: Bool {
+        guard
+            #available(macOS 27.0, *),
+            let timestamp = macOS27ControlToggleTimestamp
+        else {
+            return false
+        }
+        return timestamp.duration(to: .now) <= .seconds(1)
+    }
+
     /// Performs the initial setup of the menu bar manager.
     func performSetup(with appState: AppState) {
         self.appState = appState
-        macOS27Controller.positionRefreshHandler = { [weak self] in
-            guard let self else { return }
-            controlItem(withName: .visible)?.requestMacOS27PositionRefresh()
-        }
         configureCancellables()
         iceBarPanel.performSetup(with: appState)
         searchPanel.performSetup(with: appState)

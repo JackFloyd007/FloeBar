@@ -33,12 +33,6 @@ final class LayoutBarContainer: NSView {
     /// The section whose items are represented.
     let section: MenuBarSection.Name
 
-    /// A Boolean value that indicates whether the container should
-    /// animate its next layout pass.
-    ///
-    /// After each layout pass, this value is reset to `true`.
-    var shouldAnimateNextLayoutPass = true
-
     /// A Boolean value that indicates whether the container can
     /// set its arranged views.
     var canSetArrangedViews = true
@@ -107,16 +101,12 @@ final class LayoutBarContainer: NSView {
     ///
     /// The container removes from its subviews the views that are included
     /// in the `oldViews` array but not in the the current ``arrangedViews``
-    /// array. Views that are found in both arrays, but at different indices
-    /// are animated from their old index to their new index.
+    /// array. Existing views move directly to their new index; Layout is an
+    /// editor and should never add a second animation after a drag completes.
     ///
     /// - Parameter oldViews: The old value of the container's arranged views.
     ///   Pass `nil` to use the current ``arrangedViews`` array.
     private func layoutArrangedViews(oldViews: [LayoutBarItemView]? = nil) {
-        defer {
-            shouldAnimateNextLayoutPass = true
-        }
-
         let oldViews = oldViews ?? arrangedViews
 
         // remove views that are no longer part of the arranged views
@@ -135,24 +125,16 @@ final class LayoutBarContainer: NSView {
             .map { $0.bounds.height }
             .max() ?? 0
 
-        for var view in arrangedViews {
-            if subviews.contains(view) {
-                // view already exists inside the layout view, but may
-                // have moved from its previous location;
-                if shouldAnimateNextLayoutPass {
-                    // replace the view with its animator proxy
-                    view = view.animator()
-                }
-            } else {
+        for view in arrangedViews {
+            if !subviews.contains(view) {
                 // view does not already exist inside the layout view;
                 // add it as a subview
                 addSubview(view)
                 view.hasContainer = true
             }
 
-            // set the view's origin; if the view is an animator proxy,
-            // it will animate to the new position; otherwise, it must
-            // be a newly added view
+            // Apply the new position immediately. NSView's animator proxy was
+            // the source of the unexplained sliding after a completed reorder.
             view.setFrameOrigin(
                 CGPoint(
                     x: previous.map { $0.frame.maxX } ?? 0,
@@ -212,13 +194,9 @@ final class LayoutBarContainer: NSView {
         }
         switch phase {
         case .entered:
-            if !arrangedViews.contains(sourceView) {
-                shouldAnimateNextLayoutPass = false
-            }
             return updateArrangedViewsForDrag(with: draggingInfo, phase: .updated)
         case .exited:
             if let sourceIndex = arrangedViews.firstIndex(of: sourceView) {
-                shouldAnimateNextLayoutPass = false
                 arrangedViews.remove(at: sourceIndex)
             }
             return .move

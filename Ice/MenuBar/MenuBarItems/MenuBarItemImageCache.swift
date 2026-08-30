@@ -230,10 +230,10 @@ final class MenuBarItemImageCache: ObservableObject {
         return individualResult
     }
 
-    /// Captures macOS 27 items from MenuBarAgent's composite hosting window.
-    /// Items that are currently concealed, or systems without Screen Recording
-    /// permission, receive a semantic replica of their menu bar button instead
-    /// of the owning application's icon.
+    /// Builds deterministic replicas from the status item's Accessibility
+    /// identity. Capturing MenuBarAgent's composite window can crop the pixels
+    /// at a stale pre-reorder frame and also starts a ScreenCaptureKit stream,
+    /// which macOS may repeatedly prompt for even after permission was granted.
     @available(macOS 27.0, *)
     private nonisolated func captureMacOS27Images(
         of items: [MenuBarItem],
@@ -242,38 +242,8 @@ final class MenuBarItemImageCache: ObservableObject {
         let capturable = items.filter { !$0.isControlItem || $0.tag == .visibleControlItem }
         guard !capturable.isEmpty else { return CaptureResult() }
 
-        let displayID = Bridging.getActiveMenuBarDisplayID() ?? CGMainDisplayID()
-        let capture = await ScreenCapture.captureMenuBarHostingWindow(displayID: displayID)
         var result = CaptureResult()
-
-        if let capture {
-            let imageBounds = CGRect(
-                x: 0,
-                y: 0,
-                width: capture.image.width,
-                height: capture.image.height
-            )
-            for item in capturable where capture.windowFrame.intersects(item.bounds) {
-                let rawCropRect = CGRect(
-                    x: (item.bounds.minX - capture.windowFrame.minX) * capture.scale,
-                    y: (item.bounds.minY - capture.windowFrame.minY) * capture.scale,
-                    width: item.bounds.width * capture.scale,
-                    height: item.bounds.height * capture.scale
-                )
-                let cropRect = rawCropRect.integral.intersection(imageBounds)
-                guard
-                    !cropRect.isNull,
-                    !cropRect.isEmpty,
-                    let image = capture.image.cropping(to: cropRect),
-                    !image.isTransparent(alphaThreshold: 0.05)
-                else {
-                    continue
-                }
-                result.images[item.tag] = CapturedImage(cgImage: image, scale: capture.scale)
-            }
-        }
-
-        for item in capturable where result.images[item.tag] == nil || prefersSemanticReplica(for: item) {
+        for item in capturable {
             if let fallback = menuBarReplicaImage(for: item, scale: fallbackScale) {
                 result.images[item.tag] = fallback
             } else {
@@ -364,6 +334,16 @@ final class MenuBarItemImageCache: ObservableObject {
 
     private nonisolated func replicaSymbolName(for item: MenuBarItem) -> String? {
         let value = "\(item.tag.title) \(item.title ?? "") \(item.displayName)".lowercased()
+        let bundleIdentifier = item.sourceApplication?.bundleIdentifier
+            ?? item.owningApplication?.bundleIdentifier
+        if bundleIdentifier == "local.wenbo.AppVolumes" ||
+            value.contains("app volumes") || value.contains("app 音量")
+        {
+            return "slider.horizontal.3"
+        }
+        if bundleIdentifier == "com.crystalidea.macsfancontrol" {
+            return "fan.fill"
+        }
         if value.contains("spotlight") || value.contains("search") || value.contains("搜索") {
             return "magnifyingglass"
         }
@@ -425,15 +405,6 @@ final class MenuBarItemImageCache: ObservableObject {
             return compact(item.displayName)
         }
         return compact(raw)
-    }
-
-    /// Some hosted system items expose a generic AX identity instead of their
-    /// actual pixels. Prefer a deterministic menu-bar glyph for those items so
-    /// Layout never falls back to labels such as `Item-0` or `Spotlight`.
-    private nonisolated func prefersSemanticReplica(for item: MenuBarItem) -> Bool {
-        if item.tag.namespace == .textInputMenuAgent { return true }
-        let value = "\(item.tag.title) \(item.title ?? "") \(item.displayName)".lowercased()
-        return value.contains("spotlight") || value.contains("search") || value.contains("搜索")
     }
 
     private nonisolated func currentInputSourceLabel() -> String? {
@@ -529,15 +500,7 @@ final class MenuBarItemImageCache: ObservableObject {
         await MainActor.run { [newImages] in
             let validTags = Set(appState.itemManager.itemCache.managedItems.map(\.tag))
             images = images.filter { validTags.contains($0.key) }
-            images.merge(newImages) { current, new in
-                // A concealed item can only produce a semantic fallback. Keep
-                // its last exact capture until it is visible and can be
-                // recaptured, rather than replacing it with a guessed icon.
-                if !current.isSemanticReplica, new.isSemanticReplica {
-                    return current
-                }
-                return new
-            }
+            images.merge(newImages) { _, new in new }
         }
     }
 

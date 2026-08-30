@@ -144,11 +144,6 @@ final class ControlItem {
     /// Storage for internal observers.
     private var cancellables = Set<AnyCancellable>()
 
-    /// A compositor-preserving macOS 27 preferred-position refresh.
-    private var macOS27PositionRefreshTask: Task<Void, Never>?
-    private var macOS27PositionRefreshBaseline: CGFloat?
-    private var macOS27PositionRefreshGeneration = 0
-
     /// The control item's underlying status item.
     private var statusItem: NSStatusItem {
         storage.statusItem
@@ -189,58 +184,6 @@ final class ControlItem {
     func performSetup(with appState: AppState) {
         self.appState = appState
         configureCancellables()
-    }
-
-    /// Makes MenuBarAgent consume a preferred-position write without removing
-    /// and republishing Ice's status item. The concrete temporary width matches
-    /// the button, so the invalidation is not visible to the user.
-    func requestMacOS27PositionRefresh() {
-        guard #available(macOS 27.0, *), identifier == .visible else { return }
-
-        macOS27PositionRefreshGeneration += 1
-        let generation = macOS27PositionRefreshGeneration
-        macOS27PositionRefreshTask?.cancel()
-        if let baseline = macOS27PositionRefreshBaseline {
-            statusItem.length = baseline
-            macOS27PositionRefreshBaseline = nil
-        }
-
-        macOS27PositionRefreshTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(50))
-            guard
-                let self,
-                !Task.isCancelled,
-                generation == macOS27PositionRefreshGeneration,
-                let button = statusItem.button,
-                button.bounds.width > 0
-            else {
-                return
-            }
-
-            let baseline = statusItem.length
-            let renderedWidth = button.bounds.width
-            let temporaryLength = if
-                baseline == NSStatusItem.variableLength ||
-                abs(baseline - renderedWidth) > 0.25
-            {
-                renderedWidth
-            } else {
-                renderedWidth + 0.5
-            }
-
-            macOS27PositionRefreshBaseline = baseline
-            statusItem.length = temporaryLength
-            try? await Task.sleep(for: .milliseconds(16))
-            guard
-                !Task.isCancelled,
-                generation == macOS27PositionRefreshGeneration
-            else {
-                return
-            }
-            statusItem.length = baseline
-            macOS27PositionRefreshBaseline = nil
-            macOS27PositionRefreshTask = nil
-        }
     }
 
     /// Configures the internal observers for the control item.
@@ -573,6 +516,7 @@ final class ControlItem {
                     let section = menuBarManager.section(withName: .alwaysHidden),
                     section.isEnabled
                 {
+                    menuBarManager.noteMacOS27ControlToggle()
                     section.toggle()
                     return
                 }
@@ -581,6 +525,7 @@ final class ControlItem {
                     let section = menuBarManager.section(withName: sectionName),
                     section.isEnabled
                 {
+                    menuBarManager.noteMacOS27ControlToggle()
                     section.toggle()
                 }
             }
