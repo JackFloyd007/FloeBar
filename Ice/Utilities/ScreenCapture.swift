@@ -48,7 +48,12 @@ enum ScreenCapture {
 
     /// Requests screen capture permissions.
     static func requestPermissions() {
-        if #available(macOS 15.0, *) {
+        if #available(macOS 27.0, *) {
+            // On macOS 27, querying SCShareableContent while the current
+            // binary is not authorized can repeatedly display the system
+            // consent alert. Only use the explicit, user-initiated request.
+            CGRequestScreenCaptureAccess()
+        } else if #available(macOS 15.0, *) {
             // CGRequestScreenCaptureAccess() is broken on macOS 15. We can
             // try accessing SCShareableContent to trigger a request if the
             // user doesn't have permissions.
@@ -108,6 +113,13 @@ enum ScreenCapture {
     static func captureMenuBarHostingWindow(
         displayID: CGDirectDisplayID
     ) async -> MenuBarHostingCapture? {
+        // SCShareableContent itself can trigger a consent alert. Image capture
+        // is optional on macOS 27 because the layout can use application icons,
+        // so never query it until TCC confirms access without prompting.
+        guard CGPreflightScreenCaptureAccess() else {
+            return nil
+        }
+
         let content: SCShareableContent
         do {
             content = try await shareableContent()

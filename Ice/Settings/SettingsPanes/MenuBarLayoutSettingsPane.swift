@@ -14,15 +14,21 @@ struct MenuBarLayoutSettingsPane: View {
     }
 
     var body: some View {
-        if !ScreenCapture.cachedCheckPermissions() {
-            missingScreenRecordingPermissions
-        } else if appState.menuBarManager.isMenuBarHiddenBySystemUserDefaults {
+        if appState.menuBarManager.isMenuBarHiddenBySystemUserDefaults {
             cannotArrange
+        } else if #available(macOS 27.0, *) {
+            layoutContent
+        } else if !ScreenCapture.cachedCheckPermissions() {
+            missingScreenRecordingPermissions
         } else {
-            IceForm(spacing: 20) {
-                header
-                layoutBars
-            }
+            layoutContent
+        }
+    }
+
+    private var layoutContent: some View {
+        IceForm(spacing: 20) {
+            header
+            layoutBars
         }
     }
 

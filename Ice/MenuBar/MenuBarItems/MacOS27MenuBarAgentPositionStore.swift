@@ -8,14 +8,114 @@
 import Cocoa
 import OSLog
 
-/// Reorders macOS 27 status items using MenuBarAgent's own preferred-position
-/// dictionary. Items no longer have draggable independent windows on this OS.
+/// Reorders and prioritizes macOS 27 status items using MenuBarAgent's own
+/// preferred-position dictionary. Elevated hidden items naturally overflow on
+/// constrained menu bars; the visibility restriction handles wider layouts.
 @available(macOS 27.0, *)
 @MainActor
 enum MacOS27MenuBarAgentPositionStore {
     private static let logger = Logger(category: "MacOS27MenuBarAgentPositionStore")
     private static let domain = "com.apple.MenuBarAgent" as CFString
     private static let positionsKey = "TrailingItemPreferredPositions" as CFString
+    private static let savedWeightsKey = "MacOS27MenuBarAgentPositionStore.savedWeights.v1"
+    private static let hiddenWeightBase = 50_000
+    private static let alwaysHiddenWeightBase = 60_000
+
+    /// Elevates only assigned third-party items into MenuBarAgent's overflow
+    /// preference bands. Apple modules and Ice's control items are deliberately
+    /// excluded so clicking Ice can never reorder unrelated parts of the bar.
+    @discardableResult
+    static func applyVisibility(
+        assignments: [String: MenuBarSection.Name],
+        order: [MenuBarSection.Name: [String]],
+        revealing revealedSection: MenuBarSection.Name?,
+        items: [MenuBarItem]
+    ) -> Bool {
+        var positions = readRawPositions()
+        var savedWeights = readSavedWeights()
+        let existingKeys = Array(positions.keys)
+        let itemByIdentifier = Dictionary(
+            items.map { ($0.tag.persistentIdentifier, $0) },
+            uniquingKeysWith: { current, _ in current }
+        )
+
+        let concealedSections: Set<MenuBarSection.Name> = switch revealedSection {
+        case .alwaysHidden: []
+        case .hidden: [.alwaysHidden]
+        case .visible, nil: [.hidden, .alwaysHidden]
+        }
+
+        var desiredHiddenKeys = [String: Int]()
+        for section in [MenuBarSection.Name.hidden, .alwaysHidden]
+        where concealedSections.contains(section) {
+            let base = section == .hidden ? hiddenWeightBase : alwaysHiddenWeightBase
+            for (offset, identifier) in order[section, default: []].enumerated() {
+                guard
+                    assignments[identifier] == section,
+                    let item = itemByIdentifier[identifier],
+                    isThirdPartyItem(item),
+                    let key = resolveKey(for: item, existingKeys: existingKeys)
+                else {
+                    continue
+                }
+                desiredHiddenKeys[key] = base + offset * 10
+            }
+        }
+
+        var changed = false
+        for (key, hiddenWeight) in desiredHiddenKeys {
+            guard let currentWeight = numericValue(positions[key]) else { continue }
+            if savedWeights[key] == nil, currentWeight < Double(hiddenWeightBase) {
+                savedWeights[key] = currentWeight
+            }
+            if numericValue(positions[key]) != Double(hiddenWeight) {
+                positions[key] = NSNumber(value: hiddenWeight)
+                changed = true
+            }
+        }
+
+        for (key, originalWeight) in savedWeights where desiredHiddenKeys[key] == nil {
+            guard positions[key] != nil else {
+                savedWeights.removeValue(forKey: key)
+                continue
+            }
+            if numericValue(positions[key]) != originalWeight {
+                positions[key] = NSNumber(value: originalWeight)
+                changed = true
+            }
+            savedWeights.removeValue(forKey: key)
+        }
+
+        writeSavedWeights(savedWeights)
+        guard changed else { return false }
+        writeRawPositions(positions)
+        logger.notice(
+            "Applied macOS 27 item visibility: hiddenKeys=\(desiredHiddenKeys.keys.sorted().joined(separator: ","), privacy: .public)"
+        )
+        return true
+    }
+
+    /// Restores every weight captured before Ice parked an item off-screen.
+    @discardableResult
+    static func revealAll() -> Bool {
+        let savedWeights = readSavedWeights()
+        guard !savedWeights.isEmpty else { return false }
+
+        var positions = readRawPositions()
+        var changed = false
+        for (key, originalWeight) in savedWeights where positions[key] != nil {
+            if numericValue(positions[key]) != originalWeight {
+                positions[key] = NSNumber(value: originalWeight)
+                changed = true
+            }
+        }
+        if changed {
+            writeRawPositions(positions)
+        }
+        writeSavedWeights([:])
+        logger.notice("Restored all macOS 27 menu bar item positions")
+        return changed
+    }
 
     @discardableResult
     static func move(
@@ -75,22 +175,62 @@ enum MacOS27MenuBarAgentPositionStore {
     }
 
     private static func readPositions() -> [String: Double] {
-        guard
-            let dictionary = CFPreferencesCopyAppValue(positionsKey, domain) as? [String: Any]
-        else {
-            return [:]
-        }
-        return dictionary.compactMapValues { value in
-            if let number = value as? NSNumber { return number.doubleValue }
-            if let string = value as? String { return Double(string) }
-            return nil
-        }
+        readRawPositions().compactMapValues(numericValue)
     }
 
     private static func writePositions(_ positions: [String: Double]) {
-        let dictionary = positions.mapValues(NSNumber.init(value:)) as CFDictionary
-        CFPreferencesSetAppValue(positionsKey, dictionary, domain)
-        CFPreferencesAppSynchronize(domain)
+        writeRawPositions(positions.mapValues(NSNumber.init(value:)))
+    }
+
+    private static func readRawPositions() -> [String: Any] {
+        CFPreferencesCopyValue(
+            positionsKey,
+            domain,
+            kCFPreferencesCurrentUser,
+            kCFPreferencesAnyHost
+        ) as? [String: Any] ?? [:]
+    }
+
+    private static func writeRawPositions(_ positions: [String: Any]) {
+        CFPreferencesSetValue(
+            positionsKey,
+            positions as CFDictionary,
+            domain,
+            kCFPreferencesCurrentUser,
+            kCFPreferencesAnyHost
+        )
+        if !CFPreferencesSynchronize(domain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost) {
+            logger.error("Could not synchronize MenuBarAgent preferred positions")
+        }
+    }
+
+    private static func numericValue(_ value: Any?) -> Double? {
+        if let number = value as? NSNumber { return number.doubleValue }
+        if let string = value as? String { return Double(string) }
+        return nil
+    }
+
+    private static func readSavedWeights() -> [String: Double] {
+        UserDefaults.standard.dictionary(forKey: savedWeightsKey)?.compactMapValues(numericValue) ?? [:]
+    }
+
+    private static func writeSavedWeights(_ weights: [String: Double]) {
+        if weights.isEmpty {
+            UserDefaults.standard.removeObject(forKey: savedWeightsKey)
+        } else {
+            UserDefaults.standard.set(weights, forKey: savedWeightsKey)
+        }
+    }
+
+    private static func isThirdPartyItem(_ item: MenuBarItem) -> Bool {
+        guard !item.isControlItem else { return false }
+        guard let bundleIdentifier = item.sourceApplication?.bundleIdentifier
+            ?? item.owningApplication?.bundleIdentifier
+        else {
+            return false
+        }
+        return bundleIdentifier != Constants.bundleIdentifier &&
+            !bundleIdentifier.hasPrefix("com.apple.")
     }
 
     private static func resolveKey(
@@ -114,6 +254,13 @@ enum MacOS27MenuBarAgentPositionStore {
             ?? item.tag.namespace.description
         let exact = "status:\(bundleIdentifier)::\(item.tag.title)"
         if existingKeys.contains(exact) { return exact }
+
+        // AX often exposes a generic Item-0 title while AppKit persists the
+        // status item's autosave name (for example MacsFanControlMenuBarIcon).
+        // A single key for the owning bundle is therefore an unambiguous match.
+        let ownerPrefix = "status:\(bundleIdentifier)::"
+        let ownerCandidates = existingKeys.filter { $0.hasPrefix(ownerPrefix) }
+        if ownerCandidates.count == 1 { return ownerCandidates[0] }
 
         let suffix = "::\(item.tag.title)"
         let candidates = existingKeys.filter { $0.hasPrefix("status:") && $0.hasSuffix(suffix) }

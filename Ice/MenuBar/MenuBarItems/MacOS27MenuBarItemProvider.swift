@@ -140,10 +140,23 @@ enum MacOS27MenuBarItemProvider {
             }
             return lhs.bounds.minX < rhs.bounds.minX
         }
+        var seenIceControlItems = Set<String>()
         var nextIndexByIdentity = [String: Int]()
 
         return sorted.compactMap { rawItem in
             guard !isNativeOverflowPlaceholder(rawItem.identityTitle) else {
+                return nil
+            }
+
+            // AppKit publishes both the primary scene and a presentation
+            // variant for Ice's NSStatusItems on macOS 27. They have the same
+            // accessibility identifier and represent one logical button. Ice
+            // control identifiers are unique, so retain only one variant.
+            if
+                rawItem.namespace == .ice,
+                ControlItem.Identifier(rawValue: rawItem.identityTitle) != nil,
+                !seenIceControlItems.insert(rawItem.identityTitle).inserted
+            {
                 return nil
             }
 

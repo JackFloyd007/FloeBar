@@ -359,10 +359,11 @@ extension MenuBarItemManager {
             if #available(macOS 27.0, *) {
                 let managedItems = items.filter { item in
                     guard item.canBeHidden, !item.isSystemClone else { return false }
-                    return !item.isControlItem || item.tag == .visibleControlItem
+                    return !item.isControlItem
                 }
                 let updatedCache = appState?.menuBarManager.macOS27Controller.makeCache(
                     liveItems: managedItems,
+                    sourceItems: items,
                     displayID: displayID
                 ) ?? ItemCache(displayID: displayID)
                 if itemCache != updatedCache {

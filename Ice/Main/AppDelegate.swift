@@ -74,6 +74,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        appState.menuBarManager.macOS27Controller.revealAllBeforeTermination()
+    }
+
     // MARK: Other Methods
 
     /// Opens the settings window and activates the app.

@@ -9,9 +9,11 @@ import OSLog
 /// Assignment-backed menu bar section management for macOS 27.
 ///
 /// Divider geometry can no longer hide items on macOS 27. This controller
-/// persists logical section membership and applies it through MenuBarClientCore's
-/// process-bound assessment-mode allowlist. The private API is loaded at runtime
-/// and degrades to a read-only layout if Apple removes it.
+/// persists logical section membership and combines MenuBarAgent's preferred-
+/// position bands with its process visibility restriction. The position pass
+/// preserves ordering; the restriction is the reliable fallback on wide menu
+/// bars where an elevated item does not naturally overflow. Ice's toggle and
+/// core system controls are always allowed.
 @MainActor
 final class MacOS27MenuBarController {
     private struct StoredLayout: Codable {
@@ -19,11 +21,16 @@ final class MacOS27MenuBarController {
         var order = [MenuBarSection.Name: [String]]()
     }
 
-    private static let defaultsKey = "MacOS27MenuBarController.layout.v1"
+    // v3 discards layouts that included Ice's own visible control item. The Ice
+    // button is the permanent toggle and must never be assigned to a section.
+    private static let defaultsKey = "MacOS27MenuBarController.layout.v3"
     private static let allSystemItemIdentifiers = Set(0 ... 8)
-    private static let systemHostBundleIdentifiers: Set<String> = [
+    private static let protectedBundleIdentifiers: Set<String> = [
+        Constants.bundleIdentifier,
         "com.apple.MenuBarAgent",
         "com.apple.controlcenter",
+        "com.apple.systemuiserver",
+        "com.apple.TextInputMenuAgent",
     ]
 
     private let logger = Logger(category: "MacOS27MenuBarController")
@@ -32,6 +39,7 @@ final class MacOS27MenuBarController {
     private var knownBundleIdentifiers = [String: String]()
     private var knownSystemItemIdentifiers = [String: Int]()
     private var lastLiveItems = [MenuBarItem]()
+    private var lastSourceItems = [MenuBarItem]()
     private var revealedSection: MenuBarSection.Name?
     private var assertionHandle: UnsafeMutableRawPointer?
     private var appliedAllowedBundleIdentifiers = Set<String>()
@@ -50,6 +58,9 @@ final class MacOS27MenuBarController {
     }
 
     isolated deinit {
+        if #available(macOS 27.0, *) {
+            MacOS27MenuBarAgentPositionStore.revealAll()
+        }
         IceAssessmentModeHidingInvalidate(assertionHandle)
     }
 
@@ -67,11 +78,23 @@ final class MacOS27MenuBarController {
 
     func makeCache(
         liveItems: [MenuBarItem],
+        sourceItems: [MenuBarItem],
         displayID: CGDirectDisplayID?
     ) -> MenuBarItemManager.ItemCache {
         precondition(Thread.isMainThread)
+        seedUnassignedItems(liveItems, using: sourceItems)
         lastLiveItems = liveItems
+        lastSourceItems = sourceItems
 
+        for item in sourceItems {
+            let identifier = item.tag.persistentIdentifier
+            if let bundleIdentifier = bundleIdentifier(for: item) {
+                knownBundleIdentifiers[identifier] = bundleIdentifier
+            }
+            if let systemIdentifier = systemItemIdentifier(for: item.tag) {
+                knownSystemItemIdentifiers[identifier] = systemIdentifier
+            }
+        }
         for item in liveItems {
             let identifier = item.tag.persistentIdentifier
             snapshots[identifier] = item
@@ -206,9 +229,19 @@ final class MacOS27MenuBarController {
         guard #available(macOS 27.0, *), IceAssessmentModeHidingAvailable() else {
             return
         }
+        if !liveItems.isEmpty { lastLiveItems = liveItems }
 
-        if !liveItems.isEmpty {
-            lastLiveItems = liveItems
+        let visibilityItems = lastSourceItems.isEmpty ? lastLiveItems : lastSourceItems
+        let didWritePositions = MacOS27MenuBarAgentPositionStore.applyVisibility(
+            assignments: layout.assignments,
+            order: layout.order,
+            revealing: revealedSection,
+            items: visibilityItems
+        )
+        if didWritePositions {
+            logger.notice(
+                "Updated macOS 27 preferred-position visibility; revealedSection=\(String(describing: self.revealedSection), privacy: .public)"
+            )
         }
 
         let concealedSections: Set<MenuBarSection.Name> = switch revealedSection {
@@ -220,11 +253,16 @@ final class MacOS27MenuBarController {
             concealedSections.contains(section) ? identifier : nil
         })
 
+        // The restriction is bundle-scoped for third-party items. If one app
+        // contributes both a visible and hidden item, fail open for the whole
+        // app instead of unexpectedly hiding its visible sibling.
         var bundlesWithVisibleItems = Set<String>()
-        for item in lastLiveItems {
+        for item in visibilityItems {
             let identifier = item.tag.persistentIdentifier
-            guard !concealedIdentifiers.contains(identifier),
-                  let bundleIdentifier = knownBundleIdentifiers[identifier] ?? bundleIdentifier(for: item)
+            guard
+                !item.isControlItem,
+                !concealedIdentifiers.contains(identifier),
+                let bundleIdentifier = knownBundleIdentifiers[identifier] ?? bundleIdentifier(for: item)
             else {
                 continue
             }
@@ -235,8 +273,7 @@ final class MacOS27MenuBarController {
             knownBundleIdentifiers[$0]
         })
         concealedBundleIdentifiers.subtract(bundlesWithVisibleItems)
-        concealedBundleIdentifiers.subtract(Self.systemHostBundleIdentifiers)
-        concealedBundleIdentifiers.remove(Constants.bundleIdentifier)
+        concealedBundleIdentifiers.subtract(Self.protectedBundleIdentifiers)
 
         let concealedSystemIdentifiers = Set(concealedIdentifiers.compactMap {
             knownSystemItemIdentifiers[$0]
@@ -249,11 +286,8 @@ final class MacOS27MenuBarController {
         )
         var allowedBundleIdentifiers = runningBundleIdentifiers
             .subtracting(concealedBundleIdentifiers)
-        allowedBundleIdentifiers.insert(Constants.bundleIdentifier)
-        allowedBundleIdentifiers.formUnion(Self.systemHostBundleIdentifiers)
-        allowedBundleIdentifiers.formUnion(
-            knownBundleIdentifiers.values.filter { !concealedBundleIdentifiers.contains($0) }
-        )
+        allowedBundleIdentifiers.formUnion(Self.protectedBundleIdentifiers)
+        allowedBundleIdentifiers.formUnion(bundlesWithVisibleItems)
 
         let hasActiveConcealment = !concealedBundleIdentifiers.isEmpty ||
             allowedSystemIdentifiers != Self.allSystemItemIdentifiers
@@ -262,7 +296,8 @@ final class MacOS27MenuBarController {
             return
         }
 
-        guard assertionHandle == nil ||
+        guard
+            assertionHandle == nil ||
                 allowedBundleIdentifiers != appliedAllowedBundleIdentifiers ||
                 allowedSystemIdentifiers != appliedAllowedSystemItemIdentifiers
         else {
@@ -278,7 +313,7 @@ final class MacOS27MenuBarController {
         ) { [weak self] in
             Task { @MainActor in
                 guard let self, generation == self.activationGeneration else { return }
-                self.logger.error("macOS 27 assessment-mode activation failed")
+                self.logger.error("macOS 27 visibility restriction activation failed")
                 self.invalidateAssertion()
             }
         }
@@ -286,7 +321,7 @@ final class MacOS27MenuBarController {
         appliedAllowedSystemItemIdentifiers = allowedSystemIdentifiers
 
         if assertionHandle == nil {
-            logger.error("macOS 27 assessment-mode hiding is unavailable")
+            logger.error("macOS 27 visibility restriction is unavailable")
         }
     }
 
@@ -304,11 +339,67 @@ final class MacOS27MenuBarController {
         UserDefaults.standard.set(data, forKey: Self.defaultsKey)
     }
 
+    /// Migrates Ice's physical divider layout into macOS 27's explicit section
+    /// assignments. Without this, a first launch treats every existing item as
+    /// visible until the user manually rebuilds the entire layout.
+    private func seedUnassignedItems(
+        _ items: [MenuBarItem],
+        using sourceItems: [MenuBarItem]
+    ) {
+        let hiddenDivider = sourceItems.first { $0.tag == .hiddenControlItem }
+        let alwaysHiddenDivider = sourceItems.first { $0.tag == .alwaysHiddenControlItem }
+
+        var seededAnyItem = false
+        for item in items {
+            let identifier = item.tag.persistentIdentifier
+            guard layout.assignments[identifier] == nil else { continue }
+
+            let section: MenuBarSection.Name
+            if let hiddenDivider, item.bounds.minX >= hiddenDivider.bounds.maxX {
+                section = .visible
+            } else if
+                let hiddenDivider,
+                let alwaysHiddenDivider,
+                item.bounds.maxX <= hiddenDivider.bounds.minX,
+                item.bounds.minX >= alwaysHiddenDivider.bounds.maxX
+            {
+                section = .hidden
+            } else if
+                let alwaysHiddenDivider,
+                item.bounds.maxX <= alwaysHiddenDivider.bounds.minX
+            {
+                section = .alwaysHidden
+            } else if let hiddenDivider, item.bounds.maxX <= hiddenDivider.bounds.minX {
+                section = .hidden
+            } else {
+                section = .visible
+            }
+
+            layout.assignments[identifier] = section
+            layout.order[section, default: []].append(identifier)
+            seededAnyItem = true
+        }
+
+        guard seededAnyItem else { return }
+        let visibleCount = layout.assignments.values.count { $0 == .visible }
+        let hiddenCount = layout.assignments.values.count { $0 == .hidden }
+        let alwaysHiddenCount = layout.assignments.values.count { $0 == .alwaysHidden }
+        logger.notice(
+            "Seeded macOS 27 layout: visible=\(visibleCount, privacy: .public), hidden=\(hiddenCount, privacy: .public), alwaysHidden=\(alwaysHiddenCount, privacy: .public)"
+        )
+    }
+
     private func bundleIdentifier(for item: MenuBarItem) -> String? {
         item.sourceApplication?.bundleIdentifier ?? item.owningApplication?.bundleIdentifier
     }
 
     private func systemItemIdentifier(for tag: MenuBarItemTag) -> Int? {
         tag.macOS27SystemItemIdentifier
+    }
+
+    func revealAllBeforeTermination() {
+        guard #available(macOS 27.0, *) else { return }
+        invalidateAssertion()
+        _ = MacOS27MenuBarAgentPositionStore.revealAll()
     }
 }

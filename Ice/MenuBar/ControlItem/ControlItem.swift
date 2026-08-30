@@ -478,16 +478,15 @@ final class ControlItem {
 
     /// Performs the control item's action.
     @objc private func performAction() {
-        guard
-            let menuBarManager = appState?.menuBarManager,
-            let event = NSApp.currentEvent
-        else {
-            return
-        }
+        guard let menuBarManager = appState?.menuBarManager else { return }
+        let event = NSApp.currentEvent
 
-        switch event.type {
-        case .leftMouseDown:
-            let modifierFlags = NSEvent.modifierFlags
+        switch event?.type {
+        case .leftMouseDown, .applicationDefined, nil:
+            // Accessibility presses do not necessarily synthesize a
+            // leftMouseDown event. Treat them as an ordinary click so the Ice
+            // button remains usable from VoiceOver and UI automation.
+            let modifierFlags = event?.modifierFlags ?? NSEvent.modifierFlags
 
             // Running this from a Task seems to improve the visual
             // responsiveness of the status item's button.
