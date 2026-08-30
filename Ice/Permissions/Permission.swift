@@ -151,7 +151,10 @@ final class ScreenRecordingPermission: Permission {
             isRequired: false,
             settingsURL: URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"),
             check: {
-                ScreenCapture.checkPermissions()
+                // Keep the shared cache synchronized from this single,
+                // non-prompting permission observer. Capture refreshes can
+                // then reuse either result without repeatedly reaching TCC.
+                ScreenCapture.cachedCheckPermissions(reset: true)
             },
             request: {
                 ScreenCapture.requestPermissions()

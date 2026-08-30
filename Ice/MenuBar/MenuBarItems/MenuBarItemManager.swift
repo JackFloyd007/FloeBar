@@ -983,19 +983,54 @@ extension MenuBarItemManager {
         }
     }
 
-    /// Refreshes just the applications that own the source and target item.
-    /// This avoids blocking every reorder on unrelated or unresponsive apps.
+    /// Returns the cached items whose centers lie between a move's endpoints.
+    @available(macOS 27.0, *)
+    private nonisolated func macOS27ItemsInMoveRange(
+        item: MenuBarItem,
+        target: MenuBarItem,
+        among items: [MenuBarItem]
+    ) -> [MenuBarItem] {
+        let lowerBound = min(item.bounds.midX, target.bounds.midX)
+        let upperBound = max(item.bounds.midX, target.bounds.midX)
+        return items.filter { lowerBound ... upperBound ~= $0.bounds.midX }
+    }
+
+    /// Refreshes only applications with items affected by this move. Including
+    /// crossed items lets long-move verification observe the whole permutation
+    /// without blocking on unrelated or unresponsive menu bar applications.
     @available(macOS 27.0, *)
     private nonisolated func targetedMacOS27Items(
         item: MenuBarItem,
-        target: MenuBarItem
+        target: MenuBarItem,
+        contextItems: [MenuBarItem]
     ) async -> [MenuBarItem] {
-        let sourcePIDs = Set(
-            [item, target].map { $0.sourcePID ?? $0.ownerPID }
+        let itemsInMoveRange = macOS27ItemsInMoveRange(
+            item: item,
+            target: target,
+            among: contextItems
         )
+        let sourcePIDs = Set((itemsInMoveRange + [item, target]).map {
+            $0.sourcePID ?? $0.ownerPID
+        })
         return await Task.detached(priority: .userInitiated) {
             MacOS27MenuBarItemProvider.menuBarItems(sourcePIDs: sourcePIDs)
         }.value
+    }
+
+    @available(macOS 27.0, *)
+    private func macOS27ItemsAreAdjacent(
+        _ first: MenuBarItem,
+        _ second: MenuBarItem,
+        among snapshot: [MenuBarItem]
+    ) -> Bool {
+        let items = snapshot.sorted { $0.bounds.minX < $1.bounds.minX }
+        guard
+            let firstIndex = items.firstIndex(where: { $0.tag == first.tag }),
+            let secondIndex = items.firstIndex(where: { $0.tag == second.tag })
+        else {
+            return false
+        }
+        return abs(firstIndex - secondIndex) == 1
     }
 
     /// Performs the same Command-drag gesture the user can use to reorder a
@@ -1266,11 +1301,13 @@ extension MenuBarItemManager {
     private func performFastMacOS27MoveIfVisible(
         item: MenuBarItem,
         destination: MoveDestination,
+        contextItems: [MenuBarItem],
         appState: AppState
     ) async -> Bool {
         var snapshot = await targetedMacOS27Items(
             item: item,
-            target: destination.targetItem
+            target: destination.targetItem,
+            contextItems: contextItems
         )
         guard
             var liveItem = snapshot.first(where: { $0.tag == item.tag }),
@@ -1301,14 +1338,18 @@ extension MenuBarItemManager {
         appState.hidEventManager.stopAll()
         defer { appState.hidEventManager.startAll() }
 
-        var didPostGesture = false
         for attempt in 1...2 {
             do {
                 lastMoveOperationTimestamp = .now
-                if case .rightOfItem = liveDestination, !liveTarget.isControlItem {
+                if
+                    case .rightOfItem = liveDestination,
+                    !liveTarget.isControlItem,
+                    macOS27ItemsAreAdjacent(liveItem, liveTarget, among: snapshot)
+                {
                     // The slot immediately before Ice is intentionally narrow.
-                    // Moving the target left is the same permutation as moving
-                    // the source right, but does not try to drop into that gap.
+                    // Swapping the target left is equivalent only for adjacent
+                    // items. Across multiple icons it produces a different
+                    // permutation, so long moves must drag the source itself.
                     try await postMacOS27CommandDrag(
                         item: liveTarget,
                         destination: .leftOfItem(liveItem)
@@ -1319,7 +1360,6 @@ extension MenuBarItemManager {
                         destination: liveDestination
                     )
                 }
-                didPostGesture = true
                 lastMoveOperationTimestamp = .now
             } catch {
                 logger.debug(
@@ -1327,40 +1367,42 @@ extension MenuBarItemManager {
                 )
             }
 
-            snapshot = await targetedMacOS27Items(
-                item: liveItem,
-                target: liveTarget
-            )
-            guard
-                let refreshedItem = snapshot.first(where: { $0.tag == item.tag }),
-                let refreshedTarget = snapshot.first(where: { $0.tag == destination.targetItem.tag })
-            else {
-                return false
-            }
-            liveItem = refreshedItem
-            liveTarget = refreshedTarget
-            liveDestination = switch destination {
-            case .leftOfItem: .leftOfItem(liveTarget)
-            case .rightOfItem: .rightOfItem(liveTarget)
-            }
-            if macOS27ItemHasCorrectPosition(
-                item: liveItem,
-                for: liveDestination,
-                among: snapshot
-            ) {
-                return true
+            // MenuBarAgent can publish the new AX positions a few frames after
+            // the drag ends. Poll a small targeted range, but never treat a
+            // merely posted gesture as success: doing so makes Layout show an
+            // optimistic order that disappears after the next app launch.
+            for settlingCheck in 1...3 {
+                snapshot = await targetedMacOS27Items(
+                    item: liveItem,
+                    target: liveTarget,
+                    contextItems: contextItems
+                )
+                guard
+                    let refreshedItem = snapshot.first(where: { $0.tag == item.tag }),
+                    let refreshedTarget = snapshot.first(where: { $0.tag == destination.targetItem.tag })
+                else {
+                    return false
+                }
+                liveItem = refreshedItem
+                liveTarget = refreshedTarget
+                liveDestination = switch destination {
+                case .leftOfItem: .leftOfItem(liveTarget)
+                case .rightOfItem: .rightOfItem(liveTarget)
+                }
+                if macOS27ItemHasCorrectPosition(
+                    item: liveItem,
+                    for: liveDestination,
+                    among: snapshot
+                ) {
+                    return true
+                }
+                if settlingCheck < 3 {
+                    try? await Task.sleep(for: .milliseconds(90))
+                }
             }
         }
 
-        // AX can lag behind a successful MenuBarAgent reorder for more than a
-        // frame. A posted native drag is authoritative and already persists
-        // its position; writing a second preference fallback here races the
-        // user's next move and is the source of occasional snap-back.
-        if didPostGesture {
-            logger.debug("Accepted a macOS 27 native reorder while AX was still settling")
-            return true
-        }
-        logger.warning("Could not post a macOS 27 physical reorder")
+        logger.warning("Could not verify a macOS 27 physical reorder")
         return false
     }
 
@@ -1374,8 +1416,12 @@ extension MenuBarItemManager {
                 return
             }
             guard let self else { return }
-            await cacheItemsRegardless()
+            // Stop displaying the projected order before asking AX for the
+            // real one. Clearing this after the refresh left Layout optimistic
+            // until the next five-second timer even when MenuBarAgent had
+            // already rolled the move back.
             appState?.menuBarManager.macOS27Controller.completePendingMove()
+            await cacheItemsRegardless()
             macOS27CacheRefreshTask = nil
         }
     }
@@ -1412,25 +1458,31 @@ extension MenuBarItemManager {
             case .rightOfItem: .rightOfItem(knownTarget)
             }
 
-            let didMoveLive = await performFastMacOS27MoveIfVisible(
+            // Commit persistence before moving the live scenes. A native drag
+            // alone can look correct briefly and then roll back when an owner
+            // republishes its saved NSStatusItem position. A long move changes
+            // the right-neighbor slot of every crossed item, so synchronize
+            // the complete affected range before the visual operation.
+            _ = MacOS27MenuBarAgentPositionStore.move(
+                item: knownItem,
+                to: knownDestination,
+                liveItems: knownItems
+            )
+            let affectedItems = macOS27ItemsInMoveRange(
+                item: knownItem,
+                target: knownTarget,
+                among: knownItems
+            )
+            _ = MacOS27MenuBarAgentPositionStore.synchronizeOwnerPreferredPositions(
+                for: affectedItems,
+                among: knownItems
+            )
+            _ = await performFastMacOS27MoveIfVisible(
                 item: knownItem,
                 destination: knownDestination,
+                contextItems: knownItems,
                 appState: appState
             )
-            // A native drag is both the fastest live operation and the source
-            // of truth for MenuBarAgent's own persistence. Preference writes
-            // are only the fallback when either AX item was unavailable.
-            if !didMoveLive {
-                _ = MacOS27MenuBarAgentPositionStore.move(
-                    item: knownItem,
-                    to: knownDestination,
-                    liveItems: knownItems
-                )
-                _ = MacOS27MenuBarAgentPositionStore.synchronizeOwnerPreferredPositions(
-                    for: [knownItem, knownTarget],
-                    among: knownItems
-                )
-            }
             scheduleMacOS27CacheRefresh()
             return
         }
@@ -1508,22 +1560,26 @@ extension MenuBarItemManager {
         let destination: MoveDestination = section == .visible
             ? .rightOfItem(iceItem)
             : .leftOfItem(iceItem)
-        let didMoveLive = await performFastMacOS27MoveIfVisible(
+        _ = MacOS27MenuBarAgentPositionStore.move(
+            item: knownItem,
+            to: destination,
+            liveItems: knownItems
+        )
+        let affectedItems = macOS27ItemsInMoveRange(
+            item: knownItem,
+            target: iceItem,
+            among: knownItems
+        )
+        _ = MacOS27MenuBarAgentPositionStore.synchronizeOwnerPreferredPositions(
+            for: affectedItems,
+            among: knownItems
+        )
+        _ = await performFastMacOS27MoveIfVisible(
             item: knownItem,
             destination: destination,
+            contextItems: knownItems,
             appState: appState
         )
-        if !didMoveLive {
-            _ = MacOS27MenuBarAgentPositionStore.move(
-                item: knownItem,
-                to: destination,
-                liveItems: knownItems
-            )
-            _ = MacOS27MenuBarAgentPositionStore.synchronizeOwnerPreferredPositions(
-                for: [knownItem],
-                among: knownItems
-            )
-        }
         scheduleMacOS27CacheRefresh()
     }
 }

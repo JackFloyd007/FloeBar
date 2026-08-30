@@ -198,7 +198,15 @@ final class MenuBarItemImageCache: ObservableObject {
     /// Captures the images of the given menu bar items and returns the result.
     private nonisolated func captureImages(of items: [MenuBarItem], scale: CGFloat, appState: AppState) async -> CaptureResult {
         if #available(macOS 27.0, *) {
-            return await captureMacOS27Images(of: items, fallbackScale: scale)
+            guard let displayID = await appState.itemManager.itemCache.displayID else {
+                return CaptureResult()
+            }
+            return await captureMacOS27Images(
+                of: items,
+                displayID: displayID,
+                exactItemTags: Set(items.map(\.tag)),
+                fallbackScale: scale
+            )
         }
 
         // Use individual capture after a move operation, since composite capture
@@ -230,20 +238,68 @@ final class MenuBarItemImageCache: ObservableObject {
         return individualResult
     }
 
-    /// Builds deterministic replicas from the status item's Accessibility
-    /// identity. Capturing MenuBarAgent's composite window can crop the pixels
-    /// at a stale pre-reorder frame and also starts a ScreenCaptureKit stream,
-    /// which macOS may repeatedly prompt for even after permission was granted.
+    /// Crops the exact pixels currently rendered for macOS 27 status items.
+    /// AX exposes geometry and identity but no image attribute, so the visible
+    /// display strip is the only source that reflects third-party artwork.
+    /// Semantic replicas remain as a non-prompting fallback for concealed items
+    /// and builds that do not currently have screen-recording permission.
     @available(macOS 27.0, *)
     private nonisolated func captureMacOS27Images(
         of items: [MenuBarItem],
+        displayID: CGDirectDisplayID,
+        exactItemTags: Set<MenuBarItemTag>,
         fallbackScale: CGFloat
     ) async -> CaptureResult {
         let capturable = items.filter { !$0.isControlItem || $0.tag == .visibleControlItem }
         guard !capturable.isEmpty else { return CaptureResult() }
 
         var result = CaptureResult()
-        for item in capturable {
+        let exactItems = capturable.filter { exactItemTags.contains($0.tag) }
+        if
+            !exactItems.isEmpty,
+            let capture = await ScreenCapture.captureMenuBarDisplayStrip(displayID: displayID)
+        {
+            let composite = capture.image
+            let imageBounds = CGRect(
+                x: 0,
+                y: 0,
+                width: composite.width,
+                height: composite.height
+            )
+            var cropOwners = [CGRect: MenuBarItemTag]()
+
+            for item in exactItems {
+                let rawCropRect = CGRect(
+                    x: (item.bounds.minX - capture.windowFrame.minX) * capture.scale,
+                    y: (item.bounds.minY - capture.windowFrame.minY) * capture.scale,
+                    width: item.bounds.width * capture.scale,
+                    height: item.bounds.height * capture.scale
+                )
+                let expectedCropRect = rawCropRect.integral
+                let cropRect = expectedCropRect.intersection(imageBounds)
+                guard
+                    !cropRect.isNull,
+                    !cropRect.isEmpty,
+                    abs(cropRect.minX - expectedCropRect.minX) <= 1,
+                    abs(cropRect.minY - expectedCropRect.minY) <= 1,
+                    abs(cropRect.maxX - expectedCropRect.maxX) <= 1,
+                    abs(cropRect.maxY - expectedCropRect.maxY) <= 1,
+                    cropOwners[cropRect] == nil,
+                    let rawImage = composite.cropping(to: cropRect),
+                    let image = rawImage.knockingOutNearUniformBackground(),
+                    !image.isTransparent(alphaThreshold: 0.05)
+                else {
+                    continue
+                }
+                cropOwners[cropRect] = item.tag
+                result.images[item.tag] = CapturedImage(
+                    cgImage: image,
+                    scale: capture.scale
+                )
+            }
+        }
+
+        for item in capturable where result.images[item.tag] == nil {
             if let fallback = menuBarReplicaImage(for: item, scale: fallbackScale) {
                 result.images[item.tag] = fallback
             } else {
@@ -468,10 +524,6 @@ final class MenuBarItemImageCache: ObservableObject {
             return
         }
 
-        if #unavailable(macOS 27.0) {
-            guard await appState.hasPermission(.screenRecording) else { return }
-        }
-
         guard
             let displayID = await appState.itemManager.itemCache.displayID,
             let screen = NSScreen.screens.first(where: { $0.displayID == displayID })
@@ -482,25 +534,57 @@ final class MenuBarItemImageCache: ObservableObject {
         let scale = screen.backingScaleFactor
         var newImages = [MenuBarItemTag: CapturedImage]()
 
-        for section in sections {
-            guard await !appState.itemManager.itemCache[section].isEmpty else {
-                continue
+        if #available(macOS 27.0, *) {
+            let sectionItems = await MainActor.run {
+                sections.map { section in
+                    (section, appState.itemManager.itemCache.managedItems(for: section))
+                }
             }
-
-            let sectionImages = await captureImages(for: section, scale: scale, appState: appState)
-
-            guard !sectionImages.isEmpty else {
-                logger.warning("Failed item image cache for \(section.logString, privacy: .public)")
-                continue
+            let allItems = sectionItems.flatMap(\.1)
+            let isLayoutEditing = await appState.menuBarManager.macOS27Controller.isLayoutEditing
+            let exactItemTags: Set<MenuBarItemTag> = if isLayoutEditing {
+                Set(allItems.map(\.tag))
+            } else {
+                Set(
+                    sectionItems
+                        .filter { $0.0 == .visible }
+                        .flatMap { $0.1.map(\.tag) }
+                )
             }
+            let result = await captureMacOS27Images(
+                of: allItems,
+                displayID: displayID,
+                exactItemTags: exactItemTags,
+                fallbackScale: scale
+            )
+            newImages = result.images
+        } else {
+            guard await appState.hasPermission(.screenRecording) else { return }
 
-            newImages.merge(sectionImages) { (_, new) in new }
+            for section in sections {
+                guard await !appState.itemManager.itemCache[section].isEmpty else {
+                    continue
+                }
+
+                let sectionImages = await captureImages(for: section, scale: scale, appState: appState)
+
+                guard !sectionImages.isEmpty else {
+                    logger.warning("Failed item image cache for \(section.logString, privacy: .public)")
+                    continue
+                }
+
+                newImages.merge(sectionImages) { (_, new) in new }
+            }
         }
 
         await MainActor.run { [newImages] in
             let validTags = Set(appState.itemManager.itemCache.managedItems.map(\.tag))
             images = images.filter { validTags.contains($0.key) }
-            images.merge(newImages) { _, new in new }
+            images.merge(newImages) { old, new in
+                // A temporarily concealed item must not replace its last exact
+                // crop with a replica merely because it is absent this tick.
+                new.isSemanticReplica && !old.isSemanticReplica ? old : new
+            }
         }
     }
 

@@ -350,6 +350,106 @@ extension CGImage {
         }
         return context.isTransparent()
     }
+
+    /// Makes the near-uniform menu-bar material around a captured status-item
+    /// glyph transparent. Display-strip capture is the only macOS 27 path that
+    /// preserves third-party icons exactly, but it also includes wallpaper and
+    /// Liquid Glass pixels around them.
+    func knockingOutNearUniformBackground(
+        maxColorDistance: CGFloat = 36,
+        cornerSampleSize: Int = 2
+    ) -> CGImage? {
+        guard width > 2, height > 2, maxColorDistance > 0 else { return nil }
+
+        let bytesPerPixel = 4
+        let bytesPerRow = width * bytesPerPixel
+        var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
+        guard let context = CGContext(
+            data: &pixels,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return nil
+        }
+        context.draw(self, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        let sample = max(1, min(cornerSampleSize, min(width, height) / 2))
+        var totalRed = 0
+        var totalGreen = 0
+        var totalBlue = 0
+        var sampleCount = 0
+        for (originX, originY) in [
+            (0, 0),
+            (width - sample, 0),
+            (0, height - sample),
+            (width - sample, height - sample),
+        ] {
+            for y in originY ..< originY + sample {
+                for x in originX ..< originX + sample {
+                    let index = y * bytesPerRow + x * bytesPerPixel
+                    let alpha = Int(pixels[index + 3])
+                    guard alpha > 8 else { continue }
+                    totalRed += Int(pixels[index]) * 255 / alpha
+                    totalGreen += Int(pixels[index + 1]) * 255 / alpha
+                    totalBlue += Int(pixels[index + 2]) * 255 / alpha
+                    sampleCount += 1
+                }
+            }
+        }
+        guard sampleCount > 0 else { return nil }
+
+        let backgroundRed = totalRed / sampleCount
+        let backgroundGreen = totalGreen / sampleCount
+        let backgroundBlue = totalBlue / sampleCount
+        let maximumDistanceSquared = maxColorDistance * maxColorDistance
+        var clearedCount = 0
+        var keptCount = 0
+
+        for y in 0 ..< height {
+            for x in 0 ..< width {
+                let index = y * bytesPerRow + x * bytesPerPixel
+                let alpha = Int(pixels[index + 3])
+                guard alpha > 8 else {
+                    pixels[index] = 0
+                    pixels[index + 1] = 0
+                    pixels[index + 2] = 0
+                    pixels[index + 3] = 0
+                    clearedCount += 1
+                    continue
+                }
+                let red = Int(pixels[index]) * 255 / alpha
+                let green = Int(pixels[index + 1]) * 255 / alpha
+                let blue = Int(pixels[index + 2]) * 255 / alpha
+                let redDistance = CGFloat(red - backgroundRed)
+                let greenDistance = CGFloat(green - backgroundGreen)
+                let blueDistance = CGFloat(blue - backgroundBlue)
+                if redDistance * redDistance + greenDistance * greenDistance +
+                    blueDistance * blueDistance <= maximumDistanceSquared
+                {
+                    pixels[index] = 0
+                    pixels[index + 1] = 0
+                    pixels[index + 2] = 0
+                    pixels[index + 3] = 0
+                    clearedCount += 1
+                } else {
+                    keptCount += 1
+                }
+            }
+        }
+
+        guard
+            keptCount > 0,
+            clearedCount > 0,
+            Double(keptCount) / Double(keptCount + clearedCount) >= 0.02
+        else {
+            return nil
+        }
+        return context.makeImage()
+    }
 }
 
 // MARK: - Collection where Element == MenuBarItem

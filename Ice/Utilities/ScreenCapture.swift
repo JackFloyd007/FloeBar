@@ -40,11 +40,13 @@ enum ScreenCapture {
         enum Context {
             static var cachedResult: Bool?
         }
-        // A positive result can be cached indefinitely. Recheck a negative
-        // result so granting permission while Ice is running takes effect and
-        // exact Layout images replace semantic fallbacks without a relaunch.
-        if !reset, Context.cachedResult == true {
-            return true
+        // Cache both outcomes. Background Layout refreshes run frequently on
+        // macOS 27; recomputing a negative result lets every refresh reach TCC
+        // and can repeatedly surface the system consent alert. The dedicated
+        // permission observer explicitly resets this cache while it polls, so
+        // a newly granted permission still takes effect without a relaunch.
+        if !reset, let cachedResult = Context.cachedResult {
+            return cachedResult
         }
         let result = checkPermissions()
         Context.cachedResult = result
@@ -183,6 +185,68 @@ enum ScreenCapture {
                 configuration: configuration
             )
             return MenuBarHostingCapture(image: image, windowFrame: captureFrame, scale: scale)
+        } catch {
+            return nil
+        }
+    }
+
+    /// Captures the visible menu-bar band of a display. Third-party status
+    /// items on macOS 27 are composited incorrectly in MenuBarAgent's private
+    /// hosting window, while this display crop contains the exact pixels the
+    /// user sees. Callers remove the near-uniform menu-bar background after
+    /// cropping each AX item frame.
+    @available(macOS 27.0, *)
+    static func captureMenuBarDisplayStrip(
+        displayID: CGDirectDisplayID
+    ) async -> MenuBarHostingCapture? {
+        // Never let a background image refresh trigger TCC UI. If this build
+        // is not currently authorized, Layout keeps its last exact image (or a
+        // semantic fallback) until the user grants permission explicitly.
+        guard cachedCheckPermissions() else {
+            return nil
+        }
+
+        let content: SCShareableContent
+        do {
+            content = try await shareableContent()
+        } catch {
+            return nil
+        }
+
+        guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
+            return nil
+        }
+
+        let displayFrame = display.frame
+        let stripFrame = CGRect(
+            x: displayFrame.minX,
+            y: displayFrame.minY,
+            width: displayFrame.width,
+            height: min(40, displayFrame.height)
+        )
+        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let scale = max(CGFloat(filter.pointPixelScale), 0.5)
+        let configuration = SCStreamConfiguration()
+        configuration.showsCursor = false
+        configuration.width = max(1, Int((stripFrame.width * scale).rounded()))
+        configuration.height = max(1, Int((stripFrame.height * scale).rounded()))
+        configuration.sourceRect = CGRect(
+            x: stripFrame.minX - displayFrame.minX,
+            y: stripFrame.minY - displayFrame.minY,
+            width: stripFrame.width,
+            height: stripFrame.height
+        )
+
+        do {
+            let image = try await SCScreenshotManager.captureImage(
+                contentFilter: filter,
+                configuration: configuration
+            )
+            return MenuBarHostingCapture(
+                image: image,
+                windowFrame: stripFrame,
+                scale: scale
+            )
         } catch {
             return nil
         }

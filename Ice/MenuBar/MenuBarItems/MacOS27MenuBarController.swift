@@ -52,6 +52,10 @@ final class MacOS27MenuBarController {
     private var hasInitializedSectionBoundary = false
     private let baselineAllowedBundleIdentifiers: Set<String>
 
+    /// Keeps every managed item exposed while the Layout editor is open. This
+    /// gives both native drag verification and exact icon capture live bounds.
+    private(set) var isLayoutEditing = false
+
     init() {
         baselineAllowedBundleIdentifiers = Set(
             NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier)
@@ -298,6 +302,17 @@ final class MacOS27MenuBarController {
         guard #available(macOS 27.0, *) else { return }
         revealedSection = .alwaysHidden
         applyVisibility(liveItems: lastLiveItems)
+    }
+
+    func beginLayoutEditing() {
+        guard #available(macOS 27.0, *) else { return }
+        isLayoutEditing = true
+        temporarilyRevealAll()
+    }
+
+    func endLayoutEditing() {
+        guard #available(macOS 27.0, *) else { return }
+        isLayoutEditing = false
     }
 
     /// Returns the latest live AX snapshot without starting another complete

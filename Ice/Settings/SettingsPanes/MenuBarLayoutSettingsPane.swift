@@ -35,11 +35,20 @@ struct MenuBarLayoutSettingsPane: View {
                 // Concealed hosted items have no live AX element and cannot be
                 // reordered reliably. Reveal them once for the whole editing
                 // session instead of flashing the bar around every drag.
-                appState.menuBarManager.macOS27Controller.temporarilyRevealAll()
+                appState.menuBarManager.macOS27Controller.beginLayoutEditing()
+                Task {
+                    // Let MenuBarAgent finish exposing hosted scenes before
+                    // taking exact display-strip crops for the Layout tiles.
+                    try? await Task.sleep(for: .milliseconds(450))
+                    await appState.imageCache.updateCacheWithoutChecks(
+                        sections: MenuBarSection.Name.allCases
+                    )
+                }
             }
         }
         .onDisappear {
             if #available(macOS 27.0, *) {
+                appState.menuBarManager.macOS27Controller.endLayoutEditing()
                 appState.menuBarManager.syncMacOS27Visibility()
             }
         }

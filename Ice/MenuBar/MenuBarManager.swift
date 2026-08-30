@@ -254,6 +254,14 @@ final class MenuBarManager: ObservableObject {
     func syncMacOS27Visibility() {
         guard #available(macOS 27.0, *), let appState else { return }
 
+        // Layout is a live editor. Keep every item exposed for its entire
+        // session so a control-state update cannot collapse the bar midway
+        // through a long drag or while its real icons are being captured.
+        if macOS27Controller.isLayoutEditing {
+            macOS27Controller.temporarilyRevealAll()
+            return
+        }
+
         // Ice Bar shows cached items without revealing them in the native bar.
         guard !appState.settings.general.useIceBar else {
             macOS27Controller.setRevealedSection(nil)
