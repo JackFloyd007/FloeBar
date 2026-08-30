@@ -11,6 +11,9 @@ menu bar items are no longer exposed as independent WindowServer windows.
   relaunches.
 - Clicking Ice's permanent menu-bar button toggles only the items assigned to
   Hidden or Always Hidden. Ice itself and the core system controls stay visible.
+- Clicking empty menu-bar space does not toggle sections on macOS 27, even if
+  an older Ice installation left `Show on click` enabled. The permanent Ice
+  button is the only menu-bar click target for revealing or concealing items.
 - Hidden and always-hidden sections use a runtime-loaded MenuBarClientCore
   visibility restriction. Replacement restrictions overlap briefly so the
   menu bar is never unrestricted between hide and reveal states.

@@ -174,6 +174,14 @@ extension HIDEventManager {
     // MARK: Handle Show On Click
 
     private func handleShowOnClick(appState: AppState, screen: NSScreen) {
+        // macOS 27 uses Ice's permanent status item as the explicit section
+        // boundary and toggle. Treating the rest of the menu bar as another
+        // toggle target makes ordinary menu-bar clicks unexpectedly reveal or
+        // conceal items, and can immediately undo a click on the Ice button.
+        if #available(macOS 27.0, *) {
+            return
+        }
+
         guard
             appState.settings.general.showOnClick,
             isMouseInsideEmptyMenuBarSpace(appState: appState, screen: screen)
