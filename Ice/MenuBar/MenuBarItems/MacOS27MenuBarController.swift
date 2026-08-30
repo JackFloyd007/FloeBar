@@ -9,11 +9,10 @@ import OSLog
 /// Assignment-backed menu bar section management for macOS 27.
 ///
 /// Divider geometry can no longer hide items on macOS 27. This controller
-/// persists logical section membership and combines MenuBarAgent's preferred-
-/// position bands with its process visibility restriction. The position pass
-/// preserves ordering; the restriction is the reliable fallback on wide menu
-/// bars where an elevated item does not naturally overflow. Ice's toggle and
-/// core system controls are always allowed.
+/// persists logical section membership, places Ice at the section boundary,
+/// and applies MenuBarAgent's process visibility restriction. Replacement
+/// restrictions overlap briefly so the compositor never falls back to an
+/// unrestricted bar between hide and reveal states.
 @MainActor
 final class MacOS27MenuBarController {
     private struct StoredLayout: Codable {
@@ -47,9 +46,13 @@ final class MacOS27MenuBarController {
     private var lastSourceItems = [MenuBarItem]()
     private var revealedSection: MenuBarSection.Name?
     private var assertionHandle: UnsafeMutableRawPointer?
+    private var retiringAssertionHandles = [UnsafeMutableRawPointer]()
     private var appliedAllowedBundleIdentifiers = Set<String>()
     private var appliedAllowedSystemItemIdentifiers = Set(0 ... 8)
     private var activationGeneration = 0
+
+    /// Invalidates MenuBarAgent's cached ordering without republishing Ice.
+    var positionRefreshHandler: (() -> Void)?
 
     init() {
         if
@@ -67,6 +70,9 @@ final class MacOS27MenuBarController {
             MacOS27MenuBarAgentPositionStore.revealAll()
         }
         IceAssessmentModeHidingInvalidate(assertionHandle)
+        for handle in retiringAssertionHandles {
+            IceAssessmentModeHidingInvalidate(handle)
+        }
     }
 
     var isHidingAvailable: Bool {
@@ -237,15 +243,14 @@ final class MacOS27MenuBarController {
         if !liveItems.isEmpty { lastLiveItems = liveItems }
 
         let visibilityItems = lastSourceItems.isEmpty ? lastLiveItems : lastSourceItems
-        let didWritePositions = MacOS27MenuBarAgentPositionStore.applyVisibility(
+        let didWritePositions = MacOS27MenuBarAgentPositionStore.applySectionBoundary(
             assignments: layout.assignments,
             order: layout.order,
-            revealing: revealedSection,
             items: visibilityItems
         )
         if didWritePositions {
             logger.notice(
-                "Updated macOS 27 preferred-position visibility; revealedSection=\(String(describing: self.revealedSection), privacy: .public)"
+                "Updated macOS 27 visible/hidden section boundary"
             )
         }
 
@@ -286,20 +291,14 @@ final class MacOS27MenuBarController {
         let allowedSystemIdentifiers = Self.allSystemItemIdentifiers
             .subtracting(concealedSystemIdentifiers)
 
-        let runningBundleIdentifiers = Set(
-            NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier)
-        )
-        var allowedBundleIdentifiers = runningBundleIdentifiers
+        // Restrict the allowlist to applications that have actually published
+        // a menu bar item. Using every running application made transient
+        // helpers change this set continuously, which rebuilt the assertion
+        // and caused a visible re-composition storm.
+        var allowedBundleIdentifiers = Set(knownBundleIdentifiers.values)
             .subtracting(concealedBundleIdentifiers)
         allowedBundleIdentifiers.formUnion(Self.protectedBundleIdentifiers)
         allowedBundleIdentifiers.formUnion(bundlesWithVisibleItems)
-
-        let hasActiveConcealment = !concealedBundleIdentifiers.isEmpty ||
-            allowedSystemIdentifiers != Self.allSystemItemIdentifiers
-        guard hasActiveConcealment else {
-            invalidateAssertion()
-            return
-        }
 
         guard
             assertionHandle == nil ||
@@ -309,10 +308,10 @@ final class MacOS27MenuBarController {
             return
         }
 
-        invalidateAssertion()
         activationGeneration += 1
         let generation = activationGeneration
-        assertionHandle = IceAssessmentModeHidingActivate(
+        let previousAssertionHandle = assertionHandle
+        let replacementHandle = IceAssessmentModeHidingActivate(
             allowedBundleIdentifiers.sorted(),
             allowedSystemIdentifiers.sorted().map(NSNumber.init(value:))
         ) { [weak self] in
@@ -322,11 +321,37 @@ final class MacOS27MenuBarController {
                 self.invalidateAssertion()
             }
         }
+        guard let replacementHandle else {
+            logger.error("macOS 27 visibility restriction is unavailable")
+            return
+        }
+
+        assertionHandle = replacementHandle
         appliedAllowedBundleIdentifiers = allowedBundleIdentifiers
         appliedAllowedSystemItemIdentifiers = allowedSystemIdentifiers
 
-        if assertionHandle == nil {
-            logger.error("macOS 27 visibility restriction is unavailable")
+        if let previousAssertionHandle {
+            // Keep the old assertion alive until the replacement has had time
+            // to activate. Overlapping restrictions prevents the menu bar from
+            // briefly revealing every status item between two configurations.
+            retiringAssertionHandles.append(previousAssertionHandle)
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(250))
+                guard let self else {
+                    IceAssessmentModeHidingInvalidate(previousAssertionHandle)
+                    return
+                }
+                if let index = retiringAssertionHandles.firstIndex(of: previousAssertionHandle) {
+                    retiringAssertionHandles.remove(at: index)
+                    IceAssessmentModeHidingInvalidate(previousAssertionHandle)
+                    // Unkeyed third-party items are inserted only after the
+                    // previous restriction retires. Refresh Ice in place at
+                    // that point so it stays between concealed and visible.
+                    positionRefreshHandler?()
+                }
+            }
+        } else if didWritePositions {
+            positionRefreshHandler?()
         }
     }
 
@@ -335,6 +360,10 @@ final class MacOS27MenuBarController {
             IceAssessmentModeHidingInvalidate(assertionHandle)
         }
         assertionHandle = nil
+        for handle in retiringAssertionHandles {
+            IceAssessmentModeHidingInvalidate(handle)
+        }
+        retiringAssertionHandles.removeAll()
         appliedAllowedBundleIdentifiers.removeAll()
         appliedAllowedSystemItemIdentifiers = Self.allSystemItemIdentifiers
     }

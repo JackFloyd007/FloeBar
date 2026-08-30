@@ -370,7 +370,6 @@ extension MenuBarItemManager {
                     itemCache = updatedCache
                     logger.debug("Updated macOS 27 assignment-backed menu bar item cache")
                 }
-                appState?.menuBarManager.restoreMacOS27ControlItems()
                 return
             }
 

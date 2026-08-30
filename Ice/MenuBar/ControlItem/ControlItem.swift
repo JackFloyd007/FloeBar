@@ -144,6 +144,11 @@ final class ControlItem {
     /// Storage for internal observers.
     private var cancellables = Set<AnyCancellable>()
 
+    /// A compositor-preserving macOS 27 preferred-position refresh.
+    private var macOS27PositionRefreshTask: Task<Void, Never>?
+    private var macOS27PositionRefreshBaseline: CGFloat?
+    private var macOS27PositionRefreshGeneration = 0
+
     /// The control item's underlying status item.
     private var statusItem: NSStatusItem {
         storage.statusItem
@@ -186,11 +191,67 @@ final class ControlItem {
         configureCancellables()
     }
 
+    /// Makes MenuBarAgent consume a preferred-position write without removing
+    /// and republishing Ice's status item. The concrete temporary width matches
+    /// the button, so the invalidation is not visible to the user.
+    func requestMacOS27PositionRefresh() {
+        guard #available(macOS 27.0, *), identifier == .visible else { return }
+
+        macOS27PositionRefreshGeneration += 1
+        let generation = macOS27PositionRefreshGeneration
+        macOS27PositionRefreshTask?.cancel()
+        if let baseline = macOS27PositionRefreshBaseline {
+            statusItem.length = baseline
+            macOS27PositionRefreshBaseline = nil
+        }
+
+        macOS27PositionRefreshTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(50))
+            guard
+                let self,
+                !Task.isCancelled,
+                generation == macOS27PositionRefreshGeneration,
+                let button = statusItem.button,
+                button.bounds.width > 0
+            else {
+                return
+            }
+
+            let baseline = statusItem.length
+            let renderedWidth = button.bounds.width
+            let temporaryLength = if
+                baseline == NSStatusItem.variableLength ||
+                abs(baseline - renderedWidth) > 0.25
+            {
+                renderedWidth
+            } else {
+                renderedWidth + 0.5
+            }
+
+            macOS27PositionRefreshBaseline = baseline
+            statusItem.length = temporaryLength
+            try? await Task.sleep(for: .milliseconds(16))
+            guard
+                !Task.isCancelled,
+                generation == macOS27PositionRefreshGeneration
+            else {
+                return
+            }
+            statusItem.length = baseline
+            macOS27PositionRefreshBaseline = nil
+            macOS27PositionRefreshTask = nil
+        }
+    }
+
     /// Configures the internal observers for the control item.
     private func configureCancellables() {
         var c = Set<AnyCancellable>()
 
         $state
+            // A same-value assignment must not commit another status-item
+            // scene update. MenuBarAgent visibly flashes those redundant
+            // updates while a macOS 27 visibility assertion is changing.
+            .removeDuplicates()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 self?.updateStatusItem()
@@ -455,51 +516,6 @@ final class ControlItem {
         }
     }
 
-    /// Re-publishes Ice's visible status item after a macOS 27 assessment-mode
-    /// reflow. MenuBarAgent can temporarily drop an otherwise-allowed item.
-    func restoreAfterMacOS27RestrictionChange() {
-        guard #available(macOS 27.0, *), identifier == .visible, let appState else {
-            return
-        }
-        guard appState.settings.general.showIceIcon else { return }
-
-        let autosaveName = identifier.rawValue
-        ControlItemDefaults[.visible, autosaveName] = true
-        ControlItemDefaults[.visibleCC, autosaveName] = true
-        if let position = ControlItemDefaults[.preferredPosition, autosaveName], position <= 0 {
-            ControlItemDefaults[.preferredPosition, autosaveName] = nil
-        }
-
-        // MenuBarAgent can remove the scene without changing AppKit's
-        // `isVisible` property. In that state, assigning `true` again is a
-        // no-op. Re-publish the same status item only when AX confirms its
-        // button is actually absent; this avoids periodic flicker and cannot
-        // create a second logical Ice item.
-        let isPublished = NSRunningApplication
-            .runningApplications(withBundleIdentifier: "com.apple.MenuBarAgent")
-            .contains { runningApp in
-                guard
-                    let application = AXHelpers.application(for: runningApp),
-                    let menuBar = AXHelpers.extrasMenuBar(for: application)
-                else {
-                    return false
-                }
-                return AXHelpers.children(for: menuBar).contains { child in
-                    AXHelpers.identifier(for: child) == Identifier.visible.rawValue
-                }
-            }
-        if !isPublished {
-            let cachedPosition = ControlItemDefaults[.preferredPosition, autosaveName]
-            statusItem.isVisible = false
-            ControlItemDefaults[.preferredPosition, autosaveName] = cachedPosition
-            statusItem.isVisible = true
-        }
-        statusItem.isVisible = true
-        constraint?.isActive = true
-        statusItem.length = identifier.length(for: state)
-        updateStatusItem()
-    }
-
     /// Adds the control item to the menu bar.
     private func addToMenuBar() {
         if #available(macOS 27.0, *), identifier != .visible {
@@ -534,11 +550,19 @@ final class ControlItem {
             // Accessibility presses do not necessarily synthesize a
             // leftMouseDown event. Treat them as an ordinary click so the Ice
             // button remains usable from VoiceOver and UI automation.
-            let modifierFlags = event?.modifierFlags ?? NSEvent.modifierFlags
+            // An accessibility press has no backing NSEvent. Do not inherit
+            // the last synthetic Command-drag's global modifier state.
+            let modifierFlags = event?.modifierFlags ?? []
 
             // Running this from a Task seems to improve the visual
             // responsiveness of the status item's button.
             Task {
+                // Command-click is the start of the system's native status-item
+                // reorder gesture. It must not also toggle the hidden section.
+                if modifierFlags.contains(.command) {
+                    return
+                }
+
                 if modifierFlags == .control {
                     showMenu()
                     return

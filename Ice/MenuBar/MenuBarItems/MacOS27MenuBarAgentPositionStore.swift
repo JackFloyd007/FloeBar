@@ -8,9 +8,10 @@
 import Cocoa
 import OSLog
 
-/// Reorders and prioritizes macOS 27 status items using MenuBarAgent's own
-/// preferred-position dictionary. Elevated hidden items naturally overflow on
-/// constrained menu bars; the visibility restriction handles wider layouts.
+/// Reorders macOS 27 status items using MenuBarAgent's own preferred-position
+/// dictionary. Visibility is handled by ``MacOS27MenuBarController``; this
+/// store keeps Ice's single control item at the boundary between the visible
+/// and concealed sections without rewriting positions on every toggle.
 @available(macOS 27.0, *)
 @MainActor
 enum MacOS27MenuBarAgentPositionStore {
@@ -18,38 +19,78 @@ enum MacOS27MenuBarAgentPositionStore {
     private static let domain = "com.apple.MenuBarAgent" as CFString
     private static let positionsKey = "TrailingItemPreferredPositions" as CFString
     private static let savedWeightsKey = "MacOS27MenuBarAgentPositionStore.savedWeights.v1"
-    private static let hiddenWeightBase = 50_000
-    private static let alwaysHiddenWeightBase = 60_000
+    // MenuBarAgent weights are ordering ranks, not pixel distances. Keep Ice
+    // almost adjacent to the visible edge; newly reintroduced items without
+    // an autosave key are then laid out on the concealed side of the boundary.
+    private static let boundaryInset = 0.001
+    private static let sectionStep = 0.1
+    private static let visibleControlKey =
+        "status:\(Constants.bundleIdentifier)::\(ControlItem.Identifier.visible.rawValue)"
 
-    /// Elevates only assigned third-party items into MenuBarAgent's overflow
-    /// preference bands. Apple modules and Ice's control items are deliberately
-    /// excluded so clicking Ice can never reorder unrelated parts of the bar.
+    /// Places the visible Ice control after every visible item and before every
+    /// resolvable hidden item. The resulting weights stay stable while a
+    /// section is toggled, preventing MenuBarAgent from making icons "dance".
     @discardableResult
-    static func applyVisibility(
+    static func applySectionBoundary(
         assignments: [String: MenuBarSection.Name],
         order: [MenuBarSection.Name: [String]],
-        revealing revealedSection: MenuBarSection.Name?,
         items: [MenuBarItem]
     ) -> Bool {
         var positions = readRawPositions()
-        var savedWeights = readSavedWeights()
-        let existingKeys = Array(positions.keys)
+        var changed = restoreLegacyParkedWeights(in: &positions)
+        let numericPositions = positions.compactMapValues(numericValue)
+        let existingKeys = Array(numericPositions.keys)
         let itemByIdentifier = Dictionary(
             items.map { ($0.tag.persistentIdentifier, $0) },
             uniquingKeysWith: { current, _ in current }
         )
 
-        let concealedSections: Set<MenuBarSection.Name> = switch revealedSection {
-        case .alwaysHidden: []
-        case .hidden: [.alwaysHidden]
-        case .visible, nil: [.hidden, .alwaysHidden]
+        let weightsIncreaseRight = observedWeightsIncreaseRight(
+            liveItems: items,
+            positions: numericPositions,
+            keys: existingKeys
+        )
+        // Hidden items are visually to the left of the Ice control. On the
+        // observed macOS 27 store, weights normally increase toward the left.
+        let hiddenDirection = weightsIncreaseRight ? -1.0 : 1.0
+
+        let visibleWeights = order[.visible, default: []].compactMap { identifier -> Double? in
+            guard
+                assignments[identifier] == .visible,
+                let item = itemByIdentifier[identifier],
+                let key = resolveKey(for: item, existingKeys: existingKeys)
+            else {
+                return nil
+            }
+            return numericPositions[key]
         }
 
-        var desiredHiddenKeys = [String: Int]()
-        for section in [MenuBarSection.Name.hidden, .alwaysHidden]
-        where concealedSections.contains(section) {
-            let base = section == .hidden ? hiddenWeightBase : alwaysHiddenWeightBase
-            for (offset, identifier) in order[section, default: []].enumerated() {
+        let currentControlWeight = numericPositions[visibleControlKey]
+        let visibleEdge = if hiddenDirection > 0 {
+            visibleWeights.max()
+        } else {
+            visibleWeights.min()
+        }
+        guard let boundaryWeight = visibleEdge.map({ $0 + hiddenDirection * boundaryInset })
+            ?? currentControlWeight
+        else {
+            if changed { writeRawPositions(positions) }
+            return changed
+        }
+
+        if numericValue(positions[visibleControlKey]) != boundaryWeight {
+            positions[visibleControlKey] = NSNumber(value: boundaryWeight)
+            changed = true
+        }
+        ControlItemDefaults[.preferredPosition, ControlItem.Identifier.visible.rawValue] =
+            CGFloat(boundaryWeight)
+
+        // The stored layout is left-to-right. Starting at its right edge puts
+        // the closest hidden item immediately to the left of Ice, followed by
+        // the rest of Hidden and then Always-Hidden.
+        var offset = 1.0
+        for section in [MenuBarSection.Name.hidden, .alwaysHidden] {
+            for identifier in order[section, default: []].reversed() {
                 guard
                     assignments[identifier] == section,
                     let item = itemByIdentifier[identifier],
@@ -58,44 +99,42 @@ enum MacOS27MenuBarAgentPositionStore {
                 else {
                     continue
                 }
-                desiredHiddenKeys[key] = base + offset * 10
+                let targetWeight = boundaryWeight + hiddenDirection * sectionStep * offset
+                if numericValue(positions[key]) != targetWeight {
+                    positions[key] = NSNumber(value: targetWeight)
+                    changed = true
+                }
+                offset += 1
             }
         }
 
-        var changed = false
-        for (key, hiddenWeight) in desiredHiddenKeys {
-            guard let currentWeight = numericValue(positions[key]) else { continue }
-            if savedWeights[key] == nil, currentWeight < Double(hiddenWeightBase) {
-                savedWeights[key] = currentWeight
-            }
-            if numericValue(positions[key]) != Double(hiddenWeight) {
-                positions[key] = NSNumber(value: hiddenWeight)
-                changed = true
-            }
-        }
-
-        for (key, originalWeight) in savedWeights where desiredHiddenKeys[key] == nil {
-            guard positions[key] != nil else {
-                savedWeights.removeValue(forKey: key)
-                continue
-            }
-            if numericValue(positions[key]) != originalWeight {
-                positions[key] = NSNumber(value: originalWeight)
-                changed = true
-            }
-            savedWeights.removeValue(forKey: key)
-        }
-
-        writeSavedWeights(savedWeights)
         guard changed else { return false }
         writeRawPositions(positions)
         logger.notice(
-            "Applied macOS 27 item visibility: hiddenKeys=\(desiredHiddenKeys.keys.sorted().joined(separator: ","), privacy: .public)"
+            "Placed macOS 27 Ice boundary at weight \(boundaryWeight, privacy: .public)"
         )
         return true
     }
 
-    /// Restores every weight captured before Ice parked an item off-screen.
+    /// Restores weights left by macOS27.3's temporary overflow parking. This
+    /// one-time migration removes the position rewrite that caused toggles to
+    /// flash and then clears the legacy bookkeeping.
+    private static func restoreLegacyParkedWeights(in positions: inout [String: Any]) -> Bool {
+        let savedWeights = readSavedWeights()
+        guard !savedWeights.isEmpty else { return false }
+
+        var changed = false
+        for (key, originalWeight) in savedWeights where positions[key] != nil {
+            if numericValue(positions[key]) != originalWeight {
+                positions[key] = NSNumber(value: originalWeight)
+                changed = true
+            }
+        }
+        writeSavedWeights([:])
+        return changed
+    }
+
+    /// Restores any legacy weights captured before Ice parked an item off-screen.
     @discardableResult
     static func revealAll() -> Bool {
         let savedWeights = readSavedWeights()
@@ -113,7 +152,7 @@ enum MacOS27MenuBarAgentPositionStore {
             writeRawPositions(positions)
         }
         writeSavedWeights([:])
-        logger.notice("Restored all macOS 27 menu bar item positions")
+        logger.notice("Restored legacy macOS 27 parked menu bar positions")
         return changed
     }
 
@@ -239,8 +278,16 @@ enum MacOS27MenuBarAgentPositionStore {
     ) -> String? {
         if item.tag.namespace == .controlCenter {
             let aliases: [String] = switch item.tag.title {
-            case "Displays": ["Display", "Displays"]
-            case "Volume": ["Sound", "Volume"]
+            case "Battery", "com.apple.menuextra.battery": ["Battery"]
+            case "Bluetooth", "com.apple.menuextra.bluetooth": ["Bluetooth"]
+            case "Clock", "com.apple.menuextra.clock": ["Clock"]
+            case "Displays", "Display", "com.apple.menuextra.displays": ["Display", "Displays"]
+            case "Keyboard", "com.apple.menuextra.keyboard": ["Keyboard"]
+            case "Sound", "Volume", "com.apple.menuextra.volume": ["Sound", "Volume"]
+            case "WiFi", "Wi-Fi", "com.apple.menuextra.wifi": ["WiFi"]
+            case "ScreenMirroring", "Screen Mirroring", "com.apple.menuextra.screenmirroring":
+                ["ScreenMirroring"]
+            case "BentoBox-0", "ControlCenter", "com.apple.menuextra.controlcenter": ["BentoBox-0"]
             default: [item.tag.title]
             }
             for alias in aliases {
@@ -270,6 +317,10 @@ enum MacOS27MenuBarAgentPositionStore {
             let displayNameKey = "status:\(localizedName)::\(item.tag.title)"
             if existingKeys.contains(displayNameKey) { return displayNameKey }
         }
+
+        // A plausible key is not necessarily the internal key MenuBarAgent
+        // sorts. Fabricating it makes the preference write appear successful
+        // while leaving the icon on the wrong side of Ice.
         return nil
     }
 

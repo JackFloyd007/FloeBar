@@ -69,6 +69,10 @@ final class MenuBarManager: ObservableObject {
     /// Performs the initial setup of the menu bar manager.
     func performSetup(with appState: AppState) {
         self.appState = appState
+        macOS27Controller.positionRefreshHandler = { [weak self] in
+            guard let self else { return }
+            controlItem(withName: .visible)?.requestMacOS27PositionRefresh()
+        }
         configureCancellables()
         iceBarPanel.performSetup(with: appState)
         searchPanel.performSetup(with: appState)
@@ -247,17 +251,6 @@ final class MenuBarManager: ObservableObject {
             macOS27Controller.setRevealedSection(.hidden)
         } else {
             macOS27Controller.setRevealedSection(nil)
-        }
-        restoreMacOS27ControlItems()
-    }
-
-    /// Restores the user-facing Ice icon after MenuBarAgent recomposites the bar.
-    func restoreMacOS27ControlItems() {
-        guard #available(macOS 27.0, *) else { return }
-        section(withName: .visible)?.controlItem.restoreAfterMacOS27RestrictionChange()
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(350))
-            self?.section(withName: .visible)?.controlItem.restoreAfterMacOS27RestrictionChange()
         }
     }
 

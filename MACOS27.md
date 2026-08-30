@@ -11,11 +11,12 @@ menu bar items are no longer exposed as independent WindowServer windows.
   relaunches.
 - Clicking Ice's permanent menu-bar button toggles only the items assigned to
   Hidden or Always Hidden. Ice itself and the core system controls stay visible.
-- Hidden and always-hidden sections combine MenuBarAgent preferred-position
-  bands with a runtime-loaded MenuBarClientCore visibility restriction. This
-  works on wide displays where position changes alone do not cause overflow.
-- Native ordering is persisted through MenuBarAgent's
-  `TrailingItemPreferredPositions` preference and restored when Ice exits.
+- Hidden and always-hidden sections use a runtime-loaded MenuBarClientCore
+  visibility restriction. Replacement restrictions overlap briefly so the
+  menu bar is never unrestricted between hide and reveal states.
+- Ice's permanent control item is placed through MenuBarAgent's
+  `TrailingItemPreferredPositions` preference at the boundary between Visible
+  and Hidden. Positions remain stable while toggling, avoiding icon movement.
 - The legacy Hidden and Always-Hidden divider status items are not published on
   macOS 27. The permanent Ice toggle is the only Ice item in the menu bar, so
   section changes do not create duplicate icons or reserve empty slots.
@@ -40,8 +41,8 @@ menu bar items are no longer exposed as independent WindowServer windows.
   attached Now Playing and Audio/Video extras follow macOS's visibility
   restriction and may temporarily disappear; revealing the section restores
   them.
-- Applying or removing the macOS visibility restriction can take about one to
-  two seconds.
+- Revealing a section waits briefly for its replacement visibility restriction
+  to activate before retiring the old one. This prevents full-bar flicker.
 - Reordering restarts the system-managed MenuBarAgent process so it reloads its
   preferred positions; macOS relaunches it automatically.
 
