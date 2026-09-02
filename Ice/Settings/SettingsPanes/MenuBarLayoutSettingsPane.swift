@@ -16,7 +16,7 @@ struct MenuBarLayoutSettingsPane: View {
     var body: some View {
         if appState.menuBarManager.isMenuBarHiddenBySystemUserDefaults {
             cannotArrange
-        } else if !ScreenCapture.cachedCheckPermissions() {
+        } else if #unavailable(macOS 27.0), !ScreenCapture.cachedCheckPermissions() {
             missingScreenRecordingPermissions
         } else {
             layoutContent
@@ -34,12 +34,12 @@ struct MenuBarLayoutSettingsPane: View {
                 // reordered reliably. Reveal them once for the whole editing
                 // session instead of flashing the bar around every drag.
                 appState.menuBarManager.macOS27Controller.beginLayoutEditing()
-                appState.imageCache.removeSemanticReplicas()
                 Task {
-                    // Let MenuBarAgent finish exposing hosted scenes before
-                    // refreshing AX geometry and taking exact display-strip
-                    // crops for the Layout tiles.
-                    try? await Task.sleep(for: .milliseconds(450))
+                    // Keep retained tiles visible while MenuBarAgent exposes
+                    // their live AX elements, then reconcile once. Rebuilding
+                    // the images again after a longer delay caused the visible
+                    // post-open redraw that looked like an animation.
+                    try? await Task.sleep(for: .milliseconds(160))
                     await itemManager.cacheItemsRegardless()
                     await appState.imageCache.updateCacheWithoutChecks(
                         sections: MenuBarSection.Name.allCases

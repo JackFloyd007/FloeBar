@@ -63,20 +63,55 @@ final class LayoutBarPaddingView: NSView {
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let draggingSource = sender.draggingSource as? LayoutBarItemView else {
+            container.canSetArrangedViews = true
+            return false
+        }
         defer {
             DispatchQueue.main.async {
+                guard !draggingSource.isAwaitingPhysicalMove else { return }
                 self.container.canSetArrangedViews = true
+                draggingSource.oldContainerInfo?.container.canSetArrangedViews = true
             }
         }
+        // `draggingSession(_:endedAt:operation:)` clears this immediately
+        // after the drop. Retain it for an asynchronous physical-move failure
+        // so Layout can return the same view to its exact original slot.
+        let rollbackOrigin = draggingSource.oldContainerInfo
 
-        guard let draggingSource = sender.draggingSource as? LayoutBarItemView else {
-            return false
+        // A cache update racing the drag can create a replacement view for the
+        // same menu-bar tag while the original drag source is still alive.
+        // Normalize to the real source object before choosing a neighbor; a
+        // duplicate otherwise lets the move resolve to "Wi-Fi left of Wi-Fi".
+        let sourceTag = draggingSource.item.tag
+        let sourceIsArranged = arrangedViews.contains { $0 === draggingSource }
+        var didInsertSource = false
+        let normalizedViews = arrangedViews.compactMap { view -> LayoutBarItemView? in
+            guard view.item.tag == sourceTag else { return view }
+            if sourceIsArranged {
+                guard view === draggingSource, !didInsertSource else { return nil }
+            } else {
+                guard !didInsertSource else { return nil }
+            }
+            didInsertSource = true
+            return draggingSource
+        }
+        let hasSameIdentityOrder = normalizedViews.count == arrangedViews.count &&
+            zip(normalizedViews, arrangedViews).allSatisfy { pair in
+                pair.0 === pair.1
+            }
+        if !hasSameIdentityOrder {
+            arrangedViews = normalizedViews
         }
 
         if let index = arrangedViews.firstIndex(of: draggingSource) {
             if arrangedViews.count == 1 {
                 if #available(macOS 27.0, *) {
-                    move(item: draggingSource.item, toSection: container.section)
+                    move(
+                        view: draggingSource,
+                        toSection: container.section,
+                        rollbackOrigin: rollbackOrigin
+                    )
                     return true
                 }
                 Task {
@@ -89,7 +124,11 @@ final class LayoutBarPaddingView: NSView {
                     case .alwaysHidden: items.first(matching: .alwaysHiddenControlItem)
                     }
                     if let targetItem {
-                        move(item: draggingSource.item, to: .leftOfItem(targetItem))
+                        move(
+                            view: draggingSource,
+                            to: .leftOfItem(targetItem),
+                            rollbackOrigin: rollbackOrigin
+                        )
                     } else {
                         Logger.default.error("No target item for layout bar drag")
                     }
@@ -97,49 +136,165 @@ final class LayoutBarPaddingView: NSView {
             } else if arrangedViews.indices.contains(index + 1) {
                 // we have a view to the right of the dragging source
                 let targetItem = arrangedViews[index + 1].item
-                move(item: draggingSource.item, to: .leftOfItem(targetItem))
+                guard targetItem.tag != draggingSource.item.tag else { return false }
+                move(
+                    view: draggingSource,
+                    to: .leftOfItem(targetItem),
+                    rollbackOrigin: rollbackOrigin
+                )
             } else if arrangedViews.indices.contains(index - 1) {
                 // we have a view to the left of the dragging source
                 let targetItem = arrangedViews[index - 1].item
-                move(item: draggingSource.item, to: .rightOfItem(targetItem))
+                guard targetItem.tag != draggingSource.item.tag else { return false }
+                move(
+                    view: draggingSource,
+                    to: .rightOfItem(targetItem),
+                    rollbackOrigin: rollbackOrigin
+                )
             }
         }
 
         return true
     }
 
-    private func move(item: MenuBarItem, to destination: MenuBarItemManager.MoveDestination) {
+    private func move(
+        view: LayoutBarItemView,
+        to destination: MenuBarItemManager.MoveDestination,
+        rollbackOrigin: (container: LayoutBarContainer, index: Int)?
+    ) {
         guard let appState = container.appState else {
             return
         }
+        view.didAcceptCurrentDrop = true
+        view.isAwaitingPhysicalMove = true
         Task {
             do {
-                try await Task.sleep(for: .milliseconds(25))
-                try await appState.itemManager.move(item: item, to: destination)
-                appState.itemManager.removeTemporarilyShownItemFromCache(with: item.tag)
+                // Let AppKit finish the drop callback without imposing a
+                // fixed delay before the physical menu-bar move begins.
+                await Task.yield()
+                if
+                    let rollbackOrigin,
+                    rollbackOrigin.container !== container
+                {
+                    // Cross Ice and reach the exact target in one compositor-
+                    // frozen transaction. The manager verifies both adjacency
+                    // and the requested side of Ice, avoiding the former pair
+                    // of complete read/drag/verify passes for one drop.
+                    try await appState.itemManager.move(
+                        item: view.item,
+                        to: destination,
+                        requiredSection: container.section
+                    )
+                } else {
+                    try await appState.itemManager.move(item: view.item, to: destination)
+                }
+                appState.itemManager.removeTemporarilyShownItemFromCache(with: view.item.tag)
+                completeSuccessfulDrop(
+                    view: view,
+                    from: rollbackOrigin,
+                    appState: appState
+                )
             } catch is CancellationError {
+                view.isAwaitingPhysicalMove = false
+                rollback(view: view, to: rollbackOrigin, appState: appState)
                 return
             } catch {
+                view.isAwaitingPhysicalMove = false
                 Logger.default.error("Error moving menu bar item: \(error, privacy: .public)")
+                rollback(view: view, to: rollbackOrigin, appState: appState)
                 let alert = NSAlert(error: error)
                 alert.runModal()
             }
         }
     }
 
-    private func move(item: MenuBarItem, toSection section: MenuBarSection.Name) {
+    private func move(
+        view: LayoutBarItemView,
+        toSection section: MenuBarSection.Name,
+        rollbackOrigin: (container: LayoutBarContainer, index: Int)?
+    ) {
         guard let appState = container.appState else { return }
+        view.didAcceptCurrentDrop = true
+        view.isAwaitingPhysicalMove = true
         Task {
             do {
-                try await Task.sleep(for: .milliseconds(25))
-                try await appState.itemManager.move(item: item, toSection: section)
-                appState.itemManager.removeTemporarilyShownItemFromCache(with: item.tag)
+                // Let AppKit finish the drop callback without imposing a
+                // fixed delay before the physical menu-bar move begins.
+                await Task.yield()
+                try await appState.itemManager.move(item: view.item, toSection: section)
+                appState.itemManager.removeTemporarilyShownItemFromCache(with: view.item.tag)
+                completeSuccessfulDrop(
+                    view: view,
+                    from: rollbackOrigin,
+                    appState: appState
+                )
             } catch is CancellationError {
+                view.isAwaitingPhysicalMove = false
+                rollback(view: view, to: rollbackOrigin, appState: appState)
                 return
             } catch {
+                view.isAwaitingPhysicalMove = false
                 Logger.default.error("Error moving menu bar item: \(error, privacy: .public)")
+                rollback(view: view, to: rollbackOrigin, appState: appState)
                 NSAlert(error: error).runModal()
             }
         }
+    }
+
+    /// Releases the drag-time container freeze only after the physical move
+    /// has been verified and projected into itemCache, then synchronizes both
+    /// sections once. Stale AX snapshots arriving during the move are ignored.
+    private func completeSuccessfulDrop(
+        view: LayoutBarItemView,
+        from origin: (container: LayoutBarContainer, index: Int)?,
+        appState: AppState
+    ) {
+        view.isAwaitingPhysicalMove = false
+        container.canSetArrangedViews = true
+        origin?.container.canSetArrangedViews = true
+
+        if let sourceContainer = origin?.container, sourceContainer !== container {
+            sourceContainer.setArrangedViews(
+                items: appState.itemManager.itemCache.managedItems(for: sourceContainer.section)
+            )
+        }
+        container.setArrangedViews(
+            items: appState.itemManager.itemCache.managedItems(for: container.section)
+        )
+    }
+
+    /// Restores the exact pre-drag view ordering after a physical move fails.
+    /// Reusing the same view avoids the duplicate image subscription and blink
+    /// caused by tearing down and recreating a Layout tile during rollback.
+    private func rollback(
+        view: LayoutBarItemView,
+        to origin: (container: LayoutBarContainer, index: Int)?,
+        appState: AppState
+    ) {
+        container.canSetArrangedViews = true
+        guard let origin else {
+            container.setArrangedViews(
+                items: appState.itemManager.itemCache.managedItems(for: container.section)
+            )
+            return
+        }
+
+        origin.container.canSetArrangedViews = true
+        if origin.container === container {
+            var views = container.arrangedViews
+            views.removeAll { $0 === view }
+            views.insert(view, at: min(origin.index, views.endIndex))
+            container.arrangedViews = views
+            return
+        }
+
+        var destinationViews = container.arrangedViews
+        destinationViews.removeAll { $0 === view }
+        container.arrangedViews = destinationViews
+
+        var sourceViews = origin.container.arrangedViews
+        sourceViews.removeAll { $0 === view }
+        sourceViews.insert(view, at: min(origin.index, sourceViews.endIndex))
+        origin.container.arrangedViews = sourceViews
     }
 }

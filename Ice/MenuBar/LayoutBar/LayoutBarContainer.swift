@@ -167,7 +167,9 @@ final class LayoutBarContainer: NSView {
             return
         }
         var newViews = [LayoutBarItemView]()
+        var seenTags = Set<MenuBarItemTag>()
         for item in items {
+            guard seenTags.insert(item.tag).inserted else { continue }
             if let existingView = arrangedViews.first(where: { $0.item.tag == item.tag }) {
                 existingView.update(item: item)
                 newViews.append(existingView)
@@ -196,6 +198,11 @@ final class LayoutBarContainer: NSView {
         case .entered:
             return updateArrangedViewsForDrag(with: draggingInfo, phase: .updated)
         case .exited:
+            // AppKit can deliver one final destination exit after the source
+            // session has already ended. Removing the source at that point
+            // defeats cancelled-drop restoration and makes the tile vanish
+            // until Layout is reopened.
+            guard sourceView.isDragSessionActive else { return .move }
             if let sourceIndex = arrangedViews.firstIndex(of: sourceView) {
                 arrangedViews.remove(at: sourceIndex)
             }

@@ -19,17 +19,17 @@ enum MacOS27MenuBarAgentPositionStore {
     private static let domain = "com.apple.MenuBarAgent" as CFString
     private static let positionsKey = "TrailingItemPreferredPositions" as CFString
     private static let savedWeightsKey = "MacOS27MenuBarAgentPositionStore.savedWeights.v1"
-    // MenuBarAgent weights are ordering ranks, not pixel distances. Keep Ice
-    // almost adjacent to the visible edge; newly reintroduced items without
-    // an autosave key are then laid out on the concealed side of the boundary.
-    private static let boundaryInset = 0.001
-    // AppKit republishes hosted NSStatusItems from an owner-local preferred
-    // position and rounds away sub-point ordering differences. Native menu bar
-    // ranks are normally spaced by roughly 10 or more, so use the same scale
-    // to keep the order stable after hide/reveal recompositions.
+    // MenuBarAgent consumes ordering ranks as integers. Native menu bar ranks
+    // are normally spaced by roughly 10 or more, so use the same scale to keep
+    // the order stable after hide/reveal recompositions.
     private static let sectionStep = 10.0
     private static let visibleControlKey =
         "status:\(Constants.bundleIdentifier)::\(ControlItem.Identifier.visible.rawValue)"
+
+    struct MoveTransaction {
+        fileprivate let originalPositions: [String: Double]
+        fileprivate let changedPositionKeys: Set<String>
+    }
 
     /// Places the visible Ice control after every visible item and before every
     /// resolvable hidden item. The resulting weights stay stable while a
@@ -59,13 +59,11 @@ enum MacOS27MenuBarAgentPositionStore {
         let hiddenDirection = weightsIncreaseRight ? -1.0 : 1.0
 
         let visibleWeights = order[.visible, default: []].compactMap { identifier -> Double? in
-            guard
-                assignments[identifier] == .visible,
-                let item = itemByIdentifier[identifier],
-                let key = resolveKey(for: item, existingKeys: existingKeys)
-            else {
-                return nil
-            }
+            guard assignments[identifier] == .visible else { return nil }
+            let key = itemByIdentifier[identifier].flatMap {
+                resolveKey(for: $0, existingKeys: existingKeys)
+            } ?? resolveKey(forPersistentIdentifier: identifier, existingKeys: existingKeys)
+            guard let key else { return nil }
             return numericPositions[key]
         }
 
@@ -75,7 +73,12 @@ enum MacOS27MenuBarAgentPositionStore {
         } else {
             visibleWeights.min()
         }
-        guard let boundaryWeight = visibleEdge.map({ $0 + hiddenDirection * boundaryInset })
+        // Never create fractional micro-ranks here. The runtime host truncates
+        // them to Int, so 255.5005 / 255.5015 / 255.5025 all become the same
+        // slot and make a later multi-item reorder ambiguous.
+        guard let boundaryWeight = visibleEdge.map({ edge in
+            Double(Int(edge) + (hiddenDirection > 0 ? 1 : -1))
+        })
             ?? currentControlWeight
         else {
             if changed { writeRawPositions(positions) }
@@ -95,14 +98,15 @@ enum MacOS27MenuBarAgentPositionStore {
         var offset = 1.0
         for section in [MenuBarSection.Name.hidden, .alwaysHidden] {
             for identifier in order[section, default: []].reversed() {
-                guard
-                    assignments[identifier] == section,
-                    let item = itemByIdentifier[identifier],
-                    isThirdPartyItem(item),
-                    let key = resolveKey(for: item, existingKeys: existingKeys)
-                else {
-                    continue
-                }
+                guard assignments[identifier] == section else { continue }
+                let item = itemByIdentifier[identifier]
+                let isThirdParty = item.map(isThirdPartyItem)
+                    ?? isThirdPartyPersistentIdentifier(identifier)
+                guard isThirdParty else { continue }
+                let key = item.flatMap {
+                    resolveKey(for: $0, existingKeys: existingKeys)
+                } ?? resolveKey(forPersistentIdentifier: identifier, existingKeys: existingKeys)
+                guard let key else { continue }
                 let targetWeight = boundaryWeight + hiddenDirection * sectionStep * offset
                 if numericValue(positions[key]) != targetWeight {
                     positions[key] = NSNumber(value: targetWeight)
@@ -112,8 +116,18 @@ enum MacOS27MenuBarAgentPositionStore {
             }
         }
 
-        guard changed else { return false }
-        writeRawPositions(positions)
+        if changed {
+            writeRawPositions(positions)
+        }
+        let didSynchronizeOwner = synchronizeBoundaryOwnerPreferredPositions(
+            order: order,
+            assignments: assignments,
+            itemsByIdentifier: itemByIdentifier,
+            positions: positions,
+            boundaryWeight: boundaryWeight,
+            existingKeys: existingKeys
+        )
+        guard changed || didSynchronizeOwner else { return false }
         logger.notice(
             "Placed macOS 27 Ice boundary at weight \(boundaryWeight, privacy: .public)"
         )
@@ -165,9 +179,10 @@ enum MacOS27MenuBarAgentPositionStore {
         item: MenuBarItem,
         to destination: MenuBarItemManager.MoveDestination,
         liveItems: [MenuBarItem]
-    ) -> Bool {
-        var positions = readPositions()
-        let keys = Array(positions.keys)
+    ) -> MoveTransaction? {
+        let originalPositions = readPositions()
+        var positions = readIntegerPositions()
+        let keys = Array(originalPositions.keys)
         let currentOrder = liveItems.sorted { lhs, rhs in
             if lhs.bounds.minX == rhs.bounds.minX {
                 return lhs.bounds.minY < rhs.bounds.minY
@@ -177,7 +192,7 @@ enum MacOS27MenuBarAgentPositionStore {
         guard
             let sourceIndex = currentOrder.firstIndex(where: { $0.tag == item.tag })
         else {
-            return false
+            return nil
         }
 
         var desiredOrder = currentOrder
@@ -185,55 +200,249 @@ enum MacOS27MenuBarAgentPositionStore {
         guard let targetIndex = desiredOrder.firstIndex(where: {
             $0.tag == destination.targetItem.tag
         }) else {
-            return false
+            return nil
         }
         let insertionIndex = switch destination {
         case .leftOfItem: targetIndex
         case .rightOfItem: targetIndex + 1
         }
         desiredOrder.insert(movedItem, at: insertionIndex)
-        guard desiredOrder.map(\.tag) != currentOrder.map(\.tag) else { return true }
-
-        // Treat the existing weights as physical slots and rotate the item
-        // identities through those slots. Midpoint insertion eventually runs
-        // out of precision and can also cross an unrelated owner-specific
-        // rank; permuting the already accepted weights works for adjacent and
-        // multi-icon moves without inventing any new rank.
-        let lowerBound = min(sourceIndex, insertionIndex)
-        let upperBound = max(sourceIndex, insertionIndex)
-        let currentSegment = currentOrder[lowerBound ... upperBound]
-        let desiredSegment = desiredOrder[lowerBound ... upperBound]
-
-        var slotWeights = [Double]()
-        var resolvedKeys = [String]()
-        for currentItem in currentSegment {
-            guard
-                let key = resolveKey(for: currentItem, existingKeys: keys),
-                let weight = positions[key]
-            else {
-                return false
-            }
-            resolvedKeys.append(key)
-            slotWeights.append(weight)
+        guard desiredOrder.map(\.tag) != currentOrder.map(\.tag) else {
+            return MoveTransaction(
+                originalPositions: originalPositions,
+                changedPositionKeys: []
+            )
         }
-        guard Set(resolvedKeys).count == resolvedKeys.count else { return false }
+
+        // Reuse MenuBarAgent's already accepted physical slots whenever they
+        // are distinct. Only rebuild a segment when an older build left two
+        // items in the same integer slot, or when an item has not published a
+        // preferred-position key yet. This keeps an ordinary long move to a
+        // minimal permutation while still repairing the ambiguous 255.xxx
+        // clusters that made multi-icon moves fail intermittently.
+        var lowerBound = min(sourceIndex, insertionIndex)
+        var upperBound = max(sourceIndex, insertionIndex)
+        let weightsIncreaseRight = observedWeightsIncreaseRight(
+            liveItems: currentOrder,
+            positions: originalPositions,
+            keys: keys
+        )
+
+        var slotWeights: [Int]?
+        while slotWeights == nil {
+            let currentSegment = currentOrder[lowerBound ... upperBound]
+            let resolvedKeys = currentSegment.compactMap {
+                resolveKey(for: $0, existingKeys: keys)
+            }
+            guard
+                resolvedKeys.count == currentSegment.count,
+                Set(resolvedKeys).count == resolvedKeys.count
+            else {
+                return nil
+            }
+
+            // An unweighted immediate neighbor is not a safe allocation
+            // boundary: skipping over it could move the requested range across
+            // an unrelated icon when that owner republishes. Absorb it into the
+            // same transaction so it receives a deterministic integer slot.
+            var expandedForUnweightedNeighbor = false
+            if lowerBound > currentOrder.startIndex {
+                let index = lowerBound - 1
+                guard let key = resolveKey(for: currentOrder[index], existingKeys: keys) else {
+                    return nil
+                }
+                if originalPositions[key] == nil {
+                    lowerBound = index
+                    expandedForUnweightedNeighbor = true
+                }
+            }
+            if upperBound + 1 < currentOrder.endIndex {
+                let index = upperBound + 1
+                guard let key = resolveKey(for: currentOrder[index], existingKeys: keys) else {
+                    return nil
+                }
+                if originalPositions[key] == nil {
+                    upperBound = index
+                    expandedForUnweightedNeighbor = true
+                }
+            }
+            if expandedForUnweightedNeighbor {
+                continue
+            }
+
+            let leftBoundary: Double?
+            if lowerBound > currentOrder.startIndex {
+                guard let key = resolveKey(
+                    for: currentOrder[lowerBound - 1],
+                    existingKeys: keys
+                ) else {
+                    return nil
+                }
+                leftBoundary = originalPositions[key]
+            } else {
+                leftBoundary = nil
+            }
+            let rightBoundary: Double?
+            if upperBound + 1 < currentOrder.endIndex {
+                guard let key = resolveKey(
+                    for: currentOrder[upperBound + 1],
+                    existingKeys: keys
+                ) else {
+                    return nil
+                }
+                rightBoundary = originalPositions[key]
+            } else {
+                rightBoundary = nil
+            }
+
+            let existingSlots = resolvedKeys.compactMap { positions[$0] }
+            let slotsFollowPhysicalOrder = zip(existingSlots, existingSlots.dropFirst())
+                .allSatisfy { left, right in
+                    weightsIncreaseRight ? left < right : left > right
+                }
+            let fitsLeftBoundary: Bool
+            if let leftBoundary, let firstSlot = existingSlots.first {
+                fitsLeftBoundary = weightsIncreaseRight
+                    ? Int(leftBoundary) < firstSlot
+                    : Int(leftBoundary) > firstSlot
+            } else {
+                fitsLeftBoundary = true
+            }
+            let fitsRightBoundary: Bool
+            if let rightBoundary, let lastSlot = existingSlots.last {
+                fitsRightBoundary = weightsIncreaseRight
+                    ? lastSlot < Int(rightBoundary)
+                    : lastSlot > Int(rightBoundary)
+            } else {
+                fitsRightBoundary = true
+            }
+            if
+                existingSlots.count == currentSegment.count,
+                Set(existingSlots).count == existingSlots.count,
+                slotsFollowPhysicalOrder,
+                fitsLeftBoundary,
+                fitsRightBoundary
+            {
+                // These weights already describe exact physical slots and are
+                // also distinct from both untouched neighbors. Permuting item
+                // identities through them moves only the crossed icons.
+                slotWeights = existingSlots
+                continue
+            }
+
+            slotWeights = allocateIntegerSlots(
+                count: currentSegment.count,
+                leftBoundary: leftBoundary,
+                rightBoundary: rightBoundary,
+                weightsIncreaseRight: weightsIncreaseRight
+            )
+            if slotWeights == nil {
+                let canExpandLeft = lowerBound > currentOrder.startIndex
+                let canExpandRight = upperBound + 1 < currentOrder.endIndex
+                guard canExpandLeft || canExpandRight else { return nil }
+                if canExpandLeft { lowerBound -= 1 }
+                if canExpandRight { upperBound += 1 }
+            }
+        }
+
+        guard let slotWeights else { return nil }
+        let desiredSegment = desiredOrder[lowerBound ... upperBound]
 
         var changedKeys = [String]()
         for (desiredItem, slotWeight) in zip(desiredSegment, slotWeights) {
             guard let key = resolveKey(for: desiredItem, existingKeys: keys) else {
-                return false
+                return nil
             }
             if positions[key] != slotWeight {
                 positions[key] = slotWeight
                 changedKeys.append(key)
             }
         }
-        guard !changedKeys.isEmpty else { return true }
-        writePositions(positions)
+        if !changedKeys.isEmpty {
+            writeIntegerPositionChanges(
+                positions,
+                changedKeys: Set(changedKeys)
+            )
+        }
         logger.info(
             "Reordered \(item.logString, privacy: .public) across \(changedKeys.count, privacy: .public) preferred-position slots"
         )
-        return true
+        return MoveTransaction(
+            originalPositions: originalPositions,
+            changedPositionKeys: Set(changedKeys)
+        )
+    }
+
+    /// Allocates distinct integer slots between the nearest untouched physical
+    /// neighbors. Working in a transformed left-to-right axis handles both
+    /// observed MenuBarAgent rank directions with the same calculation.
+    private static func allocateIntegerSlots(
+        count: Int,
+        leftBoundary: Double?,
+        rightBoundary: Double?,
+        weightsIncreaseRight: Bool
+    ) -> [Int]? {
+        guard count > 0 else { return [] }
+
+        let direction = weightsIncreaseRight ? 1.0 : -1.0
+        // Untouched fractional neighbors are interpreted through the same Int
+        // projection as the runtime host. Otherwise an allocated `255` beside
+        // an untouched `255.5025` would still collapse into a tie.
+        let transformedLeft = leftBoundary.map { Double(Int($0)) * direction }
+        let transformedRight = rightBoundary.map { Double(Int($0)) * direction }
+        let transformedSlots: [Int]
+
+        switch (transformedLeft, transformedRight) {
+        case let (left?, right?):
+            guard left < right else { return nil }
+            let first = Int(floor(left)) + 1
+            let last = Int(ceil(right)) - 1
+            let available = last - first + 1
+            guard available >= count else { return nil }
+            transformedSlots = (0 ..< count).map { index in
+                // Choose the center of each equal-width bin. This keeps space
+                // on both sides and remains unique when available == count.
+                first + ((2 * index + 1) * available) / (2 * count)
+            }
+
+        case let (left?, nil):
+            let first = Int(floor(left)) + Int(sectionStep)
+            transformedSlots = (0 ..< count).map {
+                first + $0 * Int(sectionStep)
+            }
+
+        case let (nil, right?):
+            let last = Int(ceil(right)) - Int(sectionStep)
+            transformedSlots = (0 ..< count).map {
+                last - (count - 1 - $0) * Int(sectionStep)
+            }
+
+        case (nil, nil):
+            transformedSlots = (0 ..< count).map { $0 * Int(sectionStep) }
+        }
+
+        guard Set(transformedSlots).count == count else { return nil }
+        return weightsIncreaseRight ? transformedSlots : transformedSlots.map { -$0 }
+    }
+
+    /// Restores only the preference keys touched by a failed transaction. The
+    /// rest of MenuBarAgent's dictionary may have changed concurrently as apps
+    /// published or withdrew items, so replacing the whole snapshot would be
+    /// unsafe.
+    static func rollback(_ transaction: MoveTransaction) {
+        if !transaction.changedPositionKeys.isEmpty {
+            var positions = readRawPositions()
+            for key in transaction.changedPositionKeys {
+                if let original = transaction.originalPositions[key] {
+                    positions[key] = NSNumber(value: original)
+                } else {
+                    positions.removeValue(forKey: key)
+                }
+            }
+            writeRawPositions(positions)
+        }
+
+        logger.notice("Rolled back an unverified macOS 27 preferred-position transaction")
     }
 
     /// Returns the items in MenuBarAgent's current physical left-to-right
@@ -268,69 +477,51 @@ enum MacOS27MenuBarAgentPositionStore {
         }.map(\.0)
     }
 
-    /// Mirrors MenuBarAgent's desired weights into each owner's AppKit
-    /// `NSStatusItem` preference. Hosted macOS 27 items read that owner-local
-    /// value when their scene is published; updating MenuBarAgent alone is not
-    /// enough to move them.
-    static func synchronizeOwnerPreferredPositions(
-        for items: [MenuBarItem],
-        among liveItems: [MenuBarItem]
+    /// Synchronizes concealed AppKit items from the saved left-to-right section
+    /// order. The last concealed item's right-hand slot is Ice's boundary;
+    /// earlier items use the next resolvable concealed item. This remains
+    /// deterministic even while the lock screen suppresses their AX elements.
+    private static func synchronizeBoundaryOwnerPreferredPositions(
+        order: [MenuBarSection.Name: [String]],
+        assignments: [String: MenuBarSection.Name],
+        itemsByIdentifier: [String: MenuBarItem],
+        positions: [String: Any],
+        boundaryWeight: Double,
+        existingKeys: [String]
     ) -> Bool {
-        let positions = readPositions()
-        let positionKeys = Array(positions.keys)
+        let identifiers = (
+            order[.alwaysHidden, default: []] + order[.hidden, default: []]
+        ).filter { identifier in
+            guard let section = assignments[identifier] else { return false }
+            return section == .alwaysHidden || section == .hidden
+        }
         var didSynchronize = false
 
-        // AppKit stores an NSStatusItem's preferred position as the slot on
-        // its right, while MenuBarAgent stores a weight for the item itself.
-        // Resolve the complete desired order and mirror the right neighbor's
-        // weight so the owner republishes into the same physical slot.
-        let weightsIncreaseRight = observedWeightsIncreaseRight(
-            liveItems: liveItems,
-            positions: positions,
-            keys: positionKeys
-        )
-        let weightedLiveItems = liveItems.compactMap { item -> (MenuBarItem, Double)? in
+        for (index, identifier) in identifiers.enumerated() {
             guard
-                let key = resolveKey(for: item, existingKeys: positionKeys),
-                let weight = positions[key]
-            else {
-                return nil
-            }
-            return (item, weight)
-        }.sorted { lhs, rhs in
-            if lhs.1 == rhs.1 {
-                return lhs.0.bounds.minX < rhs.0.bounds.minX
-            }
-            return weightsIncreaseRight ? lhs.1 < rhs.1 : lhs.1 > rhs.1
-        }
+                let item = itemsByIdentifier[identifier],
+                isThirdPartyItem(item)
+            else { continue }
 
-        for item in items {
+            let rightWeight = identifiers.dropFirst(index + 1).compactMap { rightIdentifier in
+                let rightKey = itemsByIdentifier[rightIdentifier].flatMap {
+                    resolveKey(for: $0, existingKeys: existingKeys)
+                } ?? resolveKey(
+                    forPersistentIdentifier: rightIdentifier,
+                    existingKeys: existingKeys
+                )
+                return rightKey.flatMap { numericValue(positions[$0]) }
+            }.first ?? boundaryWeight
+
             guard
-                !item.isControlItem,
-                let itemIndex = weightedLiveItems.firstIndex(where: { $0.0.tag == item.tag }),
                 let application = item.sourceApplication ?? item.owningApplication,
                 let bundleIdentifier = application.bundleIdentifier,
-                !bundleIdentifier.hasPrefix("com.apple."),
-                application.bundleURL?.path.hasPrefix("/System/") != true
-            else {
-                continue
-            }
-
-            let itemWeight = weightedLiveItems[itemIndex].1
-            let ownerWeight = if itemIndex + 1 < weightedLiveItems.endIndex {
-                weightedLiveItems[itemIndex + 1].1
-            } else {
-                itemWeight + (weightsIncreaseRight ? 10.0 : -10.0)
-            }
-            guard
                 writeOwnerPreferredPosition(
-                    ownerWeight,
+                    rightWeight,
                     item: item,
                     domain: bundleIdentifier as CFString
                 )
-            else {
-                continue
-            }
+            else { continue }
             didSynchronize = true
         }
         return didSynchronize
@@ -341,38 +532,17 @@ enum MacOS27MenuBarAgentPositionStore {
         item: MenuBarItem,
         domain: CFString
     ) -> Bool {
-        let prefix = "NSStatusItem Preferred Position "
-        let keys = (CFPreferencesCopyKeyList(
-            domain,
-            kCFPreferencesCurrentUser,
-            kCFPreferencesAnyHost
-        ) as? [String] ?? []).filter { $0.hasPrefix(prefix) }
-        guard !keys.isEmpty else { return false }
-
-        let identityCandidates = [item.tag.title, item.title, item.displayName]
-            .compactMap { $0?.lowercased() }
-            .filter { !$0.isEmpty }
-        let matchedKeys = keys.filter { key in
-            let normalized = key.lowercased()
-            return identityCandidates.contains { normalized.contains($0) }
-        }
-        guard let key = matchedKeys.count == 1 ? matchedKeys[0] : (keys.count == 1 ? keys[0] : nil) else {
+        guard let preference = ownerPreferredPosition(for: item, domain: domain) else {
             return false
         }
 
-        let existing = CFPreferencesCopyValue(
-            key as CFString,
-            domain,
-            kCFPreferencesCurrentUser,
-            kCFPreferencesAnyHost
-        )
         // The running scene may still be using the value it read at launch,
-        // but a matching preference is already durable. The caller handles a
-        // live placement with a short native drag and never restarts the app.
-        guard numericValue(existing) != weight else { return true }
+        // but a matching preference is already durable. The caller refreshes
+        // the hosted child only when the complete transaction is ready.
+        guard preference.value != weight else { return false }
 
         CFPreferencesSetValue(
-            key as CFString,
+            preference.key as CFString,
             NSNumber(value: weight),
             domain,
             kCFPreferencesCurrentUser,
@@ -386,16 +556,83 @@ enum MacOS27MenuBarAgentPositionStore {
         return true
     }
 
+    private static func ownerPreferredPosition(
+        for item: MenuBarItem,
+        domain: CFString
+    ) -> (key: String, value: Double?)? {
+        let prefix = "NSStatusItem Preferred Position "
+        let keys = (CFPreferencesCopyKeyList(
+            domain,
+            kCFPreferencesCurrentUser,
+            kCFPreferencesAnyHost
+        ) as? [String] ?? []).filter { $0.hasPrefix(prefix) }
+        guard !keys.isEmpty else { return nil }
+
+        let identityCandidates = [item.tag.title, item.title, item.displayName]
+            .compactMap { $0?.lowercased() }
+            .filter { !$0.isEmpty }
+        let matchedKeys = keys.filter { key in
+            let normalized = key.lowercased()
+            return identityCandidates.contains { normalized.contains($0) }
+        }
+        guard let key = matchedKeys.count == 1 ? matchedKeys[0] : (keys.count == 1 ? keys[0] : nil) else {
+            return nil
+        }
+
+        let existing = CFPreferencesCopyValue(
+            key as CFString,
+            domain,
+            kCFPreferencesCurrentUser,
+            kCFPreferencesAnyHost
+        )
+        return (key, numericValue(existing))
+    }
+
     private static func readPositions() -> [String: Double] {
         readRawPositions().compactMapValues(numericValue)
     }
 
-    private static func writePositions(_ positions: [String: Double]) {
-        writeRawPositions(positions.mapValues(NSNumber.init(value:)))
+    /// MenuBarAgent consumes the preferred-position dictionary as integer
+    /// ranks. AppKit can leave fractional values behind after native drags, but
+    /// the macOS 27 runtime host truncates those values before planning a move
+    /// and writes integer NSNumbers back. Matching that representation matters:
+    /// swapping two nearly-adjacent fractional ranks can synchronize without
+    /// invalidating the host's live ordering.
+    private static func readIntegerPositions() -> [String: Int] {
+        readRawPositions().compactMapValues { value in
+            if let number = value as? NSNumber { return number.intValue }
+            if let string = value as? String, let number = Double(string) {
+                return Int(number)
+            }
+            return nil
+        }
+    }
+
+    /// Writes only the keys involved in the current transaction. Other apps
+    /// can publish or withdraw status items concurrently, so replacing the
+    /// complete dictionary with our integer projection would discard their
+    /// fresh values and unnecessarily quantize unrelated slots.
+    private static func writeIntegerPositionChanges(
+        _ positions: [String: Int],
+        changedKeys: Set<String>
+    ) {
+        var rawPositions = readRawPositions()
+        for key in changedKeys {
+            guard let position = positions[key] else { continue }
+            rawPositions[key] = NSNumber(value: position)
+        }
+        writeRawPositions(rawPositions)
     }
 
     private static func readRawPositions() -> [String: Any] {
-        CFPreferencesCopyValue(
+        // Pull any MenuBarAgent write that cfprefsd has not yet merged into
+        // this process before resolving keys or capturing rollback values.
+        _ = CFPreferencesSynchronize(
+            domain,
+            kCFPreferencesCurrentUser,
+            kCFPreferencesAnyHost
+        )
+        return CFPreferencesCopyValue(
             positionsKey,
             domain,
             kCFPreferencesCurrentUser,
@@ -519,6 +756,68 @@ enum MacOS27MenuBarAgentPositionStore {
         // bundle/title key and persists it from that point forward.
         if isThirdPartyItem(item) { return exact }
         return nil
+    }
+
+    /// Resolves a saved layout identity even when a locked screen or a current
+    /// visibility restriction prevents AX from vending the live item. Section
+    /// boundary calculation must include every saved visible item; otherwise
+    /// one incomplete startup scan can shift Ice and every hidden item.
+    private static func resolveKey(
+        forPersistentIdentifier identifier: String,
+        existingKeys: [String]
+    ) -> String? {
+        let base = identifier.replacing(/#\d+$/, with: "")
+        guard let separator = base.firstIndex(of: ":") else { return nil }
+        let namespace = String(base[..<separator])
+        let title = String(base[base.index(after: separator)...])
+
+        if namespace == MenuBarItemTag.Namespace.controlCenter.description {
+            let aliases: [String] = switch title {
+            case "Battery", "com.apple.menuextra.battery": ["Battery"]
+            case "Bluetooth", "com.apple.menuextra.bluetooth": ["Bluetooth"]
+            case "Clock", "com.apple.menuextra.clock": ["Clock"]
+            case "Displays", "Display", "com.apple.menuextra.displays": ["Display", "Displays"]
+            case "Keyboard", "com.apple.menuextra.keyboard": ["Keyboard"]
+            case "Sound", "Volume", "com.apple.menuextra.volume": ["Sound", "Volume"]
+            case "WiFi", "Wi-Fi", "com.apple.menuextra.wifi": ["WiFi"]
+            case "ScreenMirroring", "Screen Mirroring", "com.apple.menuextra.screenmirroring":
+                ["ScreenMirroring"]
+            case "BentoBox-0", "ControlCenter", "com.apple.menuextra.controlcenter": ["BentoBox-0"]
+            default: [title]
+            }
+            for alias in aliases {
+                let key = "module:\(alias)"
+                if existingKeys.contains(key) { return key }
+            }
+        }
+
+        if namespace == "com.apple.campo" {
+            let normalized = title.lowercased()
+            let itemName = if normalized.contains("spotlight") ||
+                normalized.contains("search") || normalized.contains("搜索")
+            {
+                "Item-0"
+            } else if normalized.contains("siri") {
+                "Item-1"
+            } else {
+                title
+            }
+            let key = "status:\(namespace)::\(itemName)"
+            if existingKeys.contains(key) { return key }
+        }
+
+        let exact = "status:\(namespace)::\(title)"
+        if existingKeys.contains(exact) { return exact }
+        let ownerPrefix = "status:\(namespace)::"
+        let ownerCandidates = existingKeys.filter { $0.hasPrefix(ownerPrefix) }
+        return ownerCandidates.count == 1 ? ownerCandidates[0] : nil
+    }
+
+    private static func isThirdPartyPersistentIdentifier(_ identifier: String) -> Bool {
+        guard let separator = identifier.firstIndex(of: ":") else { return false }
+        let namespace = identifier[..<separator]
+        return namespace != Substring(Constants.bundleIdentifier) &&
+            !namespace.hasPrefix("com.apple.")
     }
 
     private static func observedWeightsIncreaseRight(

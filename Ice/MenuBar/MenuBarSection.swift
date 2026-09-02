@@ -194,6 +194,7 @@ final class MenuBarSection {
                 }
             }
 
+            menuBarManager.syncMacOS27Visibility()
             return // We're done.
         }
 
@@ -212,6 +213,10 @@ final class MenuBarSection {
             }
         }
 
+        // Combine delivers the state publisher on the next main-queue turn.
+        // Apply the final state now as well so a click reaches macOS 27's
+        // visibility assertion without waiting for that extra dispatch.
+        menuBarManager.syncMacOS27Visibility()
         startRehideChecks()
     }
 
@@ -233,6 +238,7 @@ final class MenuBarSection {
             controlItem.state = .hideSection
         }
 
+        menuBarManager.syncMacOS27Visibility()
         stopRehideChecks()
     }
 

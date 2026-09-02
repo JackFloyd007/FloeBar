@@ -11,9 +11,19 @@ import OSLog
 
 /// A view that displays an image in a menu bar layout view.
 final class LayoutBarItemView: NSView {
+    /// Compact menu bar glyphs use one common center-to-center slot. Wider
+    /// textual status items may expand beyond it, but Wi-Fi, Spotlight,
+    /// Battery, input source, and ordinary app icons no longer inherit visibly
+    /// different spacing from their individual pixel widths.
+    private static let minimumItemWidth: CGFloat = 32
+    private static let horizontalImageInset: CGFloat = 2
+
     private weak var appState: AppState?
 
     private var cancellables = Set<AnyCancellable>()
+    private var pendingMoveTask: Task<Void, Never>?
+    private var pendingMoveOffset = 0
+    private var pendingMoveIsExecuting = false
 
     /// The item that the view represents.
     private(set) var item: MenuBarItem
@@ -32,16 +42,61 @@ final class LayoutBarItemView: NSView {
     /// A Boolean value that indicates whether the item view is currently inside a container.
     var hasContainer = false
 
+    /// Keeps source and destination containers frozen between the visual drop
+    /// and completion of the asynchronous physical menu-bar move.
+    var isAwaitingPhysicalMove = false
+
+    /// Distinguishes a destination that synchronously accepted this AppKit
+    /// drag from a cancelled session whose final `draggingExited` can arrive
+    /// after the source's ended callback.
+    var didAcceptCurrentDrop = false
+    var isDragSessionActive = false
+    private var dragSessionGeneration = 0
+
+    /// A Layout-only image with the capture's transparent side margins
+    /// removed. The shared cache retains the original pixels for other views.
+    private var displayedImage: NSImage?
+    private var displayedImageSize = CGSize.zero
+
     /// The image displayed inside the view.
     private var cachedImage: MenuBarItemImageCache.CapturedImage? {
         didSet {
             if let image = cachedImage {
-                setFrameSize(image.scaledSize)
-            } else {
-                setFrameSize(.zero)
+                let trimmed = image.cgImage.trimmingTransparency(
+                    around: [.minXEdge, .maxXEdge],
+                    alphaThreshold: 0.05
+                ) ?? image.cgImage
+                displayedImageSize = CGSize(
+                    width: CGFloat(trimmed.width) / image.scale,
+                    height: CGFloat(trimmed.height) / image.scale
+                )
+                displayedImage = NSImage(cgImage: trimmed, size: displayedImageSize)
+                setFrameSize(
+                    CGSize(
+                        width: max(
+                            Self.minimumItemWidth,
+                            displayedImageSize.width + (Self.horizontalImageInset * 2)
+                        ),
+                        height: displayedImageSize.height
+                    )
+                )
+            } else if displayedImage == nil {
+                // Keep the row stable while a refreshed capture is pending.
+                // Preserve an existing captured glyph across a transient nil;
+                // clearing and rebuilding it produced an avoidable blink.
+                setFrameSize(Self.fallbackSize(for: item))
             }
             needsDisplay = true
         }
+    }
+
+    private var displayedImageRect: CGRect {
+        CGRect(
+            x: bounds.midX - (displayedImageSize.width / 2),
+            y: bounds.midY - (displayedImageSize.height / 2),
+            width: displayedImageSize.width,
+            height: displayedImageSize.height
+        )
     }
 
     /// A Boolean value that indicates whether the item view is a dragging placeholder.
@@ -65,8 +120,9 @@ final class LayoutBarItemView: NSView {
         self.item = item
         self.appState = appState
 
-        // set the frame to the full item frame size; the image will be centered when displayed
-        super.init(frame: CGRect(origin: .zero, size: item.bounds.size))
+        // Start with the same minimum slot used by captured glyphs so opening
+        // Layout does not first publish one spacing and then snap to another.
+        super.init(frame: CGRect(origin: .zero, size: Self.fallbackSize(for: item)))
         unregisterDraggedTypes()
 
         self.toolTip = item.displayName
@@ -84,6 +140,16 @@ final class LayoutBarItemView: NSView {
                 name: "Move Right"
             ) { [weak self] in
                 self?.moveOnePosition(left: false) ?? false
+            },
+            NSAccessibilityCustomAction(
+                name: "Move to Hidden"
+            ) { [weak self] in
+                self?.move(toSection: .hidden) ?? false
+            },
+            NSAccessibilityCustomAction(
+                name: "Move to Visible"
+            ) { [weak self] in
+                self?.move(toSection: .visible) ?? false
             },
         ])
 
@@ -120,34 +186,118 @@ final class LayoutBarItemView: NSView {
         setAccessibilityLabel(item.displayName)
         isEnabled = item.isMovable
         if cachedImage == nil {
-            setFrameSize(item.bounds.size)
+            setFrameSize(Self.fallbackSize(for: item))
         }
     }
 
+    private static func fallbackSize(for item: MenuBarItem) -> CGSize {
+        CGSize(
+            width: max(minimumItemWidth, item.bounds.width),
+            height: item.bounds.height
+        )
+    }
+
     private func moveOnePosition(left: Bool) -> Bool {
+        guard let appState else { return false }
+        appState.menuBarManager.macOS27Controller.beginLayoutEditing()
+
+        // Accessibility clients can deliver consecutive custom actions a few
+        // hundred milliseconds apart. Debounce the complete burst into one
+        // final displacement so crossing three icons performs one physical
+        // read/write/verify transaction instead of three adjacent moves.
+        pendingMoveOffset += left ? -1 : 1
+        guard !pendingMoveIsExecuting else { return true }
+        schedulePendingMove(using: appState)
+        return true
+    }
+
+    /// Moves this item across an Ice section boundary. Besides making the
+    /// Layout editor complete for VoiceOver users, this action exercises the
+    /// same manager transaction as a cross-section AppKit drop.
+    private func move(toSection section: MenuBarSection.Name) -> Bool {
         guard
+            isEnabled,
             let appState,
-            let address = appState.itemManager.itemCache.address(for: item.tag)
+            let address = appState.itemManager.itemCache.address(for: item.tag),
+            address.section != section
         else {
             return false
         }
 
-        let items = appState.itemManager.itemCache[address.section]
-        let targetIndex = left ? address.index - 1 : address.index + 1
-        guard items.indices.contains(targetIndex) else { return false }
-        let destination: MenuBarItemManager.MoveDestination = left
-            ? .leftOfItem(items[targetIndex])
-            : .rightOfItem(items[targetIndex])
-
-        Task { @MainActor [weak self, weak appState] in
-            guard let self, let appState else { return }
+        let wasLayoutEditing = appState.menuBarManager.macOS27Controller.isLayoutEditing
+        appState.menuBarManager.macOS27Controller.beginLayoutEditing()
+        let freshItem = appState.itemManager.itemCache[address.section][address.index]
+        Task { @MainActor [weak appState] in
+            guard let appState else { return }
             do {
-                try await appState.itemManager.move(item: item, to: destination)
+                if !wasLayoutEditing {
+                    // MenuBarAgent recreates concealed hosted scenes after the
+                    // Layout reveal assertion changes. Give those live AX
+                    // endpoints one frame to return before resolving the move.
+                    try? await Task.sleep(for: .milliseconds(160))
+                }
+                try await appState.itemManager.move(item: freshItem, toSection: section)
+                appState.itemManager.removeTemporarilyShownItemFromCache(with: freshItem.tag)
+            } catch {
+                Logger.default.error("Error moving menu bar item between sections: \(error, privacy: .public)")
+                NSAlert(error: error).runModal()
+            }
+        }
+        return true
+    }
+
+    private func schedulePendingMove(using appState: AppState) {
+        // A new action received during the quiet period restarts it. Do not
+        // cancel an in-flight physical move; actions received while it runs
+        // remain in pendingMoveOffset and are scheduled as the next burst.
+        pendingMoveTask?.cancel()
+
+        let itemTag = item.tag
+        pendingMoveTask = Task { @MainActor [weak self, weak appState] in
+            do {
+                // One short run-loop-sized quiet window still coalesces rapid
+                // accessibility actions, without making a single adjustment
+                // feel like it was ignored before physical work begins.
+                try await Task.sleep(for: .milliseconds(40))
+            } catch {
+                return
+            }
+
+            guard let self, let appState, !Task.isCancelled else { return }
+            pendingMoveIsExecuting = true
+            let requestedOffset = pendingMoveOffset
+            pendingMoveOffset = 0
+            defer {
+                pendingMoveIsExecuting = false
+                pendingMoveTask = nil
+                if pendingMoveOffset != 0 {
+                    schedulePendingMove(using: appState)
+                }
+            }
+
+            guard
+                requestedOffset != 0,
+                let address = appState.itemManager.itemCache.address(for: itemTag)
+            else {
+                return
+            }
+
+            let items = appState.itemManager.itemCache[address.section]
+            let targetIndex = (address.index + requestedOffset).clamped(
+                to: items.startIndex ... max(items.startIndex, items.endIndex - 1)
+            )
+            guard targetIndex != address.index else { return }
+
+            let freshItem = items[address.index]
+            let destination: MenuBarItemManager.MoveDestination = targetIndex < address.index
+                ? .leftOfItem(items[targetIndex])
+                : .rightOfItem(items[targetIndex])
+            do {
+                try await appState.itemManager.move(item: freshItem, to: destination)
             } catch {
                 Logger.default.error("Error moving menu bar item: \(error, privacy: .public)")
             }
         }
-        return true
     }
 
     /// Provides an alert to display when the item view is disabled.
@@ -167,8 +317,8 @@ final class LayoutBarItemView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         if !isDraggingPlaceholder {
-            cachedImage?.nsImage.draw(
-                in: bounds,
+            displayedImage?.draw(
+                in: displayedImageRect,
                 from: .zero,
                 operation: .sourceOver,
                 fraction: isEnabled ? 1.0 : 0.67
@@ -213,7 +363,7 @@ final class LayoutBarItemView: NSView {
         pasteboardItem.setData(Data(), forType: .layoutBarItem)
 
         let draggingItem = NSDraggingItem(pasteboardWriter: pasteboardItem)
-        draggingItem.setDraggingFrame(bounds, contents: cachedImage?.nsImage)
+        draggingItem.setDraggingFrame(displayedImageRect, contents: displayedImage)
 
         beginDraggingSession(with: [draggingItem], event: event, source: self)
     }
@@ -226,9 +376,25 @@ extension LayoutBarItemView: NSDraggingSource {
     }
 
     func draggingSession(_ session: NSDraggingSession, willBeginAt screenPoint: NSPoint) {
-        // make sure the container doesn't update its arranged views and that items
-        // aren't arranged during a dragging session
+        appState?.menuBarManager.macOS27Controller.beginLayoutEditing()
+        dragSessionGeneration &+= 1
+        didAcceptCurrentDrop = false
+        isDragSessionActive = true
+
+        // Capture the origin before the first drag update. A fast long drag can
+        // leave the padding view before AppKit sends `draggingUpdated`, and the
+        // old lazy capture then had no container/index with which to restore a
+        // cancelled drop. That made the tile disappear until Layout reopened.
         if let container = superview as? LayoutBarContainer {
+            if
+                oldContainerInfo == nil,
+                let index = container.arrangedViews.firstIndex(of: self)
+            {
+                oldContainerInfo = (container, index)
+            }
+
+            // Make sure the container doesn't update its arranged views while
+            // the drag's provisional order is being displayed.
             container.canSetArrangedViews = false
         }
 
@@ -242,10 +408,9 @@ extension LayoutBarItemView: NSDraggingSource {
     }
 
     func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
-        defer {
-            // always remove container info at the end of a session
-            oldContainerInfo = nil
-        }
+        let originalInfo = oldContainerInfo
+        let sessionGeneration = dragSessionGeneration
+        isDragSessionActive = false
 
         // since the session's `animatesToStartingPositionsOnCancelOrFail` property was
         // set to false when the session began (above), there is no delay between the user
@@ -254,13 +419,43 @@ extension LayoutBarItemView: NSDraggingSource {
         // need to be updated inside `performDragOperation(_:)` on `LayoutBarPaddingView`
         isDraggingPlaceholder = false
 
-        // if the drop occurs outside of a container, reinsert the view into its original
-        // container at its original index
-        if !hasContainer {
-            guard let (container, index) = oldContainerInfo else {
+        // Do not restore synchronously here. On macOS 27 AppKit may call this
+        // source method before the destination's `performDragOperation`, then
+        // send one final `draggingExited`. Rebuilding the old order now would
+        // overwrite the valid drop's immediate preview.
+        let isArrangedInSuperview = (superview as? LayoutBarContainer)?.arrangedViews.contains {
+            $0 === self
+        } == true
+        if isArrangedInSuperview {
+            hasContainer = true
+        }
+
+        // Fifty milliseconds is long enough for the destination callback to
+        // set `didAcceptCurrentDrop`, while keeping a genuinely cancelled tile
+        // from being absent for a visible interval. The generation guard keeps
+        // an unusually fast next drag from being modified by this cleanup.
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) { [weak self] in
+            guard
+                let self,
+                self.dragSessionGeneration == sessionGeneration
+            else {
                 return
             }
-            container.arrangedViews.insert(self, at: index)
+
+            if !self.didAcceptCurrentDrop, let originalInfo {
+                let originalContainer = originalInfo.container
+                var views = originalContainer.arrangedViews
+                views.removeAll { $0 === self || $0.item.tag == self.item.tag }
+                views.insert(self, at: min(originalInfo.index, views.endIndex))
+                originalContainer.arrangedViews = views
+                self.hasContainer = true
+            }
+
+            if !self.isAwaitingPhysicalMove {
+                originalInfo?.container.canSetArrangedViews = true
+            }
+            self.oldContainerInfo = nil
+            self.didAcceptCurrentDrop = false
         }
     }
 }

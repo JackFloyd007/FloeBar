@@ -4,6 +4,7 @@
 //
 
 import CoreGraphics
+import CoreVideo
 @preconcurrency import ScreenCaptureKit
 
 /// A namespace for screen capture operations.
@@ -113,9 +114,83 @@ enum ScreenCapture {
         let scale: CGFloat
     }
 
-    /// Captures the full-width MenuBarAgent window that composites status
-    /// items on macOS 27. Falls back to the top strip of the display if the
-    /// private hosting window is not exposed by ScreenCaptureKit.
+    /// Returns whether ScreenCaptureKit reported the macOS 27 hosting strip in
+    /// point space or in backing-pixel space. Some early macOS 27 builds use
+    /// the latter, and multiplying that frame by `pointPixelScale` a second
+    /// time produces shifted or half-height menu-bar crops.
+    @available(macOS 27.0, *)
+    private static func hostingFrameAppearsPixelBacked(
+        _ frame: CGRect,
+        displayFrame: CGRect
+    ) -> Bool {
+        guard displayFrame.width > 0 else { return false }
+        return frame.height > 40 || frame.width > displayFrame.width * 1.5
+    }
+
+    /// Normalizes a captured bitmap to a point-space frame and the actual
+    /// bitmap-to-point scale. Deriving the scale from the returned image keeps
+    /// AX crop geometry aligned when ScreenCaptureKit's reported scale drifts.
+    @available(macOS 27.0, *)
+    private static func normalizedMenuBarCapture(
+        image: CGImage,
+        windowFrame: CGRect,
+        displayFrame: CGRect,
+        reportedScale: CGFloat
+    ) -> MenuBarHostingCapture? {
+        guard
+            image.width > 0,
+            image.height > 0,
+            displayFrame.width > 0,
+            displayFrame.height > 0
+        else {
+            return nil
+        }
+
+        if hostingFrameAppearsPixelBacked(windowFrame, displayFrame: displayFrame) {
+            let scale = CGFloat(image.width) / displayFrame.width
+            guard scale > 0.5, scale < 6 else { return nil }
+            return MenuBarHostingCapture(
+                image: image,
+                windowFrame: CGRect(
+                    x: displayFrame.minX,
+                    y: displayFrame.minY,
+                    width: displayFrame.width,
+                    height: CGFloat(image.height) / scale
+                ),
+                scale: scale
+            )
+        }
+
+        guard windowFrame.width > 0, windowFrame.height > 0 else { return nil }
+        let scale = CGFloat(image.width) / windowFrame.width
+        guard scale > 0.5, scale < 6 else { return nil }
+
+        if abs(CGFloat(image.height) - windowFrame.height * scale) > 3 {
+            let displayScale = CGFloat(image.width) / displayFrame.width
+            guard displayScale > 0.5, displayScale < 6 else { return nil }
+            return MenuBarHostingCapture(
+                image: image,
+                windowFrame: CGRect(
+                    x: displayFrame.minX,
+                    y: displayFrame.minY,
+                    width: displayFrame.width,
+                    height: CGFloat(image.height) / displayScale
+                ),
+                scale: displayScale
+            )
+        }
+
+        _ = reportedScale
+        return MenuBarHostingCapture(
+            image: image,
+            windowFrame: windowFrame,
+            scale: scale
+        )
+    }
+
+    /// Captures the full-width MenuBarAgent window that composites Apple
+    /// status items on macOS 27. Returns `nil` rather than mixing in unrelated
+    /// display-strip pixels when the private hosting window is unavailable.
     @available(macOS 27.0, *)
     static func captureMenuBarHostingWindow(
         displayID: CGDirectDisplayID
@@ -141,50 +216,58 @@ enum ScreenCapture {
         let displayFrame = display.frame
         let hostingWindow = content.windows
             .filter { window in
-                window.owningApplication?.bundleIdentifier == "com.apple.MenuBarAgent" &&
+                let pointSpaceGeometry =
+                    window.frame.height <= 40 &&
+                    window.frame.width > displayFrame.width * 0.8
+                let pixelSpaceGeometry =
+                    window.frame.height > 40 &&
+                    window.frame.height <= 80 &&
+                    window.frame.width > displayFrame.width * 1.5
+                return window.owningApplication?.bundleIdentifier == "com.apple.MenuBarAgent" &&
                 window.frame.height > 0 &&
-                window.frame.height <= 40 &&
-                window.frame.width > displayFrame.width * 0.8 &&
+                (pointSpaceGeometry || pixelSpaceGeometry) &&
                 abs(window.frame.minX - displayFrame.minX) < 2 &&
                 abs(window.frame.minY - displayFrame.minY) < 2
             }
             .max { $0.windowID < $1.windowID }
 
-        let filter: SCContentFilter
-        let captureFrame: CGRect
+        // A full-display fallback includes unrelated app-menu pixels and can
+        // silently associate them with status items. A clean miss is safer;
+        // callers retain the last exact image or use a semantic fallback.
+        guard let hostingWindow else { return nil }
+
+        let filter = SCContentFilter(desktopIndependentWindow: hostingWindow)
+        let captureFrame = hostingWindow.frame
+        let reportedScale = CGFloat(filter.pointPixelScale)
+        let pixelBacked = hostingFrameAppearsPixelBacked(
+            captureFrame,
+            displayFrame: displayFrame
+        )
         let configuration = SCStreamConfiguration()
         configuration.showsCursor = false
-
-        if let hostingWindow {
-            filter = SCContentFilter(desktopIndependentWindow: hostingWindow)
-            captureFrame = hostingWindow.frame
-            configuration.ignoreShadowsSingleWindow = true
-        } else {
-            filter = SCContentFilter(display: display, excludingWindows: [])
-            captureFrame = CGRect(
-                x: displayFrame.minX,
-                y: displayFrame.minY,
-                width: displayFrame.width,
-                height: min(40, displayFrame.height)
-            )
-            configuration.sourceRect = CGRect(
-                x: 0,
-                y: 0,
-                width: captureFrame.width,
-                height: captureFrame.height
-            )
-        }
-
-        let scale = CGFloat(filter.pointPixelScale)
-        configuration.width = Int((captureFrame.width * scale).rounded())
-        configuration.height = Int((captureFrame.height * scale).rounded())
+        configuration.ignoreShadowsSingleWindow = true
+        configuration.pixelFormat = kCVPixelFormatType_32BGRA
+        configuration.captureDynamicRange = .SDR
+        configuration.width = max(
+            1,
+            Int((captureFrame.width * (pixelBacked ? 1 : max(reportedScale, 0.5))).rounded())
+        )
+        configuration.height = max(
+            1,
+            Int((captureFrame.height * (pixelBacked ? 1 : max(reportedScale, 0.5))).rounded())
+        )
 
         do {
             let image = try await SCScreenshotManager.captureImage(
                 contentFilter: filter,
                 configuration: configuration
             )
-            return MenuBarHostingCapture(image: image, windowFrame: captureFrame, scale: scale)
+            return normalizedMenuBarCapture(
+                image: image,
+                windowFrame: captureFrame,
+                displayFrame: displayFrame,
+                reportedScale: reportedScale
+            )
         } catch {
             return nil
         }
@@ -224,10 +307,21 @@ enum ScreenCapture {
             width: displayFrame.width,
             height: min(40, displayFrame.height)
         )
-        let filter = SCContentFilter(display: display, excludingWindows: [])
-        let scale = max(CGFloat(filter.pointPixelScale), 0.5)
+        // Exclude overlays above the main-menu window level. They are painted
+        // over the real status items and would otherwise contaminate a crop.
+        let mainMenuLevel = Int(CGWindowLevelForKey(.mainMenuWindow))
+        let overlayWindows = content.windows.filter { window in
+            window.isOnScreen &&
+                window.windowLayer > mainMenuLevel &&
+                window.frame.intersects(stripFrame)
+        }
+        let filter = SCContentFilter(display: display, excludingWindows: overlayWindows)
+        let reportedScale = CGFloat(filter.pointPixelScale)
+        let scale = max(reportedScale, 0.5)
         let configuration = SCStreamConfiguration()
         configuration.showsCursor = false
+        configuration.pixelFormat = kCVPixelFormatType_32BGRA
+        configuration.captureDynamicRange = .SDR
         configuration.width = max(1, Int((stripFrame.width * scale).rounded()))
         configuration.height = max(1, Int((stripFrame.height * scale).rounded()))
         configuration.sourceRect = CGRect(
@@ -242,10 +336,11 @@ enum ScreenCapture {
                 contentFilter: filter,
                 configuration: configuration
             )
-            return MenuBarHostingCapture(
+            return normalizedMenuBarCapture(
                 image: image,
                 windowFrame: stripFrame,
-                scale: scale
+                displayFrame: displayFrame,
+                reportedScale: reportedScale
             )
         } catch {
             return nil

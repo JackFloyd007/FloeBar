@@ -18,9 +18,10 @@ import OSLog
 enum MacOS27MenuBarItemProvider {
     private static let logger = Logger(category: "MacOS27MenuBarItemProvider")
     private static let maxItemHeight: CGFloat = 40
-    /// AXSwift's Core Foundation value conversion is not safe when multiple
-    /// complete `AXExtrasMenuBar` walks overlap on macOS 27. Keep each walk
-    /// atomic; callers already run this work away from the main actor.
+    /// Keep complete `AXExtrasMenuBar` walks from interleaving. Each owner's
+    /// actual AX reads are also batched on the main thread below because
+    /// HIServices' serializer is not safe when Ice answers an incoming AX
+    /// hierarchy request at the same time as a background outgoing read.
     private static let operationLock = NSLock()
 
     static func menuBarItems(
@@ -38,79 +39,144 @@ enum MacOS27MenuBarItemProvider {
         let displayBounds = display.map(CGDisplayBounds)
         return menuBarItems(
             from: NSWorkspace.shared.runningApplications,
-            displayBounds: displayBounds
+            displayBounds: displayBounds,
+            includeSupplementaryMetadata: true
         )
     }
 
     /// Reads only the owners involved in a reorder. A complete AX walk can
     /// spend the per-process timeout on every running app; two targeted owners
     /// are enough to refresh drag bounds and verify adjacency.
-    static func menuBarItems(sourcePIDs: Set<pid_t>) -> [MenuBarItem] {
+    static func menuBarItems(
+        sourcePIDs: Set<pid_t>,
+        namespaces: Set<MenuBarItemTag.Namespace> = []
+    ) -> [MenuBarItem] {
         operationLock.lock()
         defer { operationLock.unlock() }
 
-        guard AXHelpers.isProcessTrusted(), !sourcePIDs.isEmpty else { return [] }
-        let applications = sourcePIDs.compactMap(NSRunningApplication.init(processIdentifier:))
-        return menuBarItems(from: applications, displayBounds: nil)
+        guard
+            AXHelpers.isProcessTrusted(),
+            !sourcePIDs.isEmpty || !namespaces.isEmpty
+        else {
+            return []
+        }
+
+        // MenuBarAgent can terminate and relaunch hosted owners (notably
+        // TextInputMenuAgent) during a native drag. Resolve each stable
+        // namespace again as well as using the fast PID path, otherwise the
+        // first post-drop snapshot can omit an item that is already visible
+        // under its replacement process.
+        var applicationsByPID = [pid_t: NSRunningApplication]()
+        for sourcePID in sourcePIDs {
+            guard let application = NSRunningApplication(processIdentifier: sourcePID) else {
+                continue
+            }
+            applicationsByPID[sourcePID] = application
+        }
+        if !namespaces.isEmpty {
+            for application in NSWorkspace.shared.runningApplications
+            where namespaces.contains(namespace(for: application)) {
+                applicationsByPID[application.processIdentifier] = application
+            }
+        }
+
+        return menuBarItems(
+            from: Array(applicationsByPID.values),
+            displayBounds: nil,
+            includeSupplementaryMetadata: false
+        )
     }
 
     private static func menuBarItems(
         from runningApplications: [NSRunningApplication],
-        displayBounds: CGRect?
+        displayBounds: CGRect?,
+        includeSupplementaryMetadata: Bool
     ) -> [MenuBarItem] {
         var rawItems = [RawItem]()
 
         for runningApp in runningApplications {
+            rawItems.append(contentsOf: AXHelpers.performOnMain {
+                Self.rawItems(
+                    from: runningApp,
+                    displayBounds: displayBounds,
+                    includeSupplementaryMetadata: includeSupplementaryMetadata
+                )
+            })
+        }
+
+        return assemble(rawItems)
+    }
+
+    private static func rawItems(
+        from runningApp: NSRunningApplication,
+        displayBounds: CGRect?,
+        includeSupplementaryMetadata: Bool
+    ) -> [RawItem] {
+        guard
+            let application = AXHelpers.application(for: runningApp),
+            let extrasMenuBar = AXHelpers.extrasMenuBar(for: application)
+        else {
+            return []
+        }
+
+        let namespace = namespace(for: runningApp)
+        var fallbackIndex = 0
+        var result = [RawItem]()
+        for (childIndex, child) in AXHelpers.children(for: extrasMenuBar).enumerated() {
             guard
-                let application = AXHelpers.application(for: runningApp),
-                let extrasMenuBar = AXHelpers.extrasMenuBar(for: application)
+                let frame = AXHelpers.frame(for: child),
+                frame.height > 0,
+                frame.height <= maxItemHeight
             else {
                 continue
             }
 
-            let namespace = namespace(for: runningApp)
-            var fallbackIndex = 0
-
-            for child in AXHelpers.children(for: extrasMenuBar) {
-                guard
-                    let frame = AXHelpers.frame(for: child),
-                    frame.height > 0,
-                    frame.height <= maxItemHeight
-                else {
-                    continue
-                }
-
-                if let displayBounds, !displayBounds.contains(CGPoint(x: frame.midX, y: frame.midY)) {
-                    continue
-                }
-
-                let descendants = AXHelpers.children(for: child)
-                let identifier = nonEmpty(AXHelpers.identifier(for: child))
-                    ?? descendants.compactMap { nonEmpty(AXHelpers.identifier(for: $0)) }.first
-                let accessibilityDescription = nonEmpty(AXHelpers.description(for: child))
-                    ?? descendants.compactMap { nonEmpty(AXHelpers.description(for: $0)) }.first
-                let accessibilityTitle = nonEmpty(AXHelpers.title(for: child))
-                let fallbackTitle = "Item-\(fallbackIndex)"
-                let displayTitle = accessibilityTitle ?? accessibilityDescription ?? identifier ?? fallbackTitle
-                if accessibilityTitle == nil, accessibilityDescription == nil, identifier == nil {
-                    fallbackIndex += 1
-                }
-
-                let identityTitle = identifier ?? accessibilityDescription ?? displayTitle
-                let ownerPID = AXHelpers.pid(for: child) ?? runningApp.processIdentifier
-                rawItems.append(
-                    RawItem(
-                        namespace: namespace,
-                        identityTitle: identityTitle,
-                        displayTitle: displayTitle,
-                        bounds: frame,
-                        ownerPID: ownerPID
-                    )
-                )
+            if let displayBounds, !displayBounds.contains(CGPoint(x: frame.midX, y: frame.midY)) {
+                continue
             }
-        }
 
-        return assemble(rawItems)
+            lazy var descendants = AXHelpers.children(for: child)
+            let identifier = nonEmpty(AXHelpers.identifier(for: child))
+                ?? descendants.compactMap { nonEmpty(AXHelpers.identifier(for: $0)) }.first
+            let accessibilityDescription = nonEmpty(AXHelpers.description(for: child))
+                ?? descendants.compactMap { nonEmpty(AXHelpers.description(for: $0)) }.first
+            let accessibilityHelp = includeSupplementaryMetadata
+                ? nonEmpty(AXHelpers.help(for: child))
+                    ?? descendants.compactMap { nonEmpty(AXHelpers.help(for: $0)) }.first
+                : nil
+            let accessibilityValue = includeSupplementaryMetadata
+                ? nonEmpty(AXHelpers.value(for: child))
+                    ?? descendants.compactMap { nonEmpty(AXHelpers.value(for: $0)) }.first
+                : nil
+            let accessibilityTitle = nonEmpty(AXHelpers.title(for: child))
+            let fallbackTitle = "Item-\(fallbackIndex)"
+            let displayTitle = accessibilityTitle ?? accessibilityDescription ?? identifier ?? fallbackTitle
+            if accessibilityTitle == nil, accessibilityDescription == nil, identifier == nil {
+                fallbackIndex += 1
+            }
+
+            // TextInputMenuAgent exposes the currently selected input source
+            // (for example "ABC" or "简体拼音") as its AX description. That
+            // label is presentation, not identity.
+            let identityTitle = if namespace == .textInputMenuAgent {
+                "Item-\(childIndex)"
+            } else {
+                identifier ?? accessibilityDescription ?? displayTitle
+            }
+            let ownerPID = AXHelpers.pid(for: child) ?? runningApp.processIdentifier
+            result.append(
+                RawItem(
+                    namespace: namespace,
+                    identityTitle: identityTitle,
+                    displayTitle: displayTitle,
+                    bounds: frame,
+                    ownerPID: ownerPID,
+                    accessibilityHelp: accessibilityHelp,
+                    accessibilityValue: accessibilityValue
+                )
+            )
+        }
+        return result
     }
 
     /// Performs the semantic accessibility press action for an item.
@@ -119,42 +185,50 @@ enum MacOS27MenuBarItemProvider {
         operationLock.lock()
         defer { operationLock.unlock() }
 
-        guard AXHelpers.isProcessTrusted() else { return false }
+        return AXHelpers.performOnMain {
+            guard AXHelpers.isProcessTrusted() else { return false }
 
-        for runningApp in NSWorkspace.shared.runningApplications
-        where namespace(for: runningApp) == item.tag.namespace {
-            guard
-                let application = AXHelpers.application(for: runningApp),
-                let extrasMenuBar = AXHelpers.extrasMenuBar(for: application)
-            else {
-                continue
-            }
-
-            let candidates = AXHelpers.children(for: extrasMenuBar).compactMap { child -> (UIElement, String, CGRect)? in
-                guard let frame = AXHelpers.frame(for: child), frame.height > 0, frame.height <= maxItemHeight else {
-                    return nil
+            for runningApp in NSWorkspace.shared.runningApplications
+            where namespace(for: runningApp) == item.tag.namespace {
+                guard
+                    let application = AXHelpers.application(for: runningApp),
+                    let extrasMenuBar = AXHelpers.extrasMenuBar(for: application)
+                else {
+                    continue
                 }
-                let descendants = AXHelpers.children(for: child)
-                let identifier = nonEmpty(AXHelpers.identifier(for: child))
-                    ?? descendants.compactMap { nonEmpty(AXHelpers.identifier(for: $0)) }.first
-                let accessibilityDescription = nonEmpty(AXHelpers.description(for: child))
-                    ?? descendants.compactMap { nonEmpty(AXHelpers.description(for: $0)) }.first
-                let title = identifier
-                    ?? accessibilityDescription
-                    ?? nonEmpty(AXHelpers.title(for: child))
-                    ?? "Item-0"
-                return (child, title, frame)
-            }.sorted { $0.2.minX < $1.2.minX }
 
-            var instanceIndex = 0
-            for candidate in candidates where candidate.1 == item.tag.title {
-                if instanceIndex == item.tag.instanceIndex {
-                    return AXHelpers.press(candidate.0)
+                let namespace = namespace(for: runningApp)
+                let candidates = AXHelpers.children(for: extrasMenuBar).enumerated().compactMap {
+                    childIndex, child -> (UIElement, String, CGRect)? in
+                    guard let frame = AXHelpers.frame(for: child), frame.height > 0, frame.height <= maxItemHeight else {
+                        return nil
+                    }
+                    let descendants = AXHelpers.children(for: child)
+                    let identifier = nonEmpty(AXHelpers.identifier(for: child))
+                        ?? descendants.compactMap { nonEmpty(AXHelpers.identifier(for: $0)) }.first
+                    let accessibilityDescription = nonEmpty(AXHelpers.description(for: child))
+                        ?? descendants.compactMap { nonEmpty(AXHelpers.description(for: $0)) }.first
+                    let title = if namespace == .textInputMenuAgent {
+                        "Item-\(childIndex)"
+                    } else {
+                        identifier
+                            ?? accessibilityDescription
+                            ?? nonEmpty(AXHelpers.title(for: child))
+                            ?? "Item-0"
+                    }
+                    return (child, title, frame)
+                }.sorted { $0.2.minX < $1.2.minX }
+
+                var instanceIndex = 0
+                for candidate in candidates where candidate.1 == item.tag.title {
+                    if instanceIndex == item.tag.instanceIndex {
+                        return AXHelpers.press(candidate.0)
+                    }
+                    instanceIndex += 1
                 }
-                instanceIndex += 1
             }
+            return false
         }
-        return false
     }
 
     private struct RawItem {
@@ -163,6 +237,8 @@ enum MacOS27MenuBarItemProvider {
         let displayTitle: String
         let bounds: CGRect
         let ownerPID: pid_t
+        let accessibilityHelp: String?
+        let accessibilityValue: String?
     }
 
     private static func assemble(_ rawItems: [RawItem]) -> [MenuBarItem] {
@@ -208,6 +284,8 @@ enum MacOS27MenuBarItemProvider {
                 sourcePID: rawItem.ownerPID,
                 bounds: rawItem.bounds,
                 title: rawItem.displayTitle,
+                accessibilityHelp: rawItem.accessibilityHelp,
+                accessibilityValue: rawItem.accessibilityValue,
                 isOnScreen: true
             )
         }

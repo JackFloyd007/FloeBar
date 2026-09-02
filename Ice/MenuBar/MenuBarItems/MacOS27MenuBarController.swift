@@ -18,6 +18,12 @@ final class MacOS27MenuBarController {
         var order = [MenuBarSection.Name: [String]]()
     }
 
+    struct MoveTransaction {
+        fileprivate let encodedLayout: Data
+        fileprivate let sectionsWithPendingMove: Set<MenuBarSection.Name>
+        fileprivate let pendingPhysicalOrders: [MenuBarSection.Name: [String]]
+    }
+
     // v3 discards layouts that included Ice's own visible control item. The Ice
     // button is the permanent toggle and must never be assigned to a section.
     private static let defaultsKey = "MacOS27MenuBarController.layout.v3"
@@ -45,11 +51,17 @@ final class MacOS27MenuBarController {
     private var lastManagedItems = [MenuBarItem]()
     private var revealedSection: MenuBarSection.Name?
     private var sectionsWithPendingMove = Set<MenuBarSection.Name>()
+    /// The exact item identities whose live left-to-right order must converge
+    /// before Layout stops displaying a verified move's projected order.
+    private var pendingPhysicalOrders = [MenuBarSection.Name: [String]]()
     private var assertionHandle: UnsafeMutableRawPointer?
+    private var retiringAssertionHandles = [UnsafeMutableRawPointer]()
     private var appliedAllowedBundleIdentifiers = Set<String>()
     private var appliedAllowedSystemItemIdentifiers = Set(0 ... 8)
     private var activationGeneration = 0
     private var hasInitializedSectionBoundary = false
+    private var isLayoutEditorPresented = false
+    private var isReorderInProgress = false
     private let baselineAllowedBundleIdentifiers: Set<String>
 
     /// Keeps every managed item exposed while the Layout editor is open. This
@@ -75,6 +87,9 @@ final class MacOS27MenuBarController {
             MacOS27MenuBarAgentPositionStore.revealAll()
         }
         IceAssessmentModeHidingInvalidate(assertionHandle)
+        for handle in retiringAssertionHandles {
+            IceAssessmentModeHidingInvalidate(handle)
+        }
     }
 
     var isHidingAvailable: Bool {
@@ -99,6 +114,7 @@ final class MacOS27MenuBarController {
         displayID: CGDirectDisplayID?
     ) -> MenuBarItemManager.ItemCache {
         precondition(Thread.isMainThread)
+        migrateTextInputIdentityIfNeeded(in: liveItems)
         seedUnassignedItems(liveItems, using: sourceItems)
         lastLiveItems = liveItems
         lastSourceItems = sourceItems
@@ -133,16 +149,28 @@ final class MacOS27MenuBarController {
 
         // Concealed items disappear from AX enumeration. Retain their last live
         // snapshot while the owning application is still running so the layout
-        // editor remains stable and can move them back to Visible.
+        // editor remains stable and can move them back to Visible. The same
+        // owner check is important for visible items: a disabled system extra
+        // such as Spotlight exits its publishing process, and retaining that
+        // stale tile gives a subsequent drop a target that no longer exists.
+        // While the owner is alive, retain the tile for the entire Layout
+        // session because MenuBarAgent can omit a hosted child during reflow.
         for (identifier, item) in snapshots where itemsByIdentifier[identifier] == nil {
-            guard
-                let section = layout.assignments[identifier],
-                section != .visible,
-                let bundleIdentifier = knownBundleIdentifiers[identifier],
+            guard let section = layout.assignments[identifier] else { continue }
+
+            let ownerIsAvailable = if let bundleIdentifier = knownBundleIdentifiers[identifier] {
                 runningBundleIdentifiers.contains(bundleIdentifier)
-            else {
+            } else {
+                knownSystemItemIdentifiers[identifier] != nil
+            }
+
+            if section == .visible {
+                guard isLayoutEditing, ownerIsAvailable else { continue }
+                itemsByIdentifier[identifier] = item
                 continue
             }
+
+            guard ownerIsAvailable else { continue }
             itemsByIdentifier[identifier] = item
         }
         lastManagedItems = Array(itemsByIdentifier.values)
@@ -201,7 +229,18 @@ final class MacOS27MenuBarController {
                 }
             }
             cache[section] = sectionItems
-            layout.order[section] = sectionItems.map { $0.tag.persistentIdentifier }
+
+            // Preserve absent identifiers in their saved slots. A running app
+            // can temporarily withdraw or republish a status item, and one
+            // incomplete AX snapshot must not erase the user's order. Explicit
+            // moves already remove an identifier from every old section before
+            // inserting it into the destination, so this cannot undo a drag.
+            var updatedOrder = sectionItems.map { $0.tag.persistentIdentifier }
+            for (savedIndex, identifier) in savedOrder.enumerated()
+            where layout.assignments[identifier] == section && !updatedOrder.contains(identifier) {
+                updatedOrder.insert(identifier, at: min(savedIndex, updatedOrder.endIndex))
+            }
+            layout.order[section] = updatedOrder
         }
 
         persist()
@@ -213,10 +252,45 @@ final class MacOS27MenuBarController {
         return cache
     }
 
+    /// Captures the persistent and pending-order state touched by a projected
+    /// Layout move. The manager uses this only while WindowServer updates are
+    /// suspended, so a failed physical reorder can restore the exact prior
+    /// section and slot without publishing an intermediate layout.
+    func makeMoveTransaction() -> MoveTransaction? {
+        guard let encodedLayout = try? JSONEncoder().encode(layout) else {
+            return nil
+        }
+        return MoveTransaction(
+            encodedLayout: encodedLayout,
+            sectionsWithPendingMove: sectionsWithPendingMove,
+            pendingPhysicalOrders: pendingPhysicalOrders
+        )
+    }
+
+    func rollback(_ transaction: MoveTransaction) {
+        guard
+            let restoredLayout = try? JSONDecoder().decode(
+                StoredLayout.self,
+                from: transaction.encodedLayout
+            )
+        else {
+            logger.error("Could not restore the macOS 27 Layout move transaction")
+            return
+        }
+
+        layout = restoredLayout
+        sectionsWithPendingMove = transaction.sectionsWithPendingMove
+        pendingPhysicalOrders = transaction.pendingPhysicalOrders
+        persist()
+        updateSectionBoundary()
+        applyVisibility(liveItems: lastLiveItems)
+    }
+
     func move(
         item: MenuBarItem,
         to destination: MenuBarItemManager.MoveDestination,
-        currentCache: MenuBarItemManager.ItemCache
+        currentCache: MenuBarItemManager.ItemCache,
+        requiredSection: MenuBarSection.Name? = nil
     ) -> MenuBarSection.Name {
         guard #available(macOS 27.0, *) else { return .visible }
 
@@ -226,7 +300,14 @@ final class MacOS27MenuBarController {
         let targetSection: MenuBarSection.Name
         let previousSection = layout.assignments[identifier, default: .visible]
 
-        if target.tag == .hiddenControlItem {
+        if let requiredSection {
+            // A Layout drop already carries the destination container.  Do
+            // not infer it again from the target item: an empty Hidden section
+            // is represented physically by the visible Ice control item, so
+            // geometry alone would incorrectly persist the moved item as
+            // Visible after a successful cross-boundary drag.
+            targetSection = requiredSection
+        } else if target.tag == .hiddenControlItem {
             targetSection = switch destination {
             case .leftOfItem: .hidden
             case .rightOfItem: .visible
@@ -267,6 +348,20 @@ final class MacOS27MenuBarController {
 
         snapshots[identifier] = item
         sectionsWithPendingMove.formUnion([previousSection, targetSection])
+        for section in Set([previousSection, targetSection]) {
+            var relevantIdentifiers = Set(
+                currentCache[section].map { $0.tag.persistentIdentifier }
+            )
+            if section == previousSection {
+                relevantIdentifiers.remove(identifier)
+            }
+            if section == targetSection {
+                relevantIdentifiers.insert(identifier)
+            }
+            pendingPhysicalOrders[section] = layout.order[section, default: []].filter(
+                relevantIdentifiers.contains
+            )
+        }
         persist()
         if previousSection != targetSection {
             updateSectionBoundary()
@@ -275,7 +370,11 @@ final class MacOS27MenuBarController {
         return targetSection
     }
 
-    func move(item: MenuBarItem, to section: MenuBarSection.Name) {
+    func move(
+        item: MenuBarItem,
+        to section: MenuBarSection.Name,
+        currentCache: MenuBarItemManager.ItemCache
+    ) {
         guard #available(macOS 27.0, *) else { return }
 
         let identifier = item.tag.persistentIdentifier
@@ -284,9 +383,33 @@ final class MacOS27MenuBarController {
             layout.order[existingSection, default: []].removeAll { $0 == identifier }
         }
         layout.assignments[identifier] = section
-        layout.order[section, default: []].append(identifier)
+        if section == .visible {
+            // A section-only move targets the first slot immediately to the
+            // right of Ice. Persist that same slot so the projected Layout
+            // order agrees with the native position and can converge without
+            // a multi-second refresh loop.
+            layout.order[section, default: []].insert(identifier, at: 0)
+        } else {
+            // Hidden section-only moves target the last slot immediately to
+            // the left of Ice.
+            layout.order[section, default: []].append(identifier)
+        }
         snapshots[identifier] = item
         sectionsWithPendingMove.formUnion([previousSection, section])
+        for pendingSection in Set([previousSection, section]) {
+            var relevantIdentifiers = Set(
+                currentCache[pendingSection].map { $0.tag.persistentIdentifier }
+            )
+            if pendingSection == previousSection {
+                relevantIdentifiers.remove(identifier)
+            }
+            if pendingSection == section {
+                relevantIdentifiers.insert(identifier)
+            }
+            pendingPhysicalOrders[pendingSection] = layout.order[pendingSection, default: []].filter(
+                relevantIdentifiers.contains
+            )
+        }
         persist()
         if previousSection != section {
             updateSectionBoundary()
@@ -296,6 +419,25 @@ final class MacOS27MenuBarController {
 
     func completePendingMove() {
         sectionsWithPendingMove.removeAll()
+        pendingPhysicalOrders.removeAll()
+    }
+
+    /// Returns true only after one complete live AX snapshot contains every
+    /// item involved in the move and their physical order matches the saved
+    /// target. Until then Layout keeps the verified projected order, avoiding
+    /// an old/new/old visual oscillation while MenuBarAgent republishes scenes.
+    func pendingMoveHasConverged() -> Bool {
+        guard !pendingPhysicalOrders.isEmpty else { return true }
+
+        for expectedOrder in pendingPhysicalOrders.values {
+            let expectedIdentifiers = Set(expectedOrder)
+            let liveOrder = lastLiveItems
+                .filter { expectedIdentifiers.contains($0.tag.persistentIdentifier) }
+                .sorted(by: Self.isOrderedLeftToRight)
+                .map { $0.tag.persistentIdentifier }
+            guard liveOrder == expectedOrder else { return false }
+        }
+        return true
     }
 
     func temporarilyRevealAll() {
@@ -306,13 +448,38 @@ final class MacOS27MenuBarController {
 
     func beginLayoutEditing() {
         guard #available(macOS 27.0, *) else { return }
+        isLayoutEditorPresented = true
         isLayoutEditing = true
         temporarilyRevealAll()
     }
 
     func endLayoutEditing() {
         guard #available(macOS 27.0, *) else { return }
+        isLayoutEditorPresented = false
+        guard !isReorderInProgress else { return }
         isLayoutEditing = false
+        completePendingMove()
+    }
+
+    /// Keeps every physical endpoint published if the user closes Layout while
+    /// its final desired order is still being reconciled.
+    func beginReordering() {
+        guard #available(macOS 27.0, *) else { return }
+        isReorderInProgress = true
+        isLayoutEditing = true
+        temporarilyRevealAll()
+    }
+
+    /// Releases the reorder hold. Returns true when Layout itself is no longer
+    /// open and the caller should restore the normal visible/hidden state.
+    @discardableResult
+    func endReordering() -> Bool {
+        guard #available(macOS 27.0, *) else { return false }
+        isReorderInProgress = false
+        guard !isLayoutEditorPresented else { return false }
+        isLayoutEditing = false
+        completePendingMove()
+        return true
     }
 
     /// Returns the latest live AX snapshot without starting another complete
@@ -338,10 +505,11 @@ final class MacOS27MenuBarController {
 
     private func updateSectionBoundary() {
         guard #available(macOS 27.0, *) else { return }
+        let knownItems = knownItemsForReordering()
         let didWritePositions = MacOS27MenuBarAgentPositionStore.applySectionBoundary(
             assignments: layout.assignments,
             order: layout.order,
-            items: knownItemsForReordering()
+            items: knownItems
         )
         guard didWritePositions else { return }
         logger.notice("Updated macOS 27 visible/hidden section boundary")
@@ -415,14 +583,20 @@ final class MacOS27MenuBarController {
         let previousAssertionHandle = assertionHandle
         let replacementHandle = IceAssessmentModeHidingActivate(
             allowedBundleIdentifiers.sorted(),
-            allowedSystemIdentifiers.sorted().map(NSNumber.init(value:))
-        ) { [weak self] in
-            Task { @MainActor in
-                guard let self, generation == self.activationGeneration else { return }
-                self.logger.error("macOS 27 visibility restriction activation failed")
-                self.invalidateAssertion()
+            allowedSystemIdentifiers.sorted().map(NSNumber.init(value:)),
+            { [weak self] in
+                Task { @MainActor in
+                    self?.completeVisibilityActivation(generation: generation)
+                }
+            },
+            { [weak self] in
+                Task { @MainActor in
+                    guard let self, generation == self.activationGeneration else { return }
+                    self.logger.error("macOS 27 visibility restriction activation failed")
+                    self.invalidateAssertion()
+                }
             }
-        }
+        )
         guard let replacementHandle else {
             logger.error("macOS 27 visibility restriction is unavailable")
             return
@@ -437,10 +611,20 @@ final class MacOS27MenuBarController {
         appliedAllowedSystemItemIdentifiers = allowedSystemIdentifiers
 
         if let previousAssertionHandle {
-            // The replacement handle is active when activation returns. Keeping
-            // the old restriction alive for another 250 ms intersects the two
-            // allowlists, which hides the new section and then makes it pop in.
-            IceAssessmentModeHidingInvalidate(previousAssertionHandle)
+            // Activation completes asynchronously. Keep the old restriction
+            // alive until MenuBarClientCore confirms its replacement, so a
+            // rapid section change cannot leave an unprotected gap while the
+            // controller already believes the new allowlist is applied.
+            retiringAssertionHandles.append(previousAssertionHandle)
+        }
+    }
+
+    private func completeVisibilityActivation(generation: Int) {
+        guard generation == activationGeneration else { return }
+        let handles = retiringAssertionHandles
+        retiringAssertionHandles.removeAll()
+        for handle in handles {
+            IceAssessmentModeHidingInvalidate(handle)
         }
     }
 
@@ -448,7 +632,11 @@ final class MacOS27MenuBarController {
         if let assertionHandle {
             IceAssessmentModeHidingInvalidate(assertionHandle)
         }
+        for handle in retiringAssertionHandles {
+            IceAssessmentModeHidingInvalidate(handle)
+        }
         assertionHandle = nil
+        retiringAssertionHandles.removeAll()
         appliedAllowedBundleIdentifiers.removeAll()
         appliedAllowedSystemItemIdentifiers = Self.allSystemItemIdentifiers
     }
@@ -456,6 +644,47 @@ final class MacOS27MenuBarController {
     private func persist() {
         guard let data = try? JSONEncoder().encode(layout) else { return }
         UserDefaults.standard.set(data, forKey: Self.defaultsKey)
+    }
+
+    /// Collapses legacy input-source labels into TextInputMenuAgent's stable
+    /// Item-N identity without changing the user's section or position.
+    private func migrateTextInputIdentityIfNeeded(in items: [MenuBarItem]) {
+        for item in items where item.tag.namespace == .textInputMenuAgent {
+            let canonicalIdentifier = item.tag.persistentIdentifier
+            let namespacePrefix = "\(item.tag.namespace):"
+            let instanceSuffix = "#\(item.tag.instanceIndex)"
+            let aliases = Set(layout.assignments.keys.filter {
+                $0.hasPrefix(namespacePrefix) && $0.hasSuffix(instanceSuffix)
+            }).union([canonicalIdentifier])
+            guard aliases.contains(where: { $0 != canonicalIdentifier }) else { continue }
+
+            var savedLocation: (section: MenuBarSection.Name, index: Int)?
+            for section in MenuBarSection.Name.allCases {
+                if let index = layout.order[section, default: []].firstIndex(where: aliases.contains) {
+                    savedLocation = (section, index)
+                    break
+                }
+            }
+            let section = savedLocation?.section
+                ?? layout.assignments[canonicalIdentifier]
+                ?? aliases.compactMap { layout.assignments[$0] }.first
+                ?? .visible
+
+            for alias in aliases {
+                layout.assignments.removeValue(forKey: alias)
+            }
+            layout.assignments[canonicalIdentifier] = section
+
+            for existingSection in MenuBarSection.Name.allCases {
+                layout.order[existingSection, default: []].removeAll(where: aliases.contains)
+            }
+            let insertionIndex = min(
+                savedLocation?.index ?? layout.order[section, default: []].endIndex,
+                layout.order[section, default: []].endIndex
+            )
+            layout.order[section, default: []].insert(canonicalIdentifier, at: insertionIndex)
+            logger.notice("Migrated Text Input menu bar identity to \(canonicalIdentifier, privacy: .public)")
+        }
     }
 
     private static func isOrderedLeftToRight(_ lhs: MenuBarItem, _ rhs: MenuBarItem) -> Bool {

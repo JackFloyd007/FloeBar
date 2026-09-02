@@ -50,7 +50,7 @@ final class ControlItem {
     }
 
     /// A hiding state for a control item.
-    enum HidingState {
+    enum HidingState: Equatable {
         case showSection
         case hideSection
     }
@@ -118,7 +118,15 @@ final class ControlItem {
     }
 
     /// The control item's hiding state (`@Published`).
-    @Published var state = HidingState.hideSection
+    @Published var state = HidingState.hideSection {
+        didSet {
+            guard state != oldValue else { return }
+            // Keep the Ice glyph and the macOS 27 visibility assertion in the
+            // same event turn. Dispatching this through Combine made a click
+            // look like two separate, slightly delayed transitions.
+            updateStatusItem()
+        }
+    }
 
     /// The control item's window (`@Published`).
     @Published private(set) var window: NSWindow?
@@ -190,22 +198,12 @@ final class ControlItem {
     func performSetup(with appState: AppState) {
         self.appState = appState
         configureCancellables()
+        updateStatusItem()
     }
 
     /// Configures the internal observers for the control item.
     private func configureCancellables() {
         var c = Set<AnyCancellable>()
-
-        $state
-            // A same-value assignment must not commit another status-item
-            // scene update. MenuBarAgent visibly flashes those redundant
-            // updates while a macOS 27 visibility assertion is changing.
-            .removeDuplicates()
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                self?.updateStatusItem()
-            }
-            .store(in: &c)
 
         statusItem.publisher(for: \.isVisible)
             .receive(on: DispatchQueue.main)
@@ -551,51 +549,56 @@ final class ControlItem {
         guard let menuBarManager = appState?.menuBarManager else { return }
         let event = NSApp.currentEvent
 
-        switch event?.type {
-        case .leftMouseDown, .applicationDefined, nil:
-            // Accessibility presses do not necessarily synthesize a
-            // leftMouseDown event. Treat them as an ordinary click so the Ice
-            // button remains usable from VoiceOver and UI automation.
-            // An accessibility press has no backing NSEvent. Do not inherit
-            // the last synthetic Command-drag's global modifier state.
-            let modifierFlags = event?.modifierFlags ?? []
+        let eventIsFreshButtonEvent = if
+            let event,
+            event.windowNumber == statusItem.button?.window?.windowNumber
+        {
+            ProcessInfo.processInfo.systemUptime - event.timestamp < 0.5
+        } else {
+            false
+        }
 
-            // Running this from a Task seems to improve the visual
-            // responsiveness of the status item's button.
-            Task {
-                // Command-click is the start of the system's native status-item
-                // reorder gesture. It must not also toggle the hidden section.
-                if modifierFlags.contains(.command) {
-                    return
-                }
-
-                if modifierFlags == .control {
-                    showMenu()
-                    return
-                }
-
-                if
-                    modifierFlags == .option,
-                    let section = menuBarManager.section(withName: .alwaysHidden),
-                    section.isEnabled
-                {
-                    menuBarManager.noteMacOS27ControlToggle()
-                    section.toggle()
-                    return
-                }
-
-                if
-                    let section = menuBarManager.section(withName: sectionName),
-                    section.isEnabled
-                {
-                    menuBarManager.noteMacOS27ControlToggle()
-                    section.toggle()
-                }
-            }
-        case .rightMouseUp:
+        if eventIsFreshButtonEvent, event?.type == .rightMouseUp {
             showMenu()
-        default:
             return
+        }
+
+        // The button sends its ordinary action on mouse-down. Accessibility
+        // presses can arrive with no event, an application-defined event, or
+        // NSApp's last unrelated event. Only trust modifiers from a fresh
+        // mouse-down that belongs to this status item's own window; otherwise
+        // a preceding Command-drag can make the next press look like another
+        // reorder gesture and silently discard it.
+        let eventIsFreshButtonMouseDown = eventIsFreshButtonEvent && event?.type == .leftMouseDown
+        let modifierFlags = eventIsFreshButtonMouseDown ? event?.modifierFlags ?? [] : []
+
+        // Command-click is the start of the system's native status-item
+        // reorder gesture. It must not also toggle the hidden section.
+        if modifierFlags.contains(.command) {
+            return
+        }
+
+        if modifierFlags == .control {
+            showMenu()
+            return
+        }
+
+        if
+            modifierFlags == .option,
+            let section = menuBarManager.section(withName: .alwaysHidden),
+            section.isEnabled
+        {
+            menuBarManager.noteMacOS27ControlToggle()
+            section.toggle()
+            return
+        }
+
+        if
+            let section = menuBarManager.section(withName: sectionName),
+            section.isEnabled
+        {
+            menuBarManager.noteMacOS27ControlToggle()
+            section.toggle()
         }
     }
 

@@ -5,6 +5,7 @@
 
 #import "MacOS27AssessmentModeHiding.h"
 #import <dlfcn.h>
+#import <CoreGraphics/CoreGraphics.h>
 
 @interface MBAssessmentModeConfiguration : NSObject
 - (instancetype)initWithAllowedSystemItems:(NSArray<NSNumber *> *)systemItems
@@ -40,6 +41,7 @@ BOOL IceAssessmentModeHidingAvailable(void) {
 
 void *IceAssessmentModeHidingActivate(NSArray<NSString *> *allowedBundleIdentifiers,
                                       NSArray<NSNumber *> *allowedSystemItems,
+                                      void (^_Nullable onActivated)(void),
                                       void (^_Nullable onFailure)(void)) {
     if (!IceAssessmentModeHidingAvailable()) {
         return NULL;
@@ -57,6 +59,7 @@ void *IceAssessmentModeHidingActivate(NSArray<NSString *> *allowedBundleIdentifi
             return NULL;
         }
 
+        void (^activatedCopy)(void) = onActivated ? [onActivated copy] : nil;
         void (^failureCopy)(void) = onFailure ? [onFailure copy] : nil;
         [assertion activateWithConfiguration:configuration
                            completionHandler:^(NSError *_Nullable error) {
@@ -65,6 +68,10 @@ void *IceAssessmentModeHidingActivate(NSArray<NSString *> *allowedBundleIdentifi
                 if (failureCopy) {
                     dispatch_async(dispatch_get_main_queue(), failureCopy);
                 }
+            } else if (activatedCopy) {
+                // Always defer success until after the bridge returned its
+                // retained assertion handle to Swift.
+                dispatch_async(dispatch_get_main_queue(), activatedCopy);
             }
         }];
         return (void *)CFBridgingRetain(assertion);
@@ -84,4 +91,68 @@ void IceAssessmentModeHidingInvalidate(void *handle) {
     } @catch (NSException *exception) {
         NSLog(@"[IceAssessmentModeHiding] invalidate threw: %@", exception);
     }
+}
+
+typedef int32_t (*IceWindowServerConnectionFunction)(void);
+typedef CGError (*IceWindowServerUpdateFunction)(int32_t connectionID);
+
+typedef struct {
+    int32_t connectionID;
+    IceWindowServerUpdateFunction reenable;
+} IceScreenUpdateSuspension;
+
+void *IceScreenUpdateSuspensionBegin(void) {
+    static void *skyLightHandle;
+    static IceWindowServerConnectionFunction mainConnection;
+    static IceWindowServerUpdateFunction disableUpdate;
+    static IceWindowServerUpdateFunction reenableUpdate;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        skyLightHandle = dlopen(
+            "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",
+            RTLD_NOW | RTLD_LOCAL
+        );
+        if (!skyLightHandle) {
+            return;
+        }
+        mainConnection = (IceWindowServerConnectionFunction)dlsym(
+            skyLightHandle,
+            "CGSMainConnectionID"
+        );
+        disableUpdate = (IceWindowServerUpdateFunction)dlsym(
+            skyLightHandle,
+            "SLSDisableUpdate"
+        );
+        reenableUpdate = (IceWindowServerUpdateFunction)dlsym(
+            skyLightHandle,
+            "SLSReenableUpdate"
+        );
+    });
+
+    if (!mainConnection || !disableUpdate || !reenableUpdate) {
+        return NULL;
+    }
+
+    int32_t connectionID = mainConnection();
+    if (connectionID == 0 || disableUpdate(connectionID) != kCGErrorSuccess) {
+        return NULL;
+    }
+
+    IceScreenUpdateSuspension *suspension = calloc(1, sizeof(*suspension));
+    if (!suspension) {
+        reenableUpdate(connectionID);
+        return NULL;
+    }
+    suspension->connectionID = connectionID;
+    suspension->reenable = reenableUpdate;
+    return suspension;
+}
+
+void IceScreenUpdateSuspensionEnd(void *handle) {
+    if (!handle) {
+        return;
+    }
+    IceScreenUpdateSuspension *suspension = handle;
+    suspension->reenable(suspension->connectionID);
+    free(suspension);
 }

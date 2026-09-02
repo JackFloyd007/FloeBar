@@ -7,10 +7,18 @@
 import Cocoa
 
 enum AXHelpers {
-    private static let queue = DispatchQueue.targetingGlobal(
-        label: "AXHelpers.queue",
-        qos: .userInteractive
-    )
+    /// HIServices' AX value serializer can crash when this process performs an
+    /// outgoing accessibility read on a background queue while its main thread
+    /// is simultaneously answering another client's hierarchy request. Route
+    /// every AX call through the main thread so incoming and outgoing
+    /// serialization cannot overlap inside Ice. Callers doing a long walk can
+    /// batch related reads with this helper to avoid one dispatch per value.
+    static func performOnMain<T>(_ operation: () throws -> T) rethrows -> T {
+        if Thread.isMainThread {
+            return try operation()
+        }
+        return try DispatchQueue.main.sync(execute: operation)
+    }
 
     /// Child AX elements do not inherit a timeout set on an application's
     /// root element. Configure the process-wide fallback once so a child that
@@ -22,18 +30,18 @@ enum AXHelpers {
 
     @discardableResult
     static func isProcessTrusted(prompt: Bool = false) -> Bool {
-        queue.sync { checkIsProcessTrusted(prompt: prompt) }
+        performOnMain { checkIsProcessTrusted(prompt: prompt) }
     }
 
     static func element(at point: CGPoint) -> UIElement? {
-        queue.sync {
+        performOnMain {
             _ = globalMessagingTimeoutConfiguration
             return try? systemWideElement.elementAtPosition(Float(point.x), Float(point.y))
         }
     }
 
     static func application(for runningApp: NSRunningApplication) -> Application? {
-        queue.sync {
+        performOnMain {
             _ = globalMessagingTimeoutConfiguration
             let application = Application(runningApp)
             if let application {
@@ -46,39 +54,50 @@ enum AXHelpers {
     }
 
     static func extrasMenuBar(for app: Application) -> UIElement? {
-        queue.sync { try? app.attribute(.extrasMenuBar) }
+        performOnMain { try? app.attribute(.extrasMenuBar) }
     }
 
     static func children(for element: UIElement) -> [UIElement] {
-        queue.sync { try? element.arrayAttribute(.children) } ?? []
+        performOnMain { try? element.arrayAttribute(.children) } ?? []
     }
 
     static func isEnabled(_ element: UIElement) -> Bool {
-        queue.sync { try? element.attribute(.enabled) } ?? false
+        performOnMain { try? element.attribute(.enabled) } ?? false
     }
 
     static func frame(for element: UIElement) -> CGRect? {
-        queue.sync { try? element.attribute(.frame) }
+        performOnMain { try? element.attribute(.frame) }
     }
 
     static func role(for element: UIElement) -> Role? {
-        queue.sync { try? element.role() }
+        performOnMain { try? element.role() }
     }
 
     static func title(for element: UIElement) -> String? {
-        queue.sync { try? element.attribute(.title) }
+        performOnMain { try? element.attribute(.title) }
     }
 
     static func identifier(for element: UIElement) -> String? {
-        queue.sync { try? element.attribute(.identifier) }
+        performOnMain { try? element.attribute(.identifier) }
     }
 
     static func description(for element: UIElement) -> String? {
-        queue.sync { try? element.attribute(.description) }
+        performOnMain { try? element.attribute(.description) }
+    }
+
+    static func help(for element: UIElement) -> String? {
+        performOnMain { try? element.attribute(.help) }
+    }
+
+    static func value(for element: UIElement) -> String? {
+        performOnMain {
+            let value: Any? = try? element.attribute(.value)
+            return value as? String
+        }
     }
 
     static func pid(for element: UIElement) -> pid_t? {
-        queue.sync {
+        performOnMain {
             var pid: pid_t = 0
             return AXUIElementGetPid(element.element, &pid) == .success ? pid : nil
         }
@@ -86,7 +105,7 @@ enum AXHelpers {
 
     @discardableResult
     static func press(_ element: UIElement) -> Bool {
-        queue.sync {
+        performOnMain {
             do {
                 try element.performAction(.press)
                 return true

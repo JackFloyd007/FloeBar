@@ -25,6 +25,12 @@ struct MenuBarItem: CustomStringConvertible {
     /// The item's window title.
     let title: String?
 
+    /// Live status information published by the item's Accessibility element.
+    /// These values let macOS 27 reproduce status-bar content without falling
+    /// back to the owning application's unrelated app icon.
+    let accessibilityHelp: String?
+    let accessibilityValue: String?
+
     /// A Boolean value that indicates whether the item is on screen.
     let isOnScreen: Bool
 
@@ -40,6 +46,8 @@ struct MenuBarItem: CustomStringConvertible {
         sourcePID: pid_t?,
         bounds: CGRect,
         title: String?,
+        accessibilityHelp: String? = nil,
+        accessibilityValue: String? = nil,
         isOnScreen: Bool
     ) {
         self.tag = tag
@@ -48,6 +56,8 @@ struct MenuBarItem: CustomStringConvertible {
         self.sourcePID = sourcePID
         self.bounds = bounds
         self.title = title
+        self.accessibilityHelp = accessibilityHelp
+        self.accessibilityValue = accessibilityValue
         self.isOnScreen = isOnScreen
     }
 
@@ -207,6 +217,8 @@ struct MenuBarItem: CustomStringConvertible {
         self.sourcePID = itemWindow.ownerPID
         self.bounds = itemWindow.bounds
         self.title = itemWindow.title
+        self.accessibilityHelp = nil
+        self.accessibilityValue = nil
         self.isOnScreen = itemWindow.isOnScreen
     }
 
@@ -223,6 +235,8 @@ struct MenuBarItem: CustomStringConvertible {
         self.sourcePID = sourcePID
         self.bounds = itemWindow.bounds
         self.title = itemWindow.title
+        self.accessibilityHelp = nil
+        self.accessibilityValue = nil
         self.isOnScreen = itemWindow.isOnScreen
     }
 }
@@ -327,6 +341,8 @@ extension MenuBarItem: Equatable {
         lhs.sourcePID == rhs.sourcePID &&
         NSStringFromRect(lhs.bounds) == NSStringFromRect(rhs.bounds) &&
         lhs.title == rhs.title &&
+        lhs.accessibilityHelp == rhs.accessibilityHelp &&
+        lhs.accessibilityValue == rhs.accessibilityValue &&
         lhs.isOnScreen == rhs.isOnScreen
     }
 }
@@ -340,6 +356,8 @@ extension MenuBarItem: Hashable {
         hasher.combine(sourcePID)
         hasher.combine(NSStringFromRect(bounds))
         hasher.combine(title)
+        hasher.combine(accessibilityHelp)
+        hasher.combine(accessibilityValue)
         hasher.combine(isOnScreen)
     }
 }

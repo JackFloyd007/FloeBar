@@ -73,6 +73,19 @@ final class MenuBarManager: ObservableObject {
     func noteMacOS27ControlToggle() {
         guard #available(macOS 27.0, *) else { return }
         macOS27ControlToggleTimestamp = .now
+
+        // Layout temporarily reveals every managed item without changing the
+        // section controls' logical states. If the user clicks Ice while that
+        // editor reveal is still active (including just after closing its
+        // window), a hidden logical state would make the first click call
+        // `show()` and appear to do nothing. Adopt the actually visible state
+        // before toggling so the same click immediately hides the section.
+        if macOS27Controller.isLayoutEditing {
+            macOS27Controller.endLayoutEditing()
+            for section in sections {
+                section.controlItem.state = .showSection
+            }
+        }
     }
 
     var shouldSuppressMacOS27SmartRehide: Bool {
@@ -163,6 +176,24 @@ final class MenuBarManager: ObservableObject {
         appState?.publisherForWindow(.settings)
             .sink { [weak self] window in
                 self?.settingsWindow = window
+            }
+            .store(in: &c)
+
+        // SwiftUI does not reliably send `onDisappear` when the Settings
+        // window is merely ordered out. End Layout's temporary reveal from the
+        // window lifecycle as well, so closing Layout cannot leave every item
+        // exposed and consume the next Ice click as a state correction.
+        $settingsWindow
+            .removeNil()
+            .flatMap { $0.publisher(for: \.isVisible) }
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] isVisible in
+                guard let self, !isVisible else { return }
+                if #available(macOS 27.0, *), macOS27Controller.isLayoutEditing {
+                    macOS27Controller.endLayoutEditing()
+                    syncMacOS27Visibility()
+                }
             }
             .store(in: &c)
 
