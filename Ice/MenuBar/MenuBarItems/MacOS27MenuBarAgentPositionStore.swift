@@ -841,5 +841,4 @@ enum MacOS27MenuBarAgentPositionStore {
         }
         return left.1 < right.1
     }
-
 }

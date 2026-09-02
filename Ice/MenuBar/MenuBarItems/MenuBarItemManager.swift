@@ -2148,10 +2148,8 @@ extension MenuBarItemManager {
             .visible,
         ]
         var seenTags = Set<MenuBarItemTag>()
-        let desiredTags: [MenuBarItemTag] = physicalSections.flatMap {
-            section -> [MenuBarItemTag] in
-            desiredCache[section].compactMap {
-                item -> MenuBarItemTag? in
+        let desiredTags: [MenuBarItemTag] = physicalSections.flatMap { section -> [MenuBarItemTag] in
+            desiredCache[section].compactMap { item -> MenuBarItemTag? in
                 guard macOS27TouchedMoveTags.contains(item.tag) else {
                     return nil
                 }

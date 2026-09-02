@@ -606,8 +606,8 @@ final class MenuBarItemImageCache: ObservableObject {
             // its NSStatusItem button (MacMixApp.swift and the shipped binary).
             return "slider.horizontal.3"
         }
-        if bundleIdentifier == "com.crystalidea.macsfancontrol" {
-            let domain = bundleIdentifier! as CFString
+        if let bundleIdentifier, bundleIdentifier == "com.crystalidea.macsfancontrol" {
+            let domain = bundleIdentifier as CFString
             let iconStyle = CFPreferencesCopyAppValue(
                 "menubarIcon" as CFString,
                 domain
@@ -661,11 +661,11 @@ final class MenuBarItemImageCache: ObservableObject {
 
         let bundleIdentifier = item.sourceApplication?.bundleIdentifier
             ?? item.owningApplication?.bundleIdentifier
-        if bundleIdentifier == "com.crystalidea.macsfancontrol" {
+        if let bundleIdentifier, bundleIdentifier == "com.crystalidea.macsfancontrol" {
             // With no fan/sensor selected, Macs Fan Control displays only its
             // monochrome fan glyph. Its AXHelp still lists every live RPM, so
             // do not mistake that tooltip for visible status-item text.
-            let domain = bundleIdentifier! as CFString
+            let domain = bundleIdentifier as CFString
             let selectedFan = CFPreferencesCopyAppValue("trayFan" as CFString, domain) as? String
             let selectedSensor = CFPreferencesCopyAppValue("traySensor" as CFString, domain) as? String
             guard selectedFan != nil && selectedFan != "-1" || !(selectedSensor ?? "").isEmpty else {

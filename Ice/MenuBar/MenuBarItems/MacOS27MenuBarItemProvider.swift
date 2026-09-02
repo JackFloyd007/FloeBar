@@ -198,8 +198,7 @@ enum MacOS27MenuBarItemProvider {
                 }
 
                 let namespace = namespace(for: runningApp)
-                let candidates = AXHelpers.children(for: extrasMenuBar).enumerated().compactMap {
-                    childIndex, child -> (UIElement, String, CGRect)? in
+                let candidates = AXHelpers.children(for: extrasMenuBar).enumerated().compactMap { childIndex, child -> (UIElement, String, CGRect)? in
                     guard let frame = AXHelpers.frame(for: child), frame.height > 0, frame.height <= maxItemHeight else {
                         return nil
                     }

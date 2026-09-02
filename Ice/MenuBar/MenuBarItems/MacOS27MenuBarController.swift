@@ -301,7 +301,7 @@ final class MacOS27MenuBarController {
         let previousSection = layout.assignments[identifier, default: .visible]
 
         if let requiredSection {
-            // A Layout drop already carries the destination container.  Do
+            // A Layout drop already carries the destination container. Do
             // not infer it again from the target item: an empty Hidden section
             // is represented physically by the visible Ice control item, so
             // geometry alone would incorrectly persist the moved item as
