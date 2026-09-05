@@ -23,6 +23,31 @@ enum MacOS27MenuBarItemProvider {
     /// HIServices' serializer is not safe when Ice answers an incoming AX
     /// hierarchy request at the same time as a background outgoing read.
     private static let operationLock = NSLock()
+    // Accessed only inside main-thread AX batches, including targeted rereads.
+    private static var runtimeIdentities = MacOS27RuntimeItemRegistry<AXUIElement>()
+
+    /// A single main-thread batch for our own controls only. Do not take the
+    /// background scan lock here: its owner may be waiting for the main thread.
+    @MainActor
+    static func ownMenuBarItems() -> [MenuBarItem] {
+        let frames = NSScreen.screens.map { screen in
+            let display = CGDisplayBounds(screen.displayID)
+            return CGRect(x: display.minX, y: display.minY, width: display.width, height: maxItemHeight)
+        }
+        let items = rawItems(
+            from: .current,
+            displayBounds: nil,
+            menuBarFrames: frames,
+            includeSupplementaryMetadata: false
+        ).items
+        for identifier in [ControlItem.Identifier.visible.rawValue, MenuBarItemTag.nativeBoundary(for: .hidden).title] {
+            let matches = items.filter { $0.identityTitle == identifier }
+            if let first = matches.first, matches.contains(where: { $0.bounds != first.bounds }) {
+                return [] // Distinct hosted variants are not a settled pair.
+            }
+        }
+        return assemble(items)
+    }
 
     static func menuBarItems(
         on display: CGDirectDisplayID? = nil,
@@ -93,41 +118,112 @@ enum MacOS27MenuBarItemProvider {
         includeSupplementaryMetadata: Bool
     ) -> [MenuBarItem] {
         var rawItems = [RawItem]()
+        let menuBarFrames = AXHelpers.performOnMain {
+            runtimeIdentities.removeUnavailableOwners(
+                Set(NSWorkspace.shared.runningApplications.map(runtimeOwner))
+            )
+            return NSScreen.screens.map { screen in
+                let display = CGDisplayBounds(screen.displayID)
+                return CGRect(x: display.minX, y: display.minY, width: display.width, height: maxItemHeight)
+            }
+        }
 
         for runningApp in runningApplications {
             rawItems.append(contentsOf: AXHelpers.performOnMain {
                 Self.rawItems(
                     from: runningApp,
                     displayBounds: displayBounds,
+                    menuBarFrames: menuBarFrames,
                     includeSupplementaryMetadata: includeSupplementaryMetadata
-                )
+                ).items
             })
         }
 
         return assemble(rawItems)
     }
 
+    /// A grace-period expiry is not enough to remove a retained tile: confirm
+    /// its owner still answers AX and no longer publishes that identity. Do
+    /// not take operationLock on main; a background scan may be waiting on us.
+    @MainActor
+    static func confirmedAbsentIdentifiers(for items: [MenuBarItem]) -> Set<String> {
+        let frames = NSScreen.screens.map { screen in
+            let display = CGDisplayBounds(screen.displayID)
+            return CGRect(x: display.minX, y: display.minY, width: display.width, height: maxItemHeight)
+        }
+        var absent = Set<String>()
+        let applications = NSWorkspace.shared.runningApplications
+        for (itemNamespace, candidates) in Dictionary(grouping: items, by: { $0.tag.namespace }) {
+            let owners = applications.filter { namespace(for: $0) == itemNamespace }
+            guard !owners.isEmpty else { continue }
+            let snapshots = owners.map {
+                rawItems(
+                    from: $0,
+                    displayBounds: nil,
+                    menuBarFrames: frames,
+                    includeSupplementaryMetadata: false,
+                    includingOffscreenItems: true
+                )
+            }
+            guard snapshots.allSatisfy(\.isComplete) else { continue }
+            // Raw identities include ambiguous hosted variants. Their geometry
+            // is not usable for a move, but they still prove the item exists.
+            let identities = Set(snapshots.flatMap(\.items).map { "\($0.namespace):\($0.identityTitle)" })
+            absent.formUnion(candidates.filter {
+                !identities.contains("\($0.tag.namespace):\($0.tag.title)")
+            }.map { $0.tag.persistentIdentifier })
+        }
+        return absent
+    }
+
+    private struct RawSnapshot {
+        var items = [RawItem]()
+        var isComplete = true
+    }
+
     private static func rawItems(
         from runningApp: NSRunningApplication,
         displayBounds: CGRect?,
-        includeSupplementaryMetadata: Bool
-    ) -> [RawItem] {
-        guard
-            let application = AXHelpers.application(for: runningApp),
-            let extrasMenuBar = AXHelpers.extrasMenuBar(for: application)
-        else {
-            return []
+        menuBarFrames: [CGRect],
+        includeSupplementaryMetadata: Bool,
+        includingOffscreenItems: Bool = false
+    ) -> RawSnapshot {
+        precondition(Thread.isMainThread)
+        guard let application = AXHelpers.application(for: runningApp) else {
+            return RawSnapshot(isComplete: false)
+        }
+        let children: [UIElement]
+        do {
+            guard let extras: UIElement = try application.attribute(.extrasMenuBar) else {
+                return RawSnapshot() // A successful read can report no status items.
+            }
+            children = try extras.arrayAttribute(.children) ?? []
+        } catch let error as AXError where error == .notImplemented {
+            // Some hosts remove AXExtrasMenuBar along with their final item.
+            // Only a successful attribute-list read that omits it establishes
+            // absence; a timeout/unresponsive owner is never treated as empty.
+            if let attributes = try? application.attributes(), !attributes.contains(.extrasMenuBar) {
+                return RawSnapshot()
+            }
+            return RawSnapshot(isComplete: false)
+        } catch {
+            return RawSnapshot(isComplete: false)
         }
 
         let namespace = namespace(for: runningApp)
         var fallbackIndex = 0
-        var result = [RawItem]()
-        for (childIndex, child) in AXHelpers.children(for: extrasMenuBar).enumerated() {
-            guard
-                let frame = AXHelpers.frame(for: child),
-                frame.height > 0,
-                frame.height <= maxItemHeight
-            else {
+        var result = RawSnapshot()
+        for (childIndex, child) in children.enumerated() {
+            guard let frame = AXHelpers.frame(for: child) else {
+                result.isComplete = false
+                continue
+            }
+            guard MacOS27ItemSnapshotGeometry.includes(
+                frame: frame,
+                menuBarFrames: menuBarFrames,
+                maxItemHeight: maxItemHeight,
+                includingOffscreenItems: includingOffscreenItems
+            ) else {
                 continue
             }
 
@@ -135,9 +231,30 @@ enum MacOS27MenuBarItemProvider {
                 continue
             }
 
-            lazy var descendants = AXHelpers.children(for: child)
-            let identifier = nonEmpty(AXHelpers.identifier(for: child))
-                ?? descendants.compactMap { nonEmpty(AXHelpers.identifier(for: $0)) }.first
+            var identityDescendants: [UIElement]?
+            let identifier: String?
+            do {
+                if let ownIdentifier = nonEmpty(try child.attribute(.identifier)) {
+                    identifier = ownIdentifier
+                } else {
+                    let descendants: [UIElement] = try child.arrayAttribute(.children) ?? []
+                    identityDescendants = descendants
+                    var descendantIdentifier: String?
+                    for descendant in descendants {
+                        if let value = nonEmpty(try descendant.attribute(.identifier)) {
+                            descendantIdentifier = value
+                            break
+                        }
+                    }
+                    identifier = descendantIdentifier
+                }
+            } catch {
+                // A failed metadata read is not evidence that the element
+                // lacks an identifier. Never mint a fallback identity for it.
+                result.isComplete = false
+                continue
+            }
+            lazy var descendants = identityDescendants ?? AXHelpers.children(for: child)
             let accessibilityDescription = nonEmpty(AXHelpers.description(for: child))
                 ?? descendants.compactMap { nonEmpty(AXHelpers.description(for: $0)) }.first
             let accessibilityHelp = includeSupplementaryMetadata
@@ -160,11 +277,20 @@ enum MacOS27MenuBarItemProvider {
             // label is presentation, not identity.
             let identityTitle = if namespace == .textInputMenuAgent {
                 "Item-\(childIndex)"
+            } else if identifier == nil,
+                      runningApp.bundleIdentifier != Constants.bundleIdentifier,
+                      runningApp.bundleIdentifier?.hasPrefix("com.apple.") != true {
+                runtimeIdentities.identity(
+                    for: child.element,
+                    owner: runtimeOwner(runningApp),
+                    now: ProcessInfo.processInfo.systemUptime,
+                    equals: { CFEqual($0, $1) }
+                )
             } else {
                 identifier ?? accessibilityDescription ?? displayTitle
             }
             let ownerPID = AXHelpers.pid(for: child) ?? runningApp.processIdentifier
-            result.append(
+            result.items.append(
                 RawItem(
                     namespace: namespace,
                     identityTitle: identityTitle,
@@ -177,57 +303,6 @@ enum MacOS27MenuBarItemProvider {
             )
         }
         return result
-    }
-
-    /// Performs the semantic accessibility press action for an item.
-    /// This is more reliable than targeting a synthetic WindowServer ID.
-    static func press(_ item: MenuBarItem) -> Bool {
-        operationLock.lock()
-        defer { operationLock.unlock() }
-
-        return AXHelpers.performOnMain {
-            guard AXHelpers.isProcessTrusted() else { return false }
-
-            for runningApp in NSWorkspace.shared.runningApplications
-            where namespace(for: runningApp) == item.tag.namespace {
-                guard
-                    let application = AXHelpers.application(for: runningApp),
-                    let extrasMenuBar = AXHelpers.extrasMenuBar(for: application)
-                else {
-                    continue
-                }
-
-                let namespace = namespace(for: runningApp)
-                let candidates = AXHelpers.children(for: extrasMenuBar).enumerated().compactMap { childIndex, child -> (UIElement, String, CGRect)? in
-                    guard let frame = AXHelpers.frame(for: child), frame.height > 0, frame.height <= maxItemHeight else {
-                        return nil
-                    }
-                    let descendants = AXHelpers.children(for: child)
-                    let identifier = nonEmpty(AXHelpers.identifier(for: child))
-                        ?? descendants.compactMap { nonEmpty(AXHelpers.identifier(for: $0)) }.first
-                    let accessibilityDescription = nonEmpty(AXHelpers.description(for: child))
-                        ?? descendants.compactMap { nonEmpty(AXHelpers.description(for: $0)) }.first
-                    let title = if namespace == .textInputMenuAgent {
-                        "Item-\(childIndex)"
-                    } else {
-                        identifier
-                            ?? accessibilityDescription
-                            ?? nonEmpty(AXHelpers.title(for: child))
-                            ?? "Item-0"
-                    }
-                    return (child, title, frame)
-                }.sorted { $0.2.minX < $1.2.minX }
-
-                var instanceIndex = 0
-                for candidate in candidates where candidate.1 == item.tag.title {
-                    if instanceIndex == item.tag.instanceIndex {
-                        return AXHelpers.press(candidate.0)
-                    }
-                    instanceIndex += 1
-                }
-            }
-            return false
-        }
     }
 
     private struct RawItem {
@@ -248,11 +323,21 @@ enum MacOS27MenuBarItemProvider {
             return lhs.bounds.minX < rhs.bounds.minX
         }
         var seenIceControlItems = Set<String>()
+        var seenRuntimeItems = Set<String>()
         var nextIndexByIdentity = [String: Int]()
+        let ambiguousRuntimeItems = Set(Dictionary(grouping: rawItems, by: \.identityTitle).compactMap { title, items in
+            guard title.hasPrefix(MacOS27RuntimeItemIdentity.prefix), let first = items.first,
+                  items.contains(where: { $0.bounds != first.bounds }) else { return nil as String? }
+            return title
+        })
 
         return sorted.compactMap { rawItem in
             guard !isNativeOverflowPlaceholder(rawItem.identityTitle) else {
                 return nil
+            }
+            if rawItem.identityTitle.hasPrefix(MacOS27RuntimeItemIdentity.prefix) {
+                guard !ambiguousRuntimeItems.contains(rawItem.identityTitle),
+                      seenRuntimeItems.insert(rawItem.identityTitle).inserted else { return nil }
             }
 
             // AppKit publishes both the primary scene and a presentation
@@ -302,6 +387,10 @@ enum MacOS27MenuBarItemProvider {
         case nil:
             return .optional(app.localizedName)
         }
+    }
+
+    private static func runtimeOwner(_ app: NSRunningApplication) -> String {
+        "\(app.processIdentifier):\(app.launchDate?.timeIntervalSinceReferenceDate ?? 0)"
     }
 
     private static func nonEmpty(_ string: String?) -> String? {

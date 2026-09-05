@@ -8,6 +8,7 @@ import Combine
 
 /// A container for the items in the menu bar layout interface.
 final class LayoutBarContainer: NSView {
+    static var itemSpacing: CGFloat { if #available(macOS 27.0, *) { 8 } else { 0 } }
     /// Phases for a dragging session.
     enum DraggingPhase {
         case entered, exited, updated, ended
@@ -137,7 +138,7 @@ final class LayoutBarContainer: NSView {
             // the source of the unexplained sliding after a completed reorder.
             view.setFrameOrigin(
                 CGPoint(
-                    x: previous.map { $0.frame.maxX } ?? 0,
+                    x: previous.map { $0.frame.maxX + Self.itemSpacing } ?? 0,
                     y: (maxHeight / 2) - view.bounds.midY
                 )
             )

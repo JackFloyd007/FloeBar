@@ -121,6 +121,9 @@ final class HIDEventManager: ObservableObject {
     /// Sets up the manager.
     func performSetup(with appState: AppState) {
         self.appState = appState
+        // macOS 27 interaction belongs exclusively to Ice's own status item.
+        // Do not even construct global mouse/scroll monitors or event taps.
+        guard #unavailable(macOS 27.0) else { return }
         startAll()
         configureCancellables()
     }
@@ -157,11 +160,13 @@ final class HIDEventManager: ObservableObject {
 
     /// Starts all monitors.
     func startAll() {
+        guard #unavailable(macOS 27.0) else { return }
         isEnabled = enabledStateStack.popLast() ?? true
     }
 
     /// Stops all monitors.
     func stopAll() {
+        guard #unavailable(macOS 27.0) else { return }
         enabledStateStack.append(isEnabled)
         isEnabled = false
     }
@@ -174,14 +179,6 @@ extension HIDEventManager {
     // MARK: Handle Show On Click
 
     private func handleShowOnClick(appState: AppState, screen: NSScreen) {
-        // macOS 27 uses Ice's permanent status item as the explicit section
-        // boundary and toggle. Treating the rest of the menu bar as another
-        // toggle target makes ordinary menu-bar clicks unexpectedly reveal or
-        // conceal items, and can immediately undo a click on the Ice button.
-        if #available(macOS 27.0, *) {
-            return
-        }
-
         guard
             appState.settings.general.showOnClick,
             isMouseInsideEmptyMenuBarSpace(appState: appState, screen: screen)
@@ -248,14 +245,6 @@ extension HIDEventManager {
         let rehideInterval = appState.settings.general.rehideInterval
 
         Task {
-            // Let the control item's action run before deciding whether this
-            // was an outside click. On macOS 27 the item is hosted by
-            // MenuBarAgent, so event.window cannot identify it reliably.
-            await Task.yield()
-            if appState.menuBarManager.shouldSuppressMacOS27SmartRehide {
-                return
-            }
-
             // Smart mode still respects the user's configured rehide delay.
             // The previous fixed 250 ms delay looked like a post-click twitch.
             do {
@@ -306,9 +295,16 @@ extension HIDEventManager {
     // MARK: Handle Secondary Context Menu
 
     private func handleSecondaryContextMenu(appState: AppState, screen: NSScreen) {
+        // On macOS 27, only ControlItem's own action may open Ice's menu.
+        // Do not schedule a delayed global popup that can replace another
+        // menu-bar item's native context menu.
+        guard appState.settings.advanced.isSecondaryContextMenuEnabled else {
+            return
+        }
+
         Task {
             guard
-                appState.settings.advanced.enableSecondaryContextMenu,
+                appState.settings.advanced.isSecondaryContextMenuEnabled,
                 isMouseInsideEmptyMenuBarSpace(appState: appState, screen: screen),
                 let mouseLocation = MouseHelpers.locationAppKit
             else {

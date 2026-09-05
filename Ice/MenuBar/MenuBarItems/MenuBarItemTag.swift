@@ -29,35 +29,16 @@ struct MenuBarItemTag: Hashable, CustomStringConvertible {
     /// A Boolean value that indicates whether the item identified
     /// by this tag can be hidden.
     var canBeHidden: Bool {
-        if #available(macOS 27.0, *), namespace == .controlCenter {
-            return macOS27SystemItemIdentifier != nil &&
-                !MenuBarItemTag.immovableItems.contains(self)
-        }
-        return !MenuBarItemTag.nonHideableItems.contains(self) &&
+        !MenuBarItemTag.immovableItems.contains(self) &&
+        !MenuBarItemTag.nonHideableItems.contains(self) &&
         !(namespace.isUUID && title == "AudioVideoModule")
-    }
-
-    /// The private macOS 27 system-item allowlist identifier, when this item
-    /// can be independently hidden without affecting other system extras.
-    var macOS27SystemItemIdentifier: Int? {
-        switch title {
-        case "Battery", "com.apple.menuextra.battery": 0
-        case "Bluetooth", "com.apple.menuextra.bluetooth": 1
-        case "Clock", "com.apple.menuextra.clock": 2
-        case "Displays", "Display", "com.apple.menuextra.displays": 3
-        case "Keyboard", "com.apple.menuextra.keyboard": 4
-        case "Sound", "Volume", "com.apple.menuextra.volume": 5
-        case "WiFi", "Wi-Fi", "com.apple.menuextra.wifi": 6
-        case "ScreenMirroring", "Screen Mirroring", "com.apple.menuextra.screenmirroring": 7
-        case "BentoBox-0", "ControlCenter", "com.apple.menuextra.controlcenter": 8
-        default: nil
-        }
     }
 
     /// A Boolean value that indicates whether the item identified
     /// by this tag is a control item owned by Ice.
     var isControlItem: Bool {
-        MenuBarItemTag.controlItems.contains(self)
+        MenuBarItemTag.controlItems.contains(self) ||
+            (namespace == .ice && title.hasPrefix("Ice.NativeBoundary."))
     }
 
     /// A Boolean value that indicates whether the item identified
@@ -142,12 +123,20 @@ extension MenuBarItemTag {
     }()
 
     /// An array of tags for items representing Ice's control items.
-    static let controlItems = ControlItem.Identifier.allCases.map { $0.tag }
+    static let controlItems = ControlItem.Identifier.allCases.map { $0.tag } + [
+        MenuBarItemTag(namespace: .ice, title: "Ice.NativeBoundary.hidden"),
+        MenuBarItemTag(namespace: .ice, title: "Ice.NativeBoundary.alwaysHidden"),
+    ]
 
     // MARK: Control Items
 
     /// The tag for Ice's control item for the "Visible" section.
     static let visibleControlItem = MenuBarItemTag(controlItem: .visible)
+
+    static func nativeBoundary(for section: MenuBarSection.Name) -> MenuBarItemTag {
+        if section == .visible { return .visibleControlItem }
+        return MenuBarItemTag(namespace: .ice, title: "Ice.NativeBoundary.\(section.rawValue).v2")
+    }
 
     /// The tag for Ice's control item for the "Hidden" section.
     static let hiddenControlItem = MenuBarItemTag(controlItem: .hidden)
@@ -159,7 +148,11 @@ extension MenuBarItemTag {
 
     /// The tag for the system item that appears in the menu bar
     /// during screen or audio capture.
-    static let audioVideoModule = MenuBarItemTag(namespace: .controlCenter, title: "AudioVideoModule")
+    static let audioVideoModule = if #available(macOS 27.0, *) {
+        MenuBarItemTag(namespace: .controlCenter, title: "com.apple.menuextra.audiovideo")
+    } else {
+        MenuBarItemTag(namespace: .controlCenter, title: "AudioVideoModule")
+    }
 
     /// The tag for the system "Clock" item.
     static let clock = if #available(macOS 27.0, *) {

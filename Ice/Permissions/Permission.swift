@@ -75,7 +75,8 @@ class Permission: ObservableObject, Identifiable {
                 guard let self else {
                     return
                 }
-                hasPermission = check()
+                let granted = check()
+                if hasPermission != granted { hasPermission = granted }
             }
     }
 

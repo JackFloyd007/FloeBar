@@ -56,7 +56,8 @@ final class MenuBarSection {
 
     /// A Boolean value that indicates whether the Ice Bar should be used.
     private var useIceBar: Bool {
-        appState?.settings.general.useIceBar ?? false
+        if #available(macOS 27.0, *) { return false }
+        return appState?.settings.general.useIceBar ?? false
     }
 
     /// A weak reference to the menu bar manager.
@@ -107,10 +108,8 @@ final class MenuBarSection {
     var isEnabled: Bool {
         if #available(macOS 27.0, *) {
             return switch name {
-            case .visible, .hidden:
-                true
-            case .alwaysHidden:
-                appState?.settings.advanced.enableAlwaysHiddenSection ?? false
+            case .visible, .hidden: true
+            case .alwaysHidden: appState?.settings.advanced.enableAlwaysHiddenSection ?? false
             }
         } else {
             if case .visible = name {
@@ -119,6 +118,10 @@ final class MenuBarSection {
             }
             return controlItem.isAddedToMenuBar
         }
+    }
+
+    var canToggleVisibility: Bool {
+        isEnabled
     }
 
     /// The hotkey to toggle the section.
@@ -164,7 +167,7 @@ final class MenuBarSection {
             return
         }
 
-        guard isEnabled else {
+        guard canToggleVisibility else {
             // The section is disabled.
             return
         }
@@ -194,7 +197,6 @@ final class MenuBarSection {
                 }
             }
 
-            menuBarManager.syncMacOS27Visibility()
             return // We're done.
         }
 
@@ -213,16 +215,13 @@ final class MenuBarSection {
             }
         }
 
-        // Combine delivers the state publisher on the next main-queue turn.
-        // Apply the final state now as well so a click reaches macOS 27's
-        // visibility assertion without waiting for that extra dispatch.
-        menuBarManager.syncMacOS27Visibility()
+        menuBarManager.syncNativeVisibility()
         startRehideChecks()
     }
 
     /// Hides the section.
     func hide() {
-        guard let menuBarManager, !isHidden else {
+        guard let menuBarManager, canToggleVisibility, !isHidden else {
             return
         }
 
@@ -238,7 +237,7 @@ final class MenuBarSection {
             controlItem.state = .hideSection
         }
 
-        menuBarManager.syncMacOS27Visibility()
+        menuBarManager.syncNativeVisibility()
         stopRehideChecks()
     }
 
@@ -249,6 +248,7 @@ final class MenuBarSection {
 
     /// Starts running checks to determine when to rehide the section.
     private func startRehideChecks() {
+        guard #unavailable(macOS 27.0) else { return }
         rehideTimer?.invalidate()
         rehideMonitor?.stop()
 

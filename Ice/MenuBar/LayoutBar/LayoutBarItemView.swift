@@ -11,11 +11,9 @@ import OSLog
 
 /// A view that displays an image in a menu bar layout view.
 final class LayoutBarItemView: NSView {
-    /// Compact menu bar glyphs use one common center-to-center slot. Wider
-    /// textual status items may expand beyond it, but Wi-Fi, Spotlight,
-    /// Battery, input source, and ordinary app icons no longer inherit visibly
-    /// different spacing from their individual pixel widths.
-    private static let minimumItemWidth: CGFloat = 32
+    /// Each real item has one compact, labelled thumbnail. There are no
+    /// placeholder views for empty positions or failed image captures.
+    private static let minimumItemWidth: CGFloat = if #available(macOS 27.0, *) { 88 } else { 32 }
     private static let horizontalImageInset: CGFloat = 2
 
     private weak var appState: AppState?
@@ -24,6 +22,10 @@ final class LayoutBarItemView: NSView {
     private var pendingMoveTask: Task<Void, Never>?
     private var pendingMoveOffset = 0
     private var pendingMoveIsExecuting = false
+    private var localDropTarget: LayoutBarPaddingView?
+    private var isLocalDragActive = false
+    private var isHovered = false
+    private var displayedImageIsTemplate = false
 
     /// The item that the view represents.
     private(set) var item: MenuBarItem
@@ -61,11 +63,20 @@ final class LayoutBarItemView: NSView {
     /// The image displayed inside the view.
     private var cachedImage: MenuBarItemImageCache.CapturedImage? {
         didSet {
+            guard cachedImage != oldValue else { return }
             if let image = cachedImage {
-                let trimmed = image.cgImage.trimmingTransparency(
+                let glyph: CGImage
+                if #available(macOS 27.0, *) {
+                    guard let result = MenuBarGlyphImage.make(from: image.cgImage) else { return }
+                    glyph = result.image
+                    displayedImageIsTemplate = result.isTemplate
+                } else {
+                    glyph = image.cgImage
+                }
+                let trimmed = glyph.trimmingTransparency(
                     around: [.minXEdge, .maxXEdge],
                     alphaThreshold: 0.05
-                ) ?? image.cgImage
+                ) ?? glyph
                 displayedImageSize = CGSize(
                     width: CGFloat(trimmed.width) / image.scale,
                     height: CGFloat(trimmed.height) / image.scale
@@ -75,9 +86,9 @@ final class LayoutBarItemView: NSView {
                     CGSize(
                         width: max(
                             Self.minimumItemWidth,
-                            displayedImageSize.width + (Self.horizontalImageInset * 2)
+                            displayedImageSize.width + (Self.horizontalImageInset * 2) + thumbnailExtraWidth
                         ),
-                        height: displayedImageSize.height
+                        height: thumbnailHeight ?? displayedImageSize.height
                     )
                 )
             } else if displayedImage == nil {
@@ -93,10 +104,20 @@ final class LayoutBarItemView: NSView {
     private var displayedImageRect: CGRect {
         CGRect(
             x: bounds.midX - (displayedImageSize.width / 2),
-            y: bounds.midY - (displayedImageSize.height / 2),
+            y: (thumbnailHeight == nil ? bounds.midY : bounds.midY + 10) - (displayedImageSize.height / 2),
             width: displayedImageSize.width,
             height: displayedImageSize.height
         )
+    }
+
+    private var thumbnailHeight: CGFloat? { if #available(macOS 27.0, *) { 68 } else { nil } }
+    private var thumbnailExtraWidth: CGFloat { if #available(macOS 27.0, *) { 12 } else { 0 } }
+
+    private var thumbnailTitle: String {
+        if item.tag.namespace == .controlCenter, item.tag.title == "com.apple.menuextra.wifi" {
+            return "Wi-Fi"
+        }
+        return item.displayName
     }
 
     /// A Boolean value that indicates whether the item view is a dragging placeholder.
@@ -111,7 +132,7 @@ final class LayoutBarItemView: NSView {
     /// A Boolean value that indicates whether the view is enabled.
     var isEnabled = true {
         didSet {
-            needsDisplay = true
+            if isEnabled != oldValue { needsDisplay = true }
         }
     }
 
@@ -191,14 +212,15 @@ final class LayoutBarItemView: NSView {
     }
 
     private static func fallbackSize(for item: MenuBarItem) -> CGSize {
-        CGSize(
-            width: max(minimumItemWidth, item.bounds.width),
-            height: item.bounds.height
-        )
+        if #available(macOS 27.0, *) {
+            CGSize(width: max(minimumItemWidth, item.bounds.width + 16), height: 68)
+        } else {
+            CGSize(width: max(minimumItemWidth, item.bounds.width), height: item.bounds.height)
+        }
     }
 
     private func moveOnePosition(left: Bool) -> Bool {
-        guard let appState else { return false }
+        guard isEnabled, let appState else { return false }
         appState.menuBarManager.macOS27Controller.beginLayoutEditing()
 
         // Accessibility clients can deliver consecutive custom actions a few
@@ -232,7 +254,7 @@ final class LayoutBarItemView: NSView {
             do {
                 if !wasLayoutEditing {
                     // MenuBarAgent recreates concealed hosted scenes after the
-                    // Layout reveal assertion changes. Give those live AX
+                    // Layout reveals its native section boundaries. Give live AX
                     // endpoints one frame to return before resolving the move.
                     try? await Task.sleep(for: .milliseconds(160))
                 }
@@ -317,12 +339,23 @@ final class LayoutBarItemView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         if !isDraggingPlaceholder {
-            displayedImage?.draw(
-                in: displayedImageRect,
-                from: .zero,
-                operation: .sourceOver,
-                fraction: isEnabled ? 1.0 : 0.67
-            )
+            if #available(macOS 27.0, *) { drawThumbnailBackgroundAndLabel() }
+            if displayedImageIsTemplate,
+               let image = displayedImage?.cgImage(forProposedRect: nil, context: nil, hints: nil),
+               let context = NSGraphicsContext.current?.cgContext {
+                context.saveGState()
+                context.clip(to: displayedImageRect, mask: image)
+                context.setFillColor(NSColor.labelColor.withAlphaComponent(isEnabled ? 1 : 0.67).cgColor)
+                context.fill(displayedImageRect)
+                context.restoreGState()
+            } else {
+                displayedImage?.draw(
+                    in: displayedImageRect,
+                    from: .zero,
+                    operation: .sourceOver,
+                    fraction: isEnabled ? 1.0 : 0.67
+                )
+            }
             if Bridging.isProcessUnresponsive(item.ownerPID) {
                 let warningImage = NSImage.warning
                 let width: CGFloat = 15
@@ -343,6 +376,79 @@ final class LayoutBarItemView: NSView {
         }
     }
 
+    @available(macOS 27.0, *)
+    private func drawThumbnailBackgroundAndLabel() {
+        if isHovered || isLocalDragActive {
+            NSColor.labelColor.withAlphaComponent(0.055).setFill()
+            NSBezierPath(roundedRect: bounds, xRadius: 9, yRadius: 9).fill()
+        }
+
+        let preview = CGRect(
+            x: bounds.midX - max(50, displayedImageSize.width + 12) / 2,
+            y: bounds.midY - 7,
+            width: max(50, displayedImageSize.width + 12),
+            height: 34
+        )
+        if displayedImage == nil {
+            NSColor.labelColor.withAlphaComponent(0.04).setFill()
+            NSBezierPath(roundedRect: preview, xRadius: 7, yRadius: 7).fill()
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.alignment = .center
+            ("…" as NSString).draw(in: preview.insetBy(dx: 4, dy: 7), withAttributes: [
+                .font: NSFont.systemFont(ofSize: 13),
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .paragraphStyle: paragraph,
+            ])
+        }
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        paragraph.lineBreakMode = .byTruncatingTail
+        (thumbnailTitle as NSString).draw(
+            in: CGRect(x: 4, y: 5, width: bounds.width - 8, height: 15),
+            withAttributes: [
+                .font: NSFont.systemFont(ofSize: 11),
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .paragraphStyle: paragraph,
+            ]
+        )
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self))
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        needsDisplay = true
+    }
+
+    override func resetCursorRects() {
+        if isEnabled { addCursorRect(bounds, cursor: .openHand) }
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func cancelOperation(_ sender: Any?) {
+        finishLocalDrag()
+    }
+
+    private func finishLocalDrag() {
+        guard isLocalDragActive else { return }
+        isLocalDragActive = false
+        alphaValue = 1
+        NSCursor.pop()
+        localDropTarget?.clearLocalDropIndicator()
+        localDropTarget = nil
+        needsDisplay = true
+    }
+
     override func mouseDragged(with event: NSEvent) {
         super.mouseDragged(with: event)
 
@@ -358,6 +464,24 @@ final class LayoutBarItemView: NSView {
             return
         }
 
+        if #available(macOS 27.0, *) {
+            // Layout is a local editor: keep the source view in place until
+            // mouse-up instead of juggling system drag-session exit callbacks.
+            if !isLocalDragActive {
+                isLocalDragActive = true
+                window?.makeFirstResponder(self)
+                alphaValue = 0.5
+                NSCursor.closedHand.push()
+                appState?.menuBarManager.macOS27Controller.beginLayoutEditing()
+            }
+            localDropTarget?.clearLocalDropIndicator()
+            localDropTarget = window?.contentView.flatMap {
+                LayoutBarPaddingView.localDropTarget(in: $0, at: event.locationInWindow)
+            }
+            localDropTarget?.showLocalDropIndicator(for: item, at: event.locationInWindow)
+            return
+        }
+
         // Data doesn't matter, but we do need to set the type.
         let pasteboardItem = NSPasteboardItem()
         pasteboardItem.setData(Data(), forType: .layoutBarItem)
@@ -366,6 +490,18 @@ final class LayoutBarItemView: NSView {
         draggingItem.setDraggingFrame(displayedImageRect, contents: displayedImage)
 
         beginDraggingSession(with: [draggingItem], event: event, source: self)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard isLocalDragActive else {
+            super.mouseUp(with: event)
+            return
+        }
+        if let root = window?.contentView,
+           let target = LayoutBarPaddingView.localDropTarget(in: root, at: event.locationInWindow) {
+            target.acceptLocalDrop(item: item, at: event.locationInWindow)
+        }
+        finishLocalDrag()
     }
 }
 

@@ -33,8 +33,8 @@ final class ControlItem {
         /// the given hiding state.
         func length(for state: HidingState) -> CGFloat {
             if #available(macOS 27.0, *) {
-                // macOS 27 no longer reflows adjacent items around an oversized
-                // status item. Logical section hiding is handled separately.
+                // A separate blank native spacer handles overflow. This button
+                // keeps its normal width and remains clickable in both states.
                 return Lengths.standard
             }
             return switch self {
@@ -72,7 +72,7 @@ final class ControlItem {
             ControlItemDefaults.preflightSetup(for: controlItem)
 
             self.statusItem = NSStatusBar.system.statusItem(withLength: 0)
-            self.statusItem.autosaveName = controlItem.identifier.rawValue
+            self.statusItem.autosaveName = controlItem.autosaveName
 
             if let button = statusItem.button {
                 button.setAccessibilityIdentifier(controlItem.identifier.rawValue)
@@ -96,7 +96,13 @@ final class ControlItem {
 
                 button.target = controlItem
                 button.action = #selector(controlItem.performAction)
-                button.sendAction(on: [.leftMouseDown, .rightMouseUp])
+                if #available(macOS 27.0, *) {
+                    // Finish the physical click before a requested hide can
+                    // realign our own boundary with a native Command-drag.
+                    button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+                } else {
+                    button.sendAction(on: [.leftMouseDown, .rightMouseUp])
+                }
             } else {
                 self.constraint = nil
             }
@@ -121,9 +127,7 @@ final class ControlItem {
     @Published var state = HidingState.hideSection {
         didSet {
             guard state != oldValue else { return }
-            // Keep the Ice glyph and the macOS 27 visibility assertion in the
-            // same event turn. Dispatching this through Combine made a click
-            // look like two separate, slightly delayed transitions.
+            // Keep the button's appearance in the same event turn as its state.
             updateStatusItem()
         }
     }
@@ -143,6 +147,18 @@ final class ControlItem {
     /// The control item's identifier.
     let identifier: Identifier
 
+    /// A fresh native identity avoids inheriting experimental host positions.
+    var autosaveName: String {
+        if #available(macOS 27.0, *), identifier == .visible {
+            return identifier.rawValue + ".native.v1"
+        }
+        return identifier.rawValue
+    }
+
+    var preferredPosition: CGFloat {
+        ControlItemDefaults[.preferredPosition, autosaveName] ?? 0
+    }
+
     /// Lazy storage for the control item's underlying status item.
     private lazy var storage = StatusItemStorage(controlItem: self)
 
@@ -151,12 +167,6 @@ final class ControlItem {
 
     /// Storage for internal observers.
     private var cancellables = Set<AnyCancellable>()
-
-    /// Restores the normal status-item length after a one-frame macOS 27
-    /// MenuBarAgent layout invalidation.
-    private var macOS27PositionRefreshTask: Task<Void, Never>?
-    private var macOS27PositionRefreshBaseline: CGFloat?
-    private var macOS27PositionRefreshGeneration = 0
 
     /// The control item's underlying status item.
     private var statusItem: NSStatusItem {
@@ -356,10 +366,6 @@ final class ControlItem {
             return
         }
 
-        button.font = NSFont.boldSystemFont(ofSize: NSFont.systemFontSize)
-        button.title = ""
-        button.image = nil
-
         if #available(macOS 27.0, *), identifier != .visible {
             // Section membership is assignment-backed on macOS 27. Publishing
             // the old divider status items creates a second Ice-looking item
@@ -368,9 +374,15 @@ final class ControlItem {
             // obsolete status items from MenuBarAgent entirely.
             removeFromMenuBar()
             constraint?.isActive = false
-            statusItem.length = 0
+            if statusItem.length != 0 { statusItem.length = 0 }
             return
         }
+
+        let font = NSFont.boldSystemFont(ofSize: NSFont.systemFontSize)
+        if button.font != font { button.font = font }
+        if !button.title.isEmpty { button.title = "" }
+        // Avoid temporarily clearing the native button between two images.
+        if #unavailable(macOS 27.0) { button.image = nil }
 
         switch identifier {
         case .visible:
@@ -431,63 +443,6 @@ final class ControlItem {
         }
     }
 
-    /// Makes MenuBarAgent consume a synchronized preferred-position update
-    /// without restarting it or moving the pointer. Switching the visible Ice
-    /// item from variable length to its already-rendered width invalidates the
-    /// hosted layout while keeping the item's geometry unchanged.
-    func requestMacOS27PositionRefresh() {
-        guard #available(macOS 27.0, *), identifier == .visible else { return }
-
-        macOS27PositionRefreshGeneration += 1
-        let generation = macOS27PositionRefreshGeneration
-        macOS27PositionRefreshTask?.cancel()
-        if let baseline = macOS27PositionRefreshBaseline {
-            statusItem.length = baseline
-            macOS27PositionRefreshBaseline = nil
-        }
-
-        macOS27PositionRefreshTask = Task { @MainActor [weak self] in
-            // Let cfprefsd deliver the cross-process write before asking
-            // MenuBarAgent to recalculate the hosted item order.
-            try? await Task.sleep(for: .milliseconds(50))
-            guard
-                let self,
-                !Task.isCancelled,
-                generation == macOS27PositionRefreshGeneration
-            else {
-                return
-            }
-
-            let baseline = statusItem.length
-            let renderedWidth = statusItem.button?.bounds.width ?? 0
-            guard renderedWidth > 0 else {
-                macOS27PositionRefreshTask = nil
-                return
-            }
-            let temporaryLength = if
-                baseline == NSStatusItem.variableLength ||
-                abs(baseline - renderedWidth) > 0.25
-            {
-                renderedWidth
-            } else {
-                renderedWidth + 0.5
-            }
-
-            macOS27PositionRefreshBaseline = baseline
-            statusItem.length = temporaryLength
-            try? await Task.sleep(for: .milliseconds(16))
-            guard
-                !Task.isCancelled,
-                generation == macOS27PositionRefreshGeneration
-            else {
-                return
-            }
-            statusItem.length = baseline
-            macOS27PositionRefreshBaseline = nil
-            macOS27PositionRefreshTask = nil
-        }
-    }
-
     /// Updates the visibility of the status item.
     ///
     /// The hidden and always-hidden control items must always be present in
@@ -503,7 +458,8 @@ final class ControlItem {
 
         if isVisible {
             constraint?.isActive = true
-            statusItem.length = identifier.length(for: state)
+            let length = identifier.length(for: state)
+            if statusItem.length != length { statusItem.length = length }
         } else {
             let showOnDrag = appState.settings.advanced.showAllSectionsOnUserDrag
             let isDragging = appState.isDraggingMenuBarItem
@@ -563,14 +519,15 @@ final class ControlItem {
             return
         }
 
-        // The button sends its ordinary action on mouse-down. Accessibility
+        // The button sends its ordinary action on mouse-up on macOS 27. Accessibility
         // presses can arrive with no event, an application-defined event, or
         // NSApp's last unrelated event. Only trust modifiers from a fresh
-        // mouse-down that belongs to this status item's own window; otherwise
+        // mouse event that belongs to this status item's own window; otherwise
         // a preceding Command-drag can make the next press look like another
         // reorder gesture and silently discard it.
-        let eventIsFreshButtonMouseDown = eventIsFreshButtonEvent && event?.type == .leftMouseDown
-        let modifierFlags = eventIsFreshButtonMouseDown ? event?.modifierFlags ?? [] : []
+        let eventIsFreshButtonClick = eventIsFreshButtonEvent &&
+            (event?.type == .leftMouseDown || event?.type == .leftMouseUp)
+        let modifierFlags = eventIsFreshButtonClick ? event?.modifierFlags ?? [] : []
 
         // Command-click is the start of the system's native status-item
         // reorder gesture. It must not also toggle the hidden section.
@@ -586,18 +543,18 @@ final class ControlItem {
         if
             modifierFlags == .option,
             let section = menuBarManager.section(withName: .alwaysHidden),
-            section.isEnabled
+            section.canToggleVisibility
         {
-            menuBarManager.noteMacOS27ControlToggle()
+            menuBarManager.prepareForControlToggle()
             section.toggle()
             return
         }
 
         if
             let section = menuBarManager.section(withName: sectionName),
-            section.isEnabled
+            section.canToggleVisibility
         {
-            menuBarManager.noteMacOS27ControlToggle()
+            menuBarManager.prepareForControlToggle()
             section.toggle()
         }
     }
@@ -633,7 +590,9 @@ final class ControlItem {
             searchItem.keyEquivalentModifierMask = keyCombination.modifiers.nsEventFlags
         }
         searchItem.target = self
-        menu.addItem(searchItem)
+        if #unavailable(macOS 27.0) {
+            menu.addItem(searchItem)
+        }
 
         menu.addItem(.separator())
 
@@ -641,7 +600,7 @@ final class ControlItem {
         for name: MenuBarSection.Name in [.hidden, .alwaysHidden] {
             guard
                 let section = appState.menuBarManager.section(withName: name),
-                section.isEnabled
+                section.canToggleVisibility
             else {
                 continue
             }
@@ -699,6 +658,7 @@ final class ControlItem {
         guard let section = menuItem.representedObject as? MenuBarSection else {
             return
         }
+        appState?.menuBarManager.prepareForControlToggle()
         section.toggle()
     }
 
@@ -746,8 +706,13 @@ enum ControlItemDefaults {
 
     /// Performs some initial required setup work before the
     /// creation of a control item.
-    fileprivate static func preflightSetup(for controlItem: ControlItem) {
-        let autosaveName = controlItem.identifier.rawValue
+    @MainActor fileprivate static func preflightSetup(for controlItem: ControlItem) {
+        let autosaveName = controlItem.autosaveName
+
+        if #available(macOS 27.0, *), controlItem.identifier == .visible,
+           Self[.preferredPosition, autosaveName] == nil {
+            Self[.preferredPosition, autosaveName] = Self[.preferredPosition, controlItem.identifier.rawValue]
+        }
 
         // Visible and hidden control items should be added before
         // existing items in the status bar.

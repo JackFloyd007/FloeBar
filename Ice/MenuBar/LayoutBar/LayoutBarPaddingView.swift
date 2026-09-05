@@ -10,6 +10,82 @@ import OSLog
 /// A Cocoa view that manages the menu bar layout interface.
 final class LayoutBarPaddingView: NSView {
     private let container: LayoutBarContainer
+    private var localDropIndicatorX: CGFloat?
+
+    /// Only inspect views in Ice's own Settings window; no global input monitor.
+    static func localDropTarget(in view: NSView, at windowPoint: CGPoint) -> LayoutBarPaddingView? {
+        guard !view.isHiddenOrHasHiddenAncestor else { return nil }
+        if let target = view as? LayoutBarPaddingView,
+           target.visibleRect.contains(target.convert(windowPoint, from: nil)) {
+            return target
+        }
+        for child in view.subviews {
+            if let target = localDropTarget(in: child, at: windowPoint) { return target }
+        }
+        return nil
+    }
+
+    private func localInsertion(for item: MenuBarItem, at windowPoint: CGPoint) -> (views: [LayoutBarItemView], index: Int) {
+        let views = arrangedViews.filter { $0.item.tag != item.tag }
+        let x = container.convert(windowPoint, from: nil).x
+        return (views, views.firstIndex { x < $0.frame.midX } ?? views.endIndex)
+    }
+
+    func showLocalDropIndicator(for item: MenuBarItem, at windowPoint: CGPoint) {
+        let insertion = localInsertion(for: item, at: windowPoint)
+        let x = insertion.views.indices.contains(insertion.index)
+            ? insertion.views[insertion.index].frame.minX - LayoutBarContainer.itemSpacing / 2
+            : (insertion.views.last?.frame.maxX ?? 0) + LayoutBarContainer.itemSpacing / 2
+        localDropIndicatorX = convert(CGPoint(x: x, y: 0), from: container).x
+        needsDisplay = true
+    }
+
+    func clearLocalDropIndicator() {
+        localDropIndicatorX = nil
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        if let x = localDropIndicatorX {
+            NSColor.controlAccentColor.withAlphaComponent(0.05).setFill()
+            NSBezierPath(roundedRect: visibleRect.insetBy(dx: 2, dy: 2), xRadius: 9, yRadius: 9).fill()
+            NSColor.controlAccentColor.setFill()
+            NSBezierPath(roundedRect: CGRect(x: x - 1.5, y: bounds.midY - 27, width: 3, height: 54), xRadius: 1.5, yRadius: 1.5).fill()
+        }
+    }
+
+    func acceptLocalDrop(item: MenuBarItem, at windowPoint: CGPoint) {
+        guard let appState = container.appState else { return }
+        let insertion = localInsertion(for: item, at: windowPoint)
+        // Dropping an item back into its own position is a no-op, including
+        // an otherwise empty row. Never start a native drag for this case.
+        if let originalIndex = arrangedViews.firstIndex(where: { $0.item.tag == item.tag }),
+           originalIndex == insertion.index {
+            return
+        }
+        let destination: MenuBarItemManager.MoveDestination?
+        if insertion.views.indices.contains(insertion.index) {
+            destination = .leftOfItem(insertion.views[insertion.index].item)
+        } else if let last = insertion.views.last {
+            destination = .rightOfItem(last.item)
+        } else {
+            destination = nil
+        }
+        Task {
+            do {
+                if let destination {
+                    try await appState.itemManager.move(
+                        item: item, to: destination, requiredSection: container.section
+                    )
+                } else {
+                    try await appState.itemManager.move(item: item, toSection: container.section)
+                }
+            } catch {
+                NSAlert(error: error).runModal()
+            }
+        }
+    }
 
     /// The layout view's arranged views.
     var arrangedViews: [LayoutBarItemView] {
@@ -30,11 +106,21 @@ final class LayoutBarPaddingView: NSView {
         addSubview(container)
         self.translatesAutoresizingMaskIntoConstraints = false
 
-        NSLayoutConstraint.activate([
-            container.centerYAnchor.constraint(equalTo: centerYAnchor),
-            trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: 7.5),
-            leadingAnchor.constraint(lessThanOrEqualTo: container.leadingAnchor, constant: -7.5),
-        ])
+        var constraints = [container.centerYAnchor.constraint(equalTo: centerYAnchor)]
+        if #available(macOS 27.0, *) {
+            // Only real items occupy positions. The remaining row is a single
+            // append target, not a right-aligned bank of empty slots.
+            constraints += [
+                container.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+                trailingAnchor.constraint(greaterThanOrEqualTo: container.trailingAnchor, constant: 12),
+            ]
+        } else {
+            constraints += [
+                trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: 7.5),
+                leadingAnchor.constraint(lessThanOrEqualTo: container.leadingAnchor, constant: -7.5),
+            ]
+        }
+        NSLayoutConstraint.activate(constraints)
 
         registerForDraggedTypes([.layoutBarItem])
     }
@@ -176,10 +262,8 @@ final class LayoutBarPaddingView: NSView {
                     let rollbackOrigin,
                     rollbackOrigin.container !== container
                 {
-                    // Cross Ice and reach the exact target in one compositor-
-                    // frozen transaction. The manager verifies both adjacency
-                    // and the requested side of Ice, avoiding the former pair
-                    // of complete read/drag/verify passes for one drop.
+                    // The drop already knows its destination section. Preserve
+                    // that intent when selecting the physical target.
                     try await appState.itemManager.move(
                         item: view.item,
                         to: destination,

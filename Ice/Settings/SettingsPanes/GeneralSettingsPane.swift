@@ -41,17 +41,19 @@ struct GeneralSettingsPane: View {
             IceSection {
                 iceIconOptions
             }
-            IceSection {
-                iceBarOptions
-            }
-            IceSection {
-                showOptions
-            }
-            IceSection {
-                rehideOptions
-            }
-            IceSection {
-                spacingOptions
+            if #unavailable(macOS 27.0) {
+                IceSection {
+                    iceBarOptions
+                }
+                IceSection {
+                    showOptions
+                }
+                IceSection {
+                    rehideOptions
+                }
+                IceSection {
+                    spacingOptions
+                }
             }
         }
     }
