@@ -127,7 +127,9 @@ enum MenuBarGlyphImage {
                 bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue),
                 provider: provider,
                 decode: nil,
-                shouldInterpolate: true,
+                // Layout draws this image at the capture's exact backing scale.
+                // Interpolating a second time softens one-pixel menu-bar strokes.
+                shouldInterpolate: false,
                 intent: .defaultIntent
             ) else { return nil }
         return Result(image: result, isTemplate: isTemplate)

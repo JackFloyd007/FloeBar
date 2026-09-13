@@ -112,6 +112,33 @@ enum MacOS27MenuBarItemProvider {
         )
     }
 
+    /// Returns the live frame of MenuBarAgent's automatic overflow control.
+    /// The control has no identifier or AX action, so callers use its verified
+    /// frame for one ordinary click before resolving concealed item endpoints.
+    static func nativeOverflowControlBounds() -> CGRect? {
+        guard AXHelpers.isProcessTrusted(),
+            let application = NSWorkspace.shared.runningApplications.first(where: {
+                $0.bundleIdentifier == "com.apple.MenuBarAgent"
+            }) else { return nil }
+        return AXHelpers.performOnMain { () -> CGRect? in
+            guard let root = AXHelpers.application(for: application),
+                let menuBar = AXHelpers.extrasMenuBar(for: root) else { return nil }
+            guard let control = AXHelpers.children(for: menuBar).first(where: {
+                isNativeOverflowControl($0)
+            }) else { return nil }
+            return AXHelpers.frame(for: control)
+        }
+    }
+
+    /// Confirms that an AX frame still belongs to the item which published it.
+    /// Concealed hosted scenes can retain an on-bar frame that is actually
+    /// occupied by MenuBarAgent's overflow button.
+    static func nativeHitMatches(_ item: MenuBarItem) -> Bool {
+        guard let hit = AXHelpers.element(at: item.bounds.center),
+            AXHelpers.pid(for: hit) == item.ownerPID else { return false }
+        return AXHelpers.frame(for: hit)?.contains(item.bounds.center) == true
+    }
+
     private static func menuBarItems(
         from runningApplications: [NSRunningApplication],
         displayBounds: CGRect?,
@@ -298,7 +325,9 @@ enum MacOS27MenuBarItemProvider {
                     bounds: frame,
                     ownerPID: ownerPID,
                     accessibilityHelp: accessibilityHelp,
-                    accessibilityValue: accessibilityValue
+                    accessibilityValue: accessibilityValue,
+                    isNativeOverflowControl: namespace == .controlCenter &&
+                        isNativeOverflowControl(child)
                 )
             )
         }
@@ -313,6 +342,7 @@ enum MacOS27MenuBarItemProvider {
         let ownerPID: pid_t
         let accessibilityHelp: String?
         let accessibilityValue: String?
+        let isNativeOverflowControl: Bool
     }
 
     private static func assemble(_ rawItems: [RawItem]) -> [MenuBarItem] {
@@ -332,7 +362,8 @@ enum MacOS27MenuBarItemProvider {
         })
 
         return sorted.compactMap { rawItem in
-            guard !isNativeOverflowPlaceholder(rawItem.identityTitle) else {
+            guard !rawItem.isNativeOverflowControl,
+                !isNativeOverflowPlaceholder(rawItem.identityTitle) else {
                 return nil
             }
             if rawItem.identityTitle.hasPrefix(MacOS27RuntimeItemIdentity.prefix) {
@@ -397,6 +428,20 @@ enum MacOS27MenuBarItemProvider {
         guard let string else { return nil }
         let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func isNativeOverflowControl(_ element: UIElement) -> Bool {
+        guard let frame = AXHelpers.frame(for: element) else { return false }
+        let descendants = AXHelpers.children(for: element)
+        let hasIdentifier = nonEmpty(AXHelpers.identifier(for: element)) != nil ||
+            descendants.contains { nonEmpty(AXHelpers.identifier(for: $0)) != nil }
+        let hasDescription = nonEmpty(AXHelpers.description(for: element)) != nil
+        return MacOS27NativeBoundary.isSystemOverflowControl(
+            frame: frame,
+            hasIdentifier: hasIdentifier,
+            hasDescription: hasDescription,
+            isButton: AXHelpers.role(for: element) == .button
+        )
     }
 
     private static func isNativeOverflowPlaceholder(_ title: String) -> Bool {

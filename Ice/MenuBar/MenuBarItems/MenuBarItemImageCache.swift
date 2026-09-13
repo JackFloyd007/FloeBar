@@ -58,6 +58,10 @@ final class MenuBarItemImageCache: ObservableObject {
 
         /// The menu bar items excluded from the capture.
         var excluded = [MenuBarItem]()
+
+        /// Cached pixels for these tags came from a different native hit target
+        /// and must not be retained while the real item is overflowed.
+        var invalidatedTags = Set<MenuBarItemTag>()
     }
 
     /// The cached item images, keyed by their corresponding tags.
@@ -280,8 +284,12 @@ final class MenuBarItemImageCache: ObservableObject {
                     MacOS27MenuBarItemProvider.menuBarItems(sourcePIDs: sourcePIDs, namespaces: namespaces)
                 }.value
                 let stableItems = liveItems.filter { item in
-                    afterCapture.first(matching: item.tag)?.bounds == item.bounds
+                    afterCapture.first(matching: item.tag)?.bounds == item.bounds &&
+                        MacOS27MenuBarItemProvider.nativeHitMatches(item)
                 }
+                result.invalidatedTags.formUnion(liveItems.filter {
+                    !MacOS27MenuBarItemProvider.nativeHitMatches($0)
+                }.map(\.tag))
                 appendMacOS27Crops(
                     for: stableItems, from: capture, into: &result
                 )
@@ -427,6 +435,7 @@ final class MenuBarItemImageCache: ObservableObject {
 
         let scale = screen.backingScaleFactor
         var newImages = [MenuBarItemTag: CapturedImage]()
+        var invalidatedTags = Set<MenuBarItemTag>()
         let controller = appState.menuBarManager.macOS27Controller
         let generation = controller.interactionGeneration
 
@@ -440,6 +449,7 @@ final class MenuBarItemImageCache: ObservableObject {
                 displayID: displayID
             )
             newImages = result.images
+            invalidatedTags = result.invalidatedTags
         } else {
             guard appState.hasPermission(.screenRecording) else { return }
 
@@ -465,7 +475,9 @@ final class MenuBarItemImageCache: ObservableObject {
                 controller.interactionGeneration == generation else { return }
         }
         let validTags = Set(appState.itemManager.itemCache.managedItems.map(\.tag))
-        var updatedImages = images.filter { validTags.contains($0.key) }
+        var updatedImages = images.filter {
+            validTags.contains($0.key) && !invalidatedTags.contains($0.key)
+        }
         updatedImages.merge(newImages) { old, new in
             if CapturedImage.isVisuallyEqual(old, new) {
                 return old

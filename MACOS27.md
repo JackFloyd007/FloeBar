@@ -1,6 +1,6 @@
 # macOS 27 native interaction
 
-Current installed development build: `0.12.0-macos27.128 (1327)` at
+Current installed development build: `0.12.0-macos27.129 (1328)` at
 `/Applications/Ice.app`. It removes the unnecessary full wait and stale hit-map
 prerequisite from ordinary, settled-pair hiding, and cleans up failed hiding
 handles. **Rapid-toggle visual acceptance still fails:** the current native

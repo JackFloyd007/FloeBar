@@ -71,6 +71,29 @@ enum MacOS27NativeBoundary {
             strip.contains(source) && strip.contains(target)
     }
 
+    /// Returns a point inside the requested half of a native status item.
+    /// Dropping just outside an item's frame is ambiguous when the neighboring
+    /// item is Ice's section boundary: on some macOS 27 builds that point still
+    /// belongs to the boundary hit area and the item never crosses sections.
+    static func dragDestinationX(target: CGRect, placingBefore: Bool) -> CGFloat {
+        let inset = min(8, max(2, target.width / 4))
+        return placingBefore ? target.minX + inset : target.maxX - inset
+    }
+
+    /// MenuBarAgent's automatic overflow control has no stable identifier and
+    /// its description is localized. Its compact button geometry and lack of a
+    /// descendant identifier distinguish it from real Control Center extras.
+    static func isSystemOverflowControl(
+        frame: CGRect,
+        hasIdentifier: Bool,
+        hasDescription: Bool,
+        isButton: Bool
+    ) -> Bool {
+        !hasIdentifier && hasDescription && isButton &&
+            frame.width > 0 && frame.width <= 22 &&
+            frame.height >= 28 && frame.height <= 34
+    }
+
     static func isImmediatelyBefore<Item: Equatable>(
         _ boundary: Item, _ control: Item, in order: [Item]
     ) -> Bool {

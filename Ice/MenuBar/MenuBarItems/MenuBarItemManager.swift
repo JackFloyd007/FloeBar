@@ -1278,6 +1278,43 @@ extension MenuBarItemManager {
         }.value
     }
 
+    /// Clicks MenuBarAgent's native overflow control so concealed items expose
+    /// usable hit targets before macOS 27 status-item reordering begins.
+    @available(macOS 27.0, *)
+    private nonisolated func postMacOS27OverflowClick(at point: CGPoint) async throws {
+        try Task.checkCancellation()
+        let originalMouseLocation = try getMouseLocation()
+        let source = try getEventSource(with: .combinedSessionState)
+        try permitLocalEvents()
+        guard let mouseDown = CGEvent(
+            mouseEventSource: source,
+            mouseType: .leftMouseDown,
+            mouseCursorPosition: point,
+            mouseButton: .left
+        ), let mouseUp = CGEvent(
+            mouseEventSource: source,
+            mouseType: .leftMouseUp,
+            mouseCursorPosition: point,
+            mouseButton: .left
+        ) else { throw EventError.cannotComplete }
+        mouseDown.flags = .maskNonCoalesced
+        mouseUp.flags = .maskNonCoalesced
+        var mouseIsDown = false
+        MouseHelpers.hideCursor()
+        defer {
+            if mouseIsDown { mouseUp.post(tap: .cghidEventTap) }
+            MouseHelpers.warpCursor(to: originalMouseLocation)
+            MouseHelpers.showCursor()
+        }
+        MouseHelpers.warpCursor(to: point)
+        await eventSleep(for: .milliseconds(24))
+        mouseDown.post(tap: .cghidEventTap)
+        mouseIsDown = true
+        await eventSleep(for: .milliseconds(55))
+        mouseUp.post(tap: .cghidEventTap)
+        mouseIsDown = false
+    }
+
     /// Posts the native Command-drag that MenuBarAgent uses for macOS 27
     /// status-item reordering, for Layout or alignment of Ice's own boundary.
     @available(macOS 27.0, *)
@@ -1290,8 +1327,10 @@ extension MenuBarItemManager {
         let targetBounds = destination.targetItem.bounds
         let start = itemBounds.center
         let endX = switch destination {
-        case .leftOfItem: targetBounds.minX - 3
-        case .rightOfItem: targetBounds.maxX + 3
+        case .leftOfItem:
+            MacOS27NativeBoundary.dragDestinationX(target: targetBounds, placingBefore: true)
+        case .rightOfItem:
+            MacOS27NativeBoundary.dragDestinationX(target: targetBounds, placingBefore: false)
         }
         let end = CGPoint(
             x: endX,
@@ -1401,9 +1440,40 @@ extension MenuBarItemManager {
         var snapshot = contextItems
         for _ in 0 ..< 2 {
             guard !Task.isCancelled,
-                let liveItem = snapshot.first(matching: item.tag),
-                let liveTarget = snapshot.first(matching: destination.targetItem.tag)
+                var liveItem = snapshot.first(matching: item.tag),
+                var liveTarget = snapshot.first(matching: destination.targetItem.tag)
             else { return false }
+            if !isOwnBoundaryAlignment &&
+                (!MacOS27MenuBarItemProvider.nativeHitMatches(liveItem) ||
+                    !MacOS27MenuBarItemProvider.nativeHitMatches(liveTarget)) {
+                guard let overflowBounds = MacOS27MenuBarItemProvider.nativeOverflowControlBounds() else {
+                    logger.error("Refusing native drag because an endpoint does not match the native hit map")
+                    return false
+                }
+                do {
+                    try await postMacOS27OverflowClick(at: overflowBounds.center)
+                } catch {
+                    logger.error("Could not reveal macOS 27 overflow items: \(error, privacy: .public)")
+                    return false
+                }
+                var resolvedEndpoints: (MenuBarItem, MenuBarItem)?
+                for _ in 0 ..< 12 {
+                    try? await Task.sleep(for: .milliseconds(80))
+                    guard !Task.isCancelled else { return false }
+                    snapshot = await currentMacOS27ReorderSnapshot(appState: appState)
+                    guard let candidateItem = snapshot.first(matching: item.tag),
+                        let candidateTarget = snapshot.first(matching: destination.targetItem.tag),
+                        MacOS27MenuBarItemProvider.nativeHitMatches(candidateItem),
+                        MacOS27MenuBarItemProvider.nativeHitMatches(candidateTarget) else { continue }
+                    resolvedEndpoints = (candidateItem, candidateTarget)
+                    break
+                }
+                guard let resolvedEndpoints else {
+                    logger.error("macOS 27 overflow item did not publish a usable native hit target")
+                    return false
+                }
+                (liveItem, liveTarget) = resolvedEndpoints
+            }
             guard NSScreen.screens.contains(where: {
                 MacOS27NativeBoundary.canDrag(
                     from: liveItem.bounds, to: liveTarget.bounds, on: CGDisplayBounds($0.displayID)

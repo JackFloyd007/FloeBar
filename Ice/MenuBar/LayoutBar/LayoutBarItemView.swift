@@ -102,11 +102,17 @@ final class LayoutBarItemView: NSView {
     }
 
     private var displayedImageRect: CGRect {
-        CGRect(
-            x: bounds.midX - (displayedImageSize.width / 2),
-            y: (thumbnailHeight == nil ? bounds.midY : bounds.midY + 10) - (displayedImageSize.height / 2),
-            width: displayedImageSize.width,
-            height: displayedImageSize.height
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1
+        func aligned(_ value: CGFloat) -> CGFloat {
+            (value * scale).rounded() / scale
+        }
+        let width = aligned(displayedImageSize.width)
+        let height = aligned(displayedImageSize.height)
+        return CGRect(
+            x: aligned(bounds.midX - (width / 2)),
+            y: aligned((thumbnailHeight == nil ? bounds.midY : bounds.midY + 10) - (height / 2)),
+            width: width,
+            height: height
         )
     }
 
@@ -340,6 +346,7 @@ final class LayoutBarItemView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         if !isDraggingPlaceholder {
             if #available(macOS 27.0, *) { drawThumbnailBackgroundAndLabel() }
+            NSGraphicsContext.current?.imageInterpolation = .none
             if displayedImageIsTemplate,
                 let image = displayedImage?.cgImage(forProposedRect: nil, context: nil, hints: nil),
                 let context = NSGraphicsContext.current?.cgContext {

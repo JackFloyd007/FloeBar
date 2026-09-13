@@ -64,6 +64,25 @@ enum NativeMenuBarBoundaryTests {
               "retained overflow geometry cannot enter the quick path")
         check(!MacOS27NativeBoundary.canCheckImmediateHide(boundary: CGRect(x: CGFloat.nan, y: 4, width: 3, height: 24), control: ice, display: display),
               "non-finite geometry cannot enter the quick path")
+        let target = frame(334, width: 32)
+        let before = MacOS27NativeBoundary.dragDestinationX(target: target, placingBefore: true)
+        let after = MacOS27NativeBoundary.dragDestinationX(target: target, placingBefore: false)
+        check(before > target.minX && before < target.midX,
+              "a before-drop lands inside the target's left half")
+        check(after > target.midX && after < target.maxX,
+              "an after-drop lands inside the target's right half")
+        check(MacOS27NativeBoundary.dragDestinationX(target: frame(334, width: 3), placingBefore: true) < 337,
+              "a narrow target keeps its drop point inside its bounds")
+        let overflow = CGRect(x: 848.5, y: 1, width: 17.5, height: 30)
+        check(MacOS27NativeBoundary.isSystemOverflowControl(
+            frame: overflow, hasIdentifier: false, hasDescription: true, isButton: true
+        ), "a localized MenuBarAgent overflow button is recognized structurally")
+        check(!MacOS27NativeBoundary.isSystemOverflowControl(
+            frame: overflow, hasIdentifier: true, hasDescription: true, isButton: true
+        ), "an identified Control Center item is not treated as overflow")
+        check(!MacOS27NativeBoundary.isSystemOverflowControl(
+            frame: frame(848, width: 18), hasIdentifier: false, hasDescription: true, isButton: true
+        ), "an ordinary-height unidentified status item is retained")
         print("\(assertions) native-boundary assertions passed")
     }
 }
