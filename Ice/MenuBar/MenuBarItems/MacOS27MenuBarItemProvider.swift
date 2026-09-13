@@ -278,8 +278,8 @@ enum MacOS27MenuBarItemProvider {
             let identityTitle = if namespace == .textInputMenuAgent {
                 "Item-\(childIndex)"
             } else if identifier == nil,
-                      runningApp.bundleIdentifier != Constants.bundleIdentifier,
-                      runningApp.bundleIdentifier?.hasPrefix("com.apple.") != true {
+                runningApp.bundleIdentifier != Constants.bundleIdentifier,
+                runningApp.bundleIdentifier?.hasPrefix("com.apple.") != true {
                 runtimeIdentities.identity(
                     for: child.element,
                     owner: runtimeOwner(runningApp),
@@ -327,7 +327,7 @@ enum MacOS27MenuBarItemProvider {
         var nextIndexByIdentity = [String: Int]()
         let ambiguousRuntimeItems = Set(Dictionary(grouping: rawItems, by: \.identityTitle).compactMap { title, items in
             guard title.hasPrefix(MacOS27RuntimeItemIdentity.prefix), let first = items.first,
-                  items.contains(where: { $0.bounds != first.bounds }) else { return nil as String? }
+                items.contains(where: { $0.bounds != first.bounds }) else { return nil as String? }
             return title
         })
 
@@ -337,7 +337,7 @@ enum MacOS27MenuBarItemProvider {
             }
             if rawItem.identityTitle.hasPrefix(MacOS27RuntimeItemIdentity.prefix) {
                 guard !ambiguousRuntimeItems.contains(rawItem.identityTitle),
-                      seenRuntimeItems.insert(rawItem.identityTitle).inserted else { return nil }
+                    seenRuntimeItems.insert(rawItem.identityTitle).inserted else { return nil }
             }
 
             // AppKit publishes both the primary scene and a presentation

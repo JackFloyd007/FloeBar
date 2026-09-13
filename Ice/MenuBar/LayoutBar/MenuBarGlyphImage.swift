@@ -18,7 +18,7 @@ enum MenuBarGlyphImage {
         let width = image.width
         let height = image.height
         guard width > 2, height > 2, width <= 1024, height <= 256,
-              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+            let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
         var pixels = [UInt8](repeating: 0, count: width * height * 4)
         let decoded = pixels.withUnsafeMutableBytes { bytes -> Bool in
             guard let context = CGContext(
@@ -117,7 +117,7 @@ enum MenuBarGlyphImage {
         }
 
         guard let provider = CGDataProvider(data: Data(output) as CFData),
-              let result = CGImage(
+            let result = CGImage(
                 width: width,
                 height: height,
                 bitsPerComponent: 8,
@@ -129,7 +129,7 @@ enum MenuBarGlyphImage {
                 decode: nil,
                 shouldInterpolate: true,
                 intent: .defaultIntent
-              ) else { return nil }
+            ) else { return nil }
         return Result(image: result, isTemplate: isTemplate)
     }
 }

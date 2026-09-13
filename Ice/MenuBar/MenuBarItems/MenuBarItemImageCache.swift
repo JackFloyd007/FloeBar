@@ -273,7 +273,7 @@ final class MenuBarItemImageCache: ObservableObject {
             )
             let liveItems = capturable.compactMap { refreshedByTag[$0.tag] }
             if let capture = await ScreenCapture.captureMenuBarDisplayStrip(displayID: displayID),
-               isPlausibleMacOS27Capture(capture) {
+                isPlausibleMacOS27Capture(capture) {
                 // A drag can occur while the screenshot is being produced.
                 // Only associate pixels with an item whose frame stayed put.
                 let afterCapture = await Task.detached(priority: .userInitiated) {
@@ -368,7 +368,7 @@ final class MenuBarItemImageCache: ObservableObject {
             }
 
             guard let image = capture.image.cropping(to: cropRect),
-                  !image.isTransparent(alphaThreshold: 0.05) else { continue }
+                !image.isTransparent(alphaThreshold: 0.05) else { continue }
 
             cropOwners[cropRect] = item.tag
             result.images[item.tag] = CapturedImage(
@@ -462,7 +462,7 @@ final class MenuBarItemImageCache: ObservableObject {
         guard !Task.isCancelled, appState.itemManager.itemCache.displayID == displayID else { return }
         if #available(macOS 27.0, *) {
             guard controller.isLayoutEditing, !controller.isReorderInProgress,
-                  controller.interactionGeneration == generation else { return }
+                controller.interactionGeneration == generation else { return }
         }
         let validTags = Set(appState.itemManager.itemCache.managedItems.map(\.tag))
         var updatedImages = images.filter { validTags.contains($0.key) }

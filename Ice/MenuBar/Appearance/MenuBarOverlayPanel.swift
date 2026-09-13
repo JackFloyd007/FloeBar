@@ -372,12 +372,12 @@ final class MenuBarOverlayPanel: NSPanel {
 
         let windows = WindowInfo.createWindows(option: .onScreen)
         guard validate(for: .showing, with: windows),
-              let menuBarWindow = WindowInfo.menuBarWindow(from: windows, for: owningScreen.displayID),
-              let newFrame = MenuBarOverlayGeometry.frame(
-                  screen: owningScreen.frame,
-                  menuBarHeight: menuBarWindow.bounds.height,
-                  inset: appState.appearanceManager.menuBarInsetAmount
-              )
+            let menuBarWindow = WindowInfo.menuBarWindow(from: windows, for: owningScreen.displayID),
+            let newFrame = MenuBarOverlayGeometry.frame(
+                screen: owningScreen.frame,
+                menuBarHeight: menuBarWindow.bounds.height,
+                inset: appState.appearanceManager.menuBarInsetAmount
+            )
         else {
             updateTaskContext.cancelAll()
             updateFlags.removeAll()

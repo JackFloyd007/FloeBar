@@ -710,7 +710,7 @@ enum ControlItemDefaults {
         let autosaveName = controlItem.autosaveName
 
         if #available(macOS 27.0, *), controlItem.identifier == .visible,
-           Self[.preferredPosition, autosaveName] == nil {
+            Self[.preferredPosition, autosaveName] == nil {
             Self[.preferredPosition, autosaveName] = Self[.preferredPosition, controlItem.identifier.rawValue]
         }
 

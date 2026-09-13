@@ -98,7 +98,7 @@ final class MacOS27MenuBarController {
         migrateTextInputIdentityIfNeeded(in: liveItems)
         seedUnassignedItems(liveItems, using: sourceItems)
         if !isReorderInProgress,
-           let iceItem = sourceItems.first(matching: .visibleControlItem) {
+            let iceItem = sourceItems.first(matching: .visibleControlItem) {
             let alwaysBoundary = sourceItems.first(matching: .nativeBoundary(for: .alwaysHidden))
             // The native bar, including manual Command-drags, is authoritative.
             for item in liveItems {
@@ -113,7 +113,7 @@ final class MacOS27MenuBarController {
                 } else if let alwaysBoundary, item.bounds.minX < alwaysBoundary.bounds.minX {
                     layout.assignments[identifier] = .alwaysHidden
                 } else if item.bounds.minX < iceItem.bounds.minX,
-                          alwaysBoundary != nil || layout.assignments[identifier] != .alwaysHidden {
+                    alwaysBoundary != nil || layout.assignments[identifier] != .alwaysHidden {
                     layout.assignments[identifier] = .hidden
                 }
             }
@@ -465,7 +465,7 @@ final class MacOS27MenuBarController {
     private func owners(of items: [MenuBarItem]) -> Set<LayoutOwners.Owner> {
         Set(items.compactMap { item in
             guard let app = NSRunningApplication(processIdentifier: item.sourcePID ?? item.ownerPID),
-                  let owner = owner(for: app), owner.namespace == item.tag.namespace else { return nil }
+                let owner = owner(for: app), owner.namespace == item.tag.namespace else { return nil }
             return owner
         })
     }
