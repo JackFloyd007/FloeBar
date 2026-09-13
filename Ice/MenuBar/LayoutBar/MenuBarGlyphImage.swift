@@ -41,47 +41,51 @@ enum MenuBarGlyphImage {
             return Result(image: image, isTemplate: false)
         }
 
-        let border = (0..<height).flatMap { y in
+        let border: [Int] = (0..<height).flatMap { y -> [Int] in
             (0..<width).compactMap { x -> Int? in
                 x < 2 || y < 2 || x >= width - 2 || y >= height - 2 ? (y * width + x) * 4 : nil
             }
         }
         // A median rejects glyph strokes touching an AX frame's edges. A
         // corner color alone can mistake such a stroke for the background.
-        let background = (0..<3).map { channel -> Double in
+        let background: [Double] = (0..<3).map { channel -> Double in
             let values = border.map { Double(pixels[$0 + channel]) / 255 }.sorted()
             return values[values.count / 2]
         }
         let luminance: ([Double]) -> Double = { $0[0] * 0.2126 + $0[1] * 0.7152 + $0[2] * 0.0722 }
         let backgroundLuminance = luminance(background)
-        let differences = offsets.map { offset in
+        let differences: [Double] = offsets.map { offset -> Double in
             luminance((0..<3).map { Double(pixels[offset + $0]) / 255 }) - backgroundLuminance
         }.sorted()
         let edgeCount = max(1, differences.count / 50)
         let bright = differences.suffix(edgeCount).reduce(0, +) / Double(edgeCount)
         let dark = -differences.prefix(edgeCount).reduce(0, +) / Double(edgeCount)
-        let colorContrasts = offsets.map { offset in
+        let colorContrasts: [Double] = offsets.map { offset -> Double in
             (0..<3).map { abs(Double(pixels[offset + $0]) / 255 - background[$0]) }.max() ?? 0
         }
         // Saturated colors may have exactly the background's luminance.
         // Detect foreground in RGB, not brightness alone.
         guard colorContrasts.max() ?? 0 > 0.08 else { return nil }
         let foreground: Double = bright >= dark ? 1 : 0
-        let direction = background.map { foreground - $0 }
-        let denominator = direction.reduce(0) { $0 + $1 * $1 }
+        let direction: [Double] = background.map { foreground - $0 }
+        let denominator: Double = direction.reduce(0.0) { partialResult, component in
+            partialResult + component * component
+        }
         guard denominator > 0.01 else { return nil }
 
         var alphas = [Double]()
         var foregroundCount = 0
         var coloredCount = 0
         for offset in offsets {
-            let color = (0..<3).map { Double(pixels[offset + $0]) / 255 }
+            let color: [Double] = (0..<3).map { Double(pixels[offset + $0]) / 255 }
             let projection = (0..<3).reduce(0.0) { $0 + (color[$1] - background[$1]) * direction[$1] }
             let alpha = max(0, min(1, projection / denominator))
             alphas.append(alpha)
             if (0..<3).contains(where: { abs(color[$0] - background[$0]) > 0.12 }) {
                 foregroundCount += 1
-                let residual = (0..<3).map { abs(color[$0] - background[$0] - alpha * direction[$0]) }.max() ?? 0
+                let residual: Double = (0..<3)
+                    .map { abs(color[$0] - background[$0] - alpha * direction[$0]) }
+                    .max() ?? 0
                 if residual > 0.07 { coloredCount += 1 }
             }
         }
@@ -97,7 +101,7 @@ enum MenuBarGlyphImage {
                 output[offset + 3] = UInt8((min(1, alpha) * 255).rounded())
             } else {
                 // Color-to-alpha unmixing preserves multicolor status glyphs.
-                let color = (0..<3).map { Double(pixels[offset + $0]) / 255 }
+                let color: [Double] = (0..<3).map { Double(pixels[offset + $0]) / 255 }
                 let alpha = (0..<3).map { channel -> Double in
                     let delta = color[channel] - background[channel]
                     return delta >= 0 ? delta / max(0.01, 1 - background[channel]) : -delta / max(0.01, background[channel])
