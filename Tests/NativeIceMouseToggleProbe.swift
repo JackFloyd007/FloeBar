@@ -10,7 +10,7 @@
 // preferences, or installs an event tap. Terminating it externally can prevent
 // cleanup; keep each run short and let it finish.
 //
-// Only the unique running /Applications/Ice.app (com.jordanbaird.Ice) is allowed.
+// Only the unique running /Applications/Ice.app (io.github.jackfloyd007.IceEric) is allowed.
 // Before EVERY click, rediscover its exact Ice.ControlItem.Visible AX extra;
 // require a finite, positive frame no wider than 40 points inside an on-screen
 // native Menubar window; require system-wide hit testing at its center to return
@@ -70,7 +70,7 @@ private func finitePositive(_ frame: CGRect) -> Bool {
 
 @MainActor
 private func iceApplication(expectedPID: pid_t? = nil) throws -> NSRunningApplication {
-    let apps = NSRunningApplication.runningApplications(withBundleIdentifier: "com.jordanbaird.Ice")
+    let apps = NSRunningApplication.runningApplications(withBundleIdentifier: "io.github.jackfloyd007.IceEric")
     guard apps.count == 1, let app = apps.first,
           !app.isTerminated,
           app.bundleURL?.standardizedFileURL.path == "/Applications/Ice.app",

@@ -119,7 +119,7 @@ static BOOL ProbeAPIAvailable(void) {
     // prevents selective hiding of the victim: that is a failed test, not a
     // reason to broaden its scope by removing these native-input protections.
     [allowed addObjectsFromArray:@[
-        ProbeBundleID, @"com.jordanbaird.Ice", @"com.apple.MenuBarAgent",
+        ProbeBundleID, @"io.github.jackfloyd007.IceEric", @"com.apple.MenuBarAgent",
         @"com.apple.appkit.status-items", @"com.apple.MenuBarAgent.systemservices",
         @"com.apple.controlcenter", @"com.apple.systemuiserver",
         @"com.apple.notificationcenterui", @"com.apple.TextInputMenuAgent",

@@ -3,7 +3,7 @@
 import AppKit
 import CoreGraphics
 
-let processes = NSRunningApplication.runningApplications(withBundleIdentifier: "com.jordanbaird.Ice")
+let processes = NSRunningApplication.runningApplications(withBundleIdentifier: "io.github.jackfloyd007.IceEric")
 guard processes.count == 1, let process = processes.first else {
     fatalError("Expected exactly one installed Ice process")
 }
