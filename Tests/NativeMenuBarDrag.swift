@@ -17,7 +17,7 @@ import ApplicationServices
 import Darwin
 
 private let allowedBundles = [
-    "ice": "com.jordanbaird.Ice", "volume": "local.wenbo.AppVolumes",
+    "ice": "io.github.jackfloyd007.IceEric", "volume": "local.wenbo.AppVolumes",
     "fan": "com.crystalidea.macsfancontrol", "spotlight": "com.apple.campo",
 ]
 private let windowServerExecutable = URL(
@@ -258,11 +258,11 @@ enum NativeMenuBarDrag {
         var sentOwnInput = false
         var inputStateConflict = false
         var heldSince: UInt64?
-        let icePID = try uniqueApplication("com.jordanbaird.Ice").processIdentifier
+        let icePID = try uniqueApplication("io.github.jackfloyd007.IceEric").processIdentifier
         let beforePID = try uniqueApplication("com.apple.MenuBarAgent").processIdentifier
 
         func ensureRuntime() throws {
-            _ = try uniqueApplication("com.jordanbaird.Ice", expectedPID: icePID)
+            _ = try uniqueApplication("io.github.jackfloyd007.IceEric", expectedPID: icePID)
             _ = try uniqueApplication("com.apple.MenuBarAgent", expectedPID: beforePID)
             do {
                 try ensureExpectedInputState(

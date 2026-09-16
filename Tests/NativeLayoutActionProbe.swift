@@ -99,7 +99,7 @@ private struct NativeLayoutActionProbe {
 
     @MainActor
     private static func installedIce() throws -> NSRunningApplication {
-        let apps = NSRunningApplication.runningApplications(withBundleIdentifier: "com.jordanbaird.Ice")
+        let apps = NSRunningApplication.runningApplications(withBundleIdentifier: "io.github.jackfloyd007.IceEric")
         guard apps.count == 1, let app = apps.first, !app.isTerminated,
               app.bundleURL?.standardizedFileURL.path == "/Applications/Ice.app" else { throw ProbeError.applicationUnavailable }
         return app

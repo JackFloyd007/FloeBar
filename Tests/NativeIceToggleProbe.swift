@@ -34,7 +34,7 @@ enum NativeIceToggleProbe {
             throw IceToggleProbeError.invalidArguments
         }
         guard AXIsProcessTrusted() else { throw IceToggleProbeError.permissionUnavailable }
-        let applications = NSRunningApplication.runningApplications(withBundleIdentifier: "com.jordanbaird.Ice")
+        let applications = NSRunningApplication.runningApplications(withBundleIdentifier: "io.github.jackfloyd007.IceEric")
         guard applications.count == 1, let application = applications.first,
               application.bundleURL?.standardizedFileURL.path == "/Applications/Ice.app" else {
             throw IceToggleProbeError.ambiguousApplication

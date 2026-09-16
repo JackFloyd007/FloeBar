@@ -78,7 +78,7 @@ private struct AppearanceWindowAudit {
 
     @MainActor
     private static func installedIce() throws -> NSRunningApplication {
-        let applications = NSRunningApplication.runningApplications(withBundleIdentifier: "com.jordanbaird.Ice")
+        let applications = NSRunningApplication.runningApplications(withBundleIdentifier: "io.github.jackfloyd007.IceEric")
         guard applications.count == 1, let application = applications.first,
               !application.isTerminated,
               application.bundleURL?.standardizedFileURL.path == "/Applications/Ice.app" else {
