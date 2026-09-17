@@ -69,7 +69,7 @@ private func uniqueApplication(_ bundle: String, expectedPID: pid_t? = nil) thro
     let apps = NSRunningApplication.runningApplications(withBundleIdentifier: bundle).filter { !$0.isTerminated }
     guard apps.count == 1, let app = apps.first,
           expectedPID == nil || app.processIdentifier == expectedPID else { throw DragCheckError.applicationChanged }
-    if bundle == allowedBundles["ice"], app.bundleURL?.standardizedFileURL.path != "/Applications/Ice.app" {
+    if bundle == allowedBundles["ice"], app.bundleURL?.standardizedFileURL.path != "/Applications/FloeBar.app" {
         throw DragCheckError.applicationChanged
     }
     return app

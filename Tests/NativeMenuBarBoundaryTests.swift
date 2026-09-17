@@ -1,4 +1,4 @@
-// Compile together with Ice/MenuBar/MenuBarItems/MacOS27NativeBoundary.swift.
+// Compile together with FloeBar/MenuBar/MenuBarItems/MacOS27NativeBoundary.swift.
 import CoreGraphics
 
 @main

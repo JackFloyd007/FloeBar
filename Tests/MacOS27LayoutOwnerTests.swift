@@ -1,4 +1,4 @@
-// Compile with Ice/MenuBar/MenuBarItems/MacOS27DynamicItemState.swift.
+// Compile with FloeBar/MenuBar/MenuBarItems/MacOS27DynamicItemState.swift.
 import Foundation
 
 @main

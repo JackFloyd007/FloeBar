@@ -3,7 +3,7 @@
 //  Ice
 //
 
-// Compile together with Ice/MenuBar/MenuBarItems/MacOS27NativeBoundary.swift.
+// Compile together with FloeBar/MenuBar/MenuBarItems/MacOS27NativeBoundary.swift.
 // Pure state-sequence checks; no native events, status items or permissions.
 @main
 enum NativeDragVisibilityStateTests {

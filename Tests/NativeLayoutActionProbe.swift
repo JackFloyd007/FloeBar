@@ -5,7 +5,7 @@
 // <probe> <App 音量|Macs Fan Control|Spotlight> \
 //   <Move Left|Move Right|Move to Hidden|Move to Visible> [count: 1...3]
 //
-// Only a currently on-screen window of the exact /Applications/Ice.app is
+// Only a currently on-screen window of the exact /Applications/FloeBar.app is
 // inspected. Menu extras, app menus, notification contents, global events and
 // coordinates are never used. Each invocation selects a unique advertised
 // raw action whose AXUIElementCopyActionDescription matches the literal action
@@ -72,7 +72,7 @@ private struct NativeLayoutActionProbe {
             let pid = app.processIdentifier
             if count == 0 {
                 let items = try layoutItems(pid: pid)
-                print("Ice PID=\(pid), path=/Applications/Ice.app, layoutItems=\(items.count)")
+                print("FloeBar PID=\(pid), path=/Applications/FloeBar.app, layoutItems=\(items.count)")
                 for item in items { describe(item) }
                 return
             }
@@ -101,7 +101,7 @@ private struct NativeLayoutActionProbe {
     private static func installedIce() throws -> NSRunningApplication {
         let apps = NSRunningApplication.runningApplications(withBundleIdentifier: "io.github.jackfloyd007.IceEric")
         guard apps.count == 1, let app = apps.first, !app.isTerminated,
-              app.bundleURL?.standardizedFileURL.path == "/Applications/Ice.app" else { throw ProbeError.applicationUnavailable }
+              app.bundleURL?.standardizedFileURL.path == "/Applications/FloeBar.app" else { throw ProbeError.applicationUnavailable }
         return app
     }
 
