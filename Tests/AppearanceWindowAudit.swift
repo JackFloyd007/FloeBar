@@ -81,7 +81,7 @@ private struct AppearanceWindowAudit {
         let applications = NSRunningApplication.runningApplications(withBundleIdentifier: "io.github.jackfloyd007.IceEric")
         guard applications.count == 1, let application = applications.first,
               !application.isTerminated,
-              application.bundleURL?.standardizedFileURL.path == "/Applications/Ice.app" else {
+              application.bundleURL?.standardizedFileURL.path == "/Applications/FloeBar.app" else {
             throw AuditError.installedAppUnavailable
         }
         return application

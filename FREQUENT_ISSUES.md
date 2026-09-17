@@ -1,35 +1,42 @@
-# Frequent Issues <!-- omit in toc -->
+# Frequent issues
 
-- [Items are moved to the always-hidden section](#items-are-moved-to-the-always-hidden-section)
-- [Ice removed an item](#ice-removed-an-item)
-- [Ice does not remember the order of items](#ice-does-not-remember-the-order-of-items)
-- [How do I solve the `Ice cannot arrange menu bar items in automatically hidden menu bars` error?](#how-do-i-solve-the-ice-cannot-arrange-menu-bar-items-in-automatically-hidden-menu-bars-error)
+## A newly launched item appears in Always Hidden
 
-## Items are moved to the always-hidden section
+macOS normally inserts a new status item at the far left of the menu bar. That
+position may be inside FloeBar's always-hidden section. Some apps recreate their
+status item each time they launch, so macOS treats it as new even after you moved
+it previously.
 
-By default, macOS adds new items to the far left of the menu bar, which is also the location of Ice's always-hidden section. Most apps are configured
-to remember the positions of their items, but some are not. macOS treats the items of these apps as new items each time they appear. This results in
-these items appearing in the always-hidden section, even if they have been previously been moved.
+Reveal the always-hidden section, then hold Command and drag the item to the
+section you want. FloeBar does not silently rewrite another app's saved menu bar
+position.
 
-Ice does not currently manage individual items, and in fact cannot, as of the current release. Once issues
-[#6](https://github.com/jordanbaird/Ice/issues/6) and [#26](https://github.com/jordanbaird/Ice/issues/26) are implemented, Ice will be able to
-monitor the items in the menu bar, and move the ones it recognizes to their previous locations, even if macOS rearranges them.
+## An item seems to have disappeared
 
-## Ice removed an item
+FloeBar does not remove third-party menu bar items. Reveal both hidden sections
+and look for the item at the far left. If it remains missing, quit and reopen the
+app that owns the item.
 
-Ice does not have the ability to move or remove items. It likely got placed in the always-hidden section by macOS. Option + click the Ice icon to show
-the always-hidden section, then Command + drag the item into a different section.
+## FloeBar does not remember an item's order
 
-## Ice does not remember the order of items
+Some apps destroy and recreate their status items or publish changing labels.
+FloeBar preserves stable identities where macOS exposes them, but cannot reliably
+restore every dynamically recreated item. Include the owning app and FloeBar
+version when filing an issue.
 
-This is not a bug, but a missing feature. It is being tracked in [#26](https://github.com/jordanbaird/Ice/issues/26).
+## Layout reports that the menu bar is automatically hidden
 
-## How do I solve the `Ice cannot arrange menu bar items in automatically hidden menu bars` error?
+FloeBar cannot safely arrange a menu bar that macOS is currently hiding:
 
-1. Open `System Settings` on your Mac
-2. Go to `Control Center`
-3. Select `Never` as shown in the image below
-4. Update your `Menu Bar Items` in `Ice`
-5. Return `Automatically hide and show the menu bar` to your preferred settings
+1. Open **System Settings**.
+2. Open **Control Center**.
+3. Set **Automatically hide and show the menu bar** to **Never**.
+4. Arrange items in FloeBar's **Menu Bar Layout**.
+5. Restore your preferred automatic-hiding setting.
 
-![Disable Menu Bar Hiding](https://github.com/user-attachments/assets/74c1fde6-d310-4fe3-9f2b-703d8ccb636a)
+## Layout shows blurred or missing previews
+
+Grant Screen Recording permission to FloeBar, quit it completely, and reopen it.
+The permission is optional for basic hiding but required for pixel-accurate menu
+bar previews. FloeBar falls back to a named placeholder when macOS cannot provide
+a usable image.

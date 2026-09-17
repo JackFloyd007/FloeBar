@@ -1,7 +1,8 @@
 # macOS 27 native interaction
 
-Current installed development build: `0.12.0-macos27.129 (1328)` at
-`/Applications/Ice.app`. It removes the unnecessary full wait and stale hit-map
+Current FloeBar source version: `0.13.0-macos27.1 (1330)`. Installed-build
+validation from before the FloeBar rename used `/Applications/Ice.app`. The
+maintained implementation removes the unnecessary full wait and stale hit-map
 prerequisite from ordinary, settled-pair hiding, and cleans up failed hiding
 handles. **Rapid-toggle visual acceptance still fails:** the current native
 overflow implementation can leave fading icons during approximately 90–116 ms
@@ -18,7 +19,9 @@ checks, real Layout ordering and native Notification Center acceptance.
 The authorized private hiding retest again broke native clock input and was
 [rejected](docs/assessment-isolation-2026-09-05.md), not integrated. Temporary
 probe apps are closed and the temporary appearance border is restored off.
-Build 1311 is the preceding native-interaction review baseline.
+Build 1311 is the preceding native-interaction review baseline. Historical
+validation documents retain the Ice name because that was the executable under
+test; new builds use `/Applications/FloeBar.app`.
 See the [native interaction review](docs/native-interaction-qa-2026-09-05.md)
 and the [Layout follow-up and acceptance record](docs/layout-native-drag-2026-09-05.md).
 The [direct native-drag follow-up](docs/native-boundary-drag-2026-09-05.md)
@@ -192,7 +195,7 @@ Run the foreground extraction checks independently of the app:
 
 ```sh
 DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer \
-  xcrun swiftc -O Ice/MenuBar/LayoutBar/MenuBarGlyphImage.swift \
+  xcrun swiftc -O FloeBar/MenuBar/LayoutBar/MenuBarGlyphImage.swift \
   Tests/MenuBarGlyphImageTests.swift -o /tmp/ice-glyph-image-tests
 /tmp/ice-glyph-image-tests
 ```
@@ -201,7 +204,7 @@ Run the native-boundary decision checks with:
 
 ```sh
 DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer \
-  xcrun swiftc -O Ice/MenuBar/MenuBarItems/MacOS27NativeBoundary.swift \
+  xcrun swiftc -O FloeBar/MenuBar/MenuBarItems/MacOS27NativeBoundary.swift \
   Tests/NativeMenuBarBoundaryTests.swift -o /tmp/ice-boundary-tests
 /tmp/ice-boundary-tests
 ```

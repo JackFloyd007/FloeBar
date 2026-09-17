@@ -10,7 +10,7 @@
 // preferences, or installs an event tap. Terminating it externally can prevent
 // cleanup; keep each run short and let it finish.
 //
-// Only the unique running /Applications/Ice.app (io.github.jackfloyd007.IceEric) is allowed.
+// Only the unique running /Applications/FloeBar.app (io.github.jackfloyd007.IceEric) is allowed.
 // Before EVERY click, rediscover its exact Ice.ControlItem.Visible AX extra;
 // require a finite, positive frame no wider than 40 points inside an on-screen
 // native Menubar window; require system-wide hit testing at its center to return
@@ -46,7 +46,7 @@ private enum ProbeError: Error, CustomStringConvertible {
         switch self {
         case .invalidArguments: "Usage: <probe> <click-count: 1...20> <interval-ms: 40...1000>"
         case .permissionsUnavailable: "Required AX/post-event permission is unavailable; no prompt requested."
-        case .applicationUnavailable: "Exactly one running /Applications/Ice.app with the expected identity is required."
+        case .applicationUnavailable: "Exactly one running /Applications/FloeBar.app with the expected identity is required."
         case .buttonUnavailable: "Exactly one enabled Ice.ControlItem.Visible AX extra is required."
         case .invalidFrame: "Ice's current button frame is invalid or wider than 40 points."
         case .menuBarUnavailable: "Ice's button is not wholly inside a visible native Menubar strip."
@@ -73,7 +73,7 @@ private func iceApplication(expectedPID: pid_t? = nil) throws -> NSRunningApplic
     let apps = NSRunningApplication.runningApplications(withBundleIdentifier: "io.github.jackfloyd007.IceEric")
     guard apps.count == 1, let app = apps.first,
           !app.isTerminated,
-          app.bundleURL?.standardizedFileURL.path == "/Applications/Ice.app",
+          app.bundleURL?.standardizedFileURL.path == "/Applications/FloeBar.app",
           expectedPID == nil || app.processIdentifier == expectedPID else {
         throw ProbeError.applicationUnavailable
     }

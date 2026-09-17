@@ -72,7 +72,7 @@ Reproduce the pure checks:
 
 ```sh
 DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer xcrun swiftc \
-  -parse-as-library Ice/MenuBar/MenuBarItems/MacOS27DynamicItemState.swift \
+  -parse-as-library FloeBar/MenuBar/MenuBarItems/MacOS27DynamicItemState.swift \
   Tests/MacOS27DynamicItemStateTests.swift -o /tmp/ice-dynamic-item-tests
 /tmp/ice-dynamic-item-tests
 ```

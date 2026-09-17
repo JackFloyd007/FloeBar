@@ -1,118 +1,91 @@
 <div align="center">
-    <img src="Ice/Assets.xcassets/AppIcon.appiconset/icon_256x256.png" width=200 height=200>
-    <h1>Ice</h1>
+  <img src="FloeBar/Resources/Assets.xcassets/AppIcon.appiconset/icon_256x256.png" width="180" height="180" alt="FloeBar app icon">
+  <h1>FloeBar</h1>
+  <p>A calm, capable menu bar organizer for macOS.</p>
 </div>
 
-Ice is a powerful menu bar management tool. While its primary function is hiding and showing menu bar items, it aims to cover a wide variety of additional features to make it one of the most versatile menu bar tools available.
+<div align="center">
 
-![Banner](https://github.com/user-attachments/assets/4423085c-4e4b-4f3d-ad0f-90a217c03470)
+[![Download](https://img.shields.io/badge/download-latest-1677ff?style=flat-square)](https://github.com/JackFloyd007/FloeBar/releases/latest)
+![Platform](https://img.shields.io/badge/platform-macOS-111827?style=flat-square)
+![Requirements](https://img.shields.io/badge/requires-macOS%2014%2B-0ea5e9?style=flat-square)
+[![License](https://img.shields.io/github/license/JackFloyd007/FloeBar?style=flat-square)](LICENSE)
 
-[![Download](https://img.shields.io/badge/download-latest-brightgreen?style=flat-square)](https://github.com/jordanbaird/Ice/releases/latest)
-![Platform](https://img.shields.io/badge/platform-macOS-blue?style=flat-square)
-![Requirements](https://img.shields.io/badge/requirements-macOS%2014%2B-fa4e49?style=flat-square)
-[![Sponsor](https://img.shields.io/badge/Sponsor%20%E2%9D%A4%EF%B8%8F-8A2BE2?style=flat-square)](https://github.com/sponsors/jordanbaird)
-[![Website](https://img.shields.io/badge/Website-015FBA?style=flat-square)](https://icemenubar.app)
-[![License](https://img.shields.io/github/license/jordanbaird/Ice?style=flat-square)](LICENSE)
+</div>
+
+FloeBar keeps a crowded Mac menu bar under control. Hide items you rarely need,
+reveal them with one click, arrange them visually, search them, and customize the
+menu bar without replacing the native macOS experience.
 
 > [!NOTE]
-> Ice is currently in active development. Some features have not yet been implemented. Download the latest release [here](https://github.com/jordanbaird/Ice/releases/latest) and see the roadmap below for upcoming features.
-
-> [!IMPORTANT]
-> This fork's `codex/macos-27` branch adds experimental macOS 27 compatibility.
-> It replaces the removed per-item WindowServer path with Accessibility-based
-> discovery, assignment-backed hiding, and MenuBarAgent-native ordering. See
-> [MACOS27.md](MACOS27.md) for implementation details and current limitations.
-
-<a href="https://www.buymeacoffee.com/jordanbaird" target="_blank">
-    <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;">
-</a>
+> FloeBar is an independently maintained GPLv3 fork of
+> [Ice](https://github.com/jordanbaird/Ice) by Jordan Baird. It is not affiliated
+> with or endorsed by the upstream project. See [NOTICE.md](NOTICE.md) for full
+> attribution.
 
 ## Install
 
-### Manual Installation
+1. Download the latest `FloeBar-*.zip` from
+   [GitHub Releases](https://github.com/JackFloyd007/FloeBar/releases/latest).
+2. Open the ZIP and move `FloeBar.app` to `/Applications`.
+3. Launch FloeBar and grant Accessibility permission when prompted.
+4. Grant Screen Recording permission only if you want exact menu bar previews
+   and the separate Floe Bar panel.
 
-Download the "Ice.zip" file from the [latest release](https://github.com/jordanbaird/Ice/releases/latest) and move the unzipped app into your `Applications` folder.
+FloeBar release builds are signed with Developer ID, notarized by Apple, and
+update through their own Sparkle feed. They do not use the original Ice update
+channel.
 
-### Homebrew
+## Features
 
-Install Ice using the following command:
+- Hide and reveal menu bar items in visible, hidden, and always-hidden sections.
+- Arrange supported items with a visual drag-and-drop layout.
+- Search menu bar items and trigger configurable hotkeys.
+- Show hidden items in a separate Floe Bar panel.
+- Customize menu bar tint, shape, shadow, border, and item spacing.
+- Launch at login and receive signed automatic updates.
+- Native macOS 27 compatibility for menu bar discovery and section boundaries.
 
-```sh
-brew install --cask jordanbaird-ice
-```
+## Permissions and privacy
 
-## Features/Roadmap
+FloeBar does not collect or transmit personal data.
 
-### Menu bar item management
+- **Accessibility** is required to discover and arrange menu bar items.
+- **Screen Recording** is optional and is used only to render the real appearance
+  of menu bar items in Layout and the Floe Bar.
 
-- [x] Hide menu bar items
-- [x] "Always-hidden" menu bar section
-- [x] Show hidden menu bar items when hovering over the menu bar
-- [x] Show hidden menu bar items when an empty area in the menu bar is clicked
-- [x] Show hidden menu bar items by scrolling or swiping in the menu bar
-- [x] Automatically rehide menu bar items
-- [x] Hide application menus when they overlap with shown menu bar items
-- [x] Drag and drop interface to arrange individual menu bar items
-- [x] Display hidden menu bar items in a separate bar (e.g. for MacBooks with the notch)
-- [x] Search menu bar items
-- [x] Menu bar item spacing (BETA)
-- [ ] Profiles for menu bar layout
-- [ ] Individual spacer items
-- [ ] Menu bar item groups
-- [ ] Show menu bar items when trigger conditions are met
+Permissions stay on the Mac and can be revoked at any time in System Settings.
 
-### Menu bar appearance
+## Compatibility
 
-- [x] Menu bar tint (solid and gradient)
-- [x] Menu bar shadow
-- [x] Menu bar border
-- [x] Custom menu bar shapes (rounded and/or split)
-- [ ] Remove background behind menu bar
-- [ ] Rounded screen corners
-- [ ] Different settings for light/dark mode
+FloeBar requires macOS 14 or later. The maintained branch includes a dedicated
+macOS 27 path that avoids global input interception and fails open when the
+native menu bar boundary cannot be verified. Known limitations and technical
+validation are documented in [MACOS27.md](MACOS27.md).
 
-### Hotkeys
+## Build from source
 
-- [x] Toggle individual menu bar sections
-- [x] Show the search panel
-- [x] Enable/disable the Ice Bar
-- [x] Show/hide section divider icons
-- [x] Toggle application menus
-- [ ] Enable/disable auto rehide
-- [ ] Temporarily show individual menu bar items
+Requirements:
 
-### Other
+- macOS 14 or later
+- Current Xcode with the macOS SDK
+- SwiftLint, if you want to run the same lint step as CI
 
-- [x] Launch at login
-- [x] Automatic updates
-- [ ] Menu bar widgets
+Open `FloeBar.xcodeproj`, select the `FloeBar` scheme, and build. Swift package
+dependencies are resolved by Xcode. Release signing and notarization instructions
+are in [docs/distribution.md](docs/distribution.md).
 
-## Why does Ice only support macOS 14 and later?
+## Contributing
 
-Ice uses a number of system APIs that are available starting in macOS 14. As such, there are no plans to support earlier versions of macOS.
+Bug reports and focused pull requests are welcome. Read
+[CONTRIBUTING.md](CONTRIBUTING.md) before opening a change, and report security
+issues according to [SECURITY.md](SECURITY.md).
 
-## Gallery
+## License and attribution
 
-#### Show hidden menu bar items below the menu bar
+FloeBar is distributed under the [GNU General Public License v3.0](LICENSE).
+Modified versions and binaries must continue to satisfy GPLv3, including source
+availability and preservation of applicable copyright notices.
 
-![Ice Bar](https://github.com/user-attachments/assets/f1429589-6186-4e1b-8aef-592219d49b9b)
-
-#### Drag-and-drop interface to arrange menu bar items
-
-![Menu Bar Layout](https://github.com/user-attachments/assets/095442ba-f2d0-4bb4-9632-91e26ef8d45b)
-
-#### Customize the menu bar's appearance
-
-![Menu Bar Appearance](https://github.com/user-attachments/assets/8c22c185-c3d2-49bb-971e-e1fc17df04b3)
-
-#### Menu bar item search
-
-![Menu Bar Item Search](https://github.com/user-attachments/assets/d1a7df3a-4989-4077-a0b1-8e7d5a1ba5b8)
-
-#### Custom menu bar item spacing
-
-![Menu Bar Item Spacing](https://github.com/user-attachments/assets/b196aa7e-184a-4d4c-b040-502f4aae40a6)
-
-## License
-
-Ice is available under the [GPL-3.0 license](LICENSE).
+FloeBar modifications are copyright © 2026 JackFloyd007. Portions are copyright
+© 2024–2025 Jordan Baird and other Ice contributors.
