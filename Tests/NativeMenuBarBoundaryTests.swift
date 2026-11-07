@@ -13,6 +13,31 @@ enum NativeMenuBarBoundaryTests {
         func frame(_ x: CGFloat, y: CGFloat = 4, width: CGFloat = 28) -> CGRect {
             CGRect(x: x, y: y, width: width, height: 24)
         }
+        check(MacOS27NativeBoundary.concealmentLength(leftEdge: 824.5, rightEdge: 917) == 86.5,
+              "crowded notched display reserves only the space before the toggle")
+        check(MacOS27NativeBoundary.concealmentLength(leftEdge: 824.5, rightEdge: 602) == nil,
+              "overflow presentation outside the native status region cannot size a spacer")
+        check(MacOS27NativeBoundary.concealmentLength(leftEdge: .nan, rightEdge: 917) == nil,
+              "invalid display geometry cannot size a spacer")
+        let boundaryFrame = frame(270, width: 24)
+        check(MacOS27NativeBoundary.unambiguousFrame([boundaryFrame, boundaryFrame]) == boundaryFrame,
+              "identical hosted boundary variants represent a single control")
+        check(MacOS27NativeBoundary.unambiguousFrame([boundaryFrame, frame(290)]) == nil,
+              "conflicting hosted variants are not silently assigned a position")
+        check(MacOS27NativeBoundary.unambiguousFrame([]) == nil,
+              "missing native boundary is not a verified position")
+        func matches(pid: Int32? = 42, identifier: String? = "boundary", hitFrame: CGRect? = nil) -> Bool {
+            MacOS27NativeBoundary.matchesOwnedHit(
+                pid: pid, expectedPID: 42, identifier: identifier, expectedIdentifier: "boundary",
+                frame: hitFrame ?? boundaryFrame, point: boundaryFrame.centerForTest
+            )
+        }
+        check(matches(), "exact owned boundary hit permits repair")
+        check(!matches(identifier: nil), "unidentified hit cannot authorize a drag")
+        check(!matches(identifier: "neighbor"), "another button in our process cannot authorize a drag")
+        check(!matches(pid: 99), "another process cannot impersonate the boundary identifier")
+        check(!matches(pid: nil), "unresolved hit owner fails closed")
+        check(!matches(hitFrame: frame(500)), "stale boundary frame cannot authorize a drag")
         let ice = frame(300)
         check(MacOS27NativeBoundary.side(of: frame(270), relativeTo: ice) == .left,
               "a hidden item starts on the left of Ice")
@@ -74,15 +99,27 @@ enum NativeMenuBarBoundaryTests {
         check(MacOS27NativeBoundary.dragDestinationX(target: frame(334, width: 3), placingBefore: true) < 337,
               "a narrow target keeps its drop point inside its bounds")
         let overflow = CGRect(x: 848.5, y: 1, width: 17.5, height: 30)
+        check(!MacOS27NativeBoundary.isSystemOverflowControl(
+            frame: overflow, hasIdentifier: false, hasDescription: true, isButton: true,
+            isAgentOwned: true, hasTitle: true
+        ), "Passwords-shaped titled buttons are not classified as system overflow")
+        check(!MacOS27NativeBoundary.isSystemOverflowControl(
+            frame: overflow, hasIdentifier: false, hasDescription: true, isButton: true,
+            isAgentOwned: false, hasTitle: false
+        ), "foreign hosted buttons are not classified as system overflow")
         check(MacOS27NativeBoundary.isSystemOverflowControl(
-            frame: overflow, hasIdentifier: false, hasDescription: true, isButton: true
+            frame: overflow, hasIdentifier: false, hasDescription: true, isButton: true, isAgentOwned: true, hasTitle: false
         ), "a localized MenuBarAgent overflow button is recognized structurally")
         check(!MacOS27NativeBoundary.isSystemOverflowControl(
-            frame: overflow, hasIdentifier: true, hasDescription: true, isButton: true
+            frame: overflow, hasIdentifier: true, hasDescription: true, isButton: true, isAgentOwned: true, hasTitle: false
         ), "an identified Control Center item is not treated as overflow")
         check(!MacOS27NativeBoundary.isSystemOverflowControl(
-            frame: frame(848, width: 18), hasIdentifier: false, hasDescription: true, isButton: true
+            frame: frame(848, width: 18), hasIdentifier: false, hasDescription: true, isButton: true, isAgentOwned: true, hasTitle: false
         ), "an ordinary-height unidentified status item is retained")
         print("\(assertions) native-boundary assertions passed")
     }
+}
+
+private extension CGRect {
+    var centerForTest: CGPoint { CGPoint(x: midX, y: midY) }
 }

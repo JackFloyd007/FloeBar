@@ -34,6 +34,9 @@ struct MenuBarItem: CustomStringConvertible {
     /// A Boolean value that indicates whether the item is on screen.
     let isOnScreen: Bool
 
+    /// Process-local AX identity, separate from the persisted semantic tag.
+    var nativeIdentityToken: String?
+
     /// Creates a structural item from a non-WindowServer provider.
     ///
     /// macOS 27 menu bar items are composited by MenuBarAgent and no longer
@@ -48,7 +51,8 @@ struct MenuBarItem: CustomStringConvertible {
         title: String?,
         accessibilityHelp: String? = nil,
         accessibilityValue: String? = nil,
-        isOnScreen: Bool
+        isOnScreen: Bool,
+        nativeIdentityToken: String? = nil
     ) {
         self.tag = tag
         self.windowID = windowID
@@ -59,6 +63,7 @@ struct MenuBarItem: CustomStringConvertible {
         self.accessibilityHelp = accessibilityHelp
         self.accessibilityValue = accessibilityValue
         self.isOnScreen = isOnScreen
+        self.nativeIdentityToken = nativeIdentityToken
     }
 
     /// A Boolean value that indicates whether this item can be moved.
@@ -321,9 +326,8 @@ extension MenuBarItem {
     ///     to return all available menu bar items.
     static func getMenuBarItems(on display: CGDirectDisplayID? = nil, option: ListOption) async -> [MenuBarItem] {
         if #available(macOS 27.0, *) {
-            return await Task.detached(priority: .userInitiated) {
-                MacOS27MenuBarItemProvider.menuBarItems(on: display, option: option)
-            }.value
+            let snapshot = await MacOS27MenuBarItemProvider.menuBarItems(on: display, option: option)
+            return snapshot.completeValue ?? []
         } else if #available(macOS 26.0, *) {
             return await getMenuBarItemsExperimental(on: display, option: option)
         } else {
@@ -343,7 +347,8 @@ extension MenuBarItem: Equatable {
         lhs.title == rhs.title &&
         lhs.accessibilityHelp == rhs.accessibilityHelp &&
         lhs.accessibilityValue == rhs.accessibilityValue &&
-        lhs.isOnScreen == rhs.isOnScreen
+        lhs.isOnScreen == rhs.isOnScreen &&
+        lhs.nativeIdentityToken == rhs.nativeIdentityToken
     }
 }
 
@@ -359,6 +364,7 @@ extension MenuBarItem: Hashable {
         hasher.combine(accessibilityHelp)
         hasher.combine(accessibilityValue)
         hasher.combine(isOnScreen)
+        hasher.combine(nativeIdentityToken)
     }
 }
 

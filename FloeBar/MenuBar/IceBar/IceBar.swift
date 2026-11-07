@@ -413,11 +413,17 @@ private struct IceBarItemView: View {
             }
             menuBarManager.section(withName: section)?.hide()
             Task {
-                try await Task.sleep(for: .milliseconds(25))
-                if Bridging.isWindowOnScreen(item.windowID) {
-                    try await itemManager.click(item: item, with: .left)
-                } else {
-                    await itemManager.temporarilyShow(item: item, clickingWith: .left)
+                do {
+                    try await Task.sleep(for: .milliseconds(25))
+                    if Bridging.isWindowOnScreen(item.windowID) {
+                        try await itemManager.click(item: item, with: .left)
+                    } else {
+                        await itemManager.temporarilyShow(item: item, clickingWith: .left)
+                    }
+                } catch is CancellationError {
+                    return
+                } catch {
+                    Logger.default.error("Could not activate Floe Bar item: \(error)")
                 }
             }
         }
@@ -430,11 +436,17 @@ private struct IceBarItemView: View {
             }
             menuBarManager.section(withName: section)?.hide()
             Task {
-                try await Task.sleep(for: .milliseconds(25))
-                if Bridging.isWindowOnScreen(item.windowID) {
-                    try await itemManager.click(item: item, with: .right)
-                } else {
-                    await itemManager.temporarilyShow(item: item, clickingWith: .right)
+                do {
+                    try await Task.sleep(for: .milliseconds(25))
+                    if Bridging.isWindowOnScreen(item.windowID) {
+                        try await itemManager.click(item: item, with: .right)
+                    } else {
+                        await itemManager.temporarilyShow(item: item, clickingWith: .right)
+                    }
+                } catch is CancellationError {
+                    return
+                } catch {
+                    Logger.default.error("Could not activate Floe Bar item: \(error)")
                 }
             }
         }

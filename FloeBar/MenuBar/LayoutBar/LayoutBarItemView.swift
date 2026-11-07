@@ -26,6 +26,8 @@ final class LayoutBarItemView: NSView {
     private var isLocalDragActive = false
     private var isHovered = false
     private var displayedImageIsTemplate = false
+    private var applicationIcon: NSImage?
+    private var displayPresentation: MenuBarItemDisplayLabel.Presentation?
 
     /// The item that the view represents.
     private(set) var item: MenuBarItem
@@ -120,6 +122,7 @@ final class LayoutBarItemView: NSView {
     private var thumbnailExtraWidth: CGFloat { if #available(macOS 27.0, *) { 12 } else { 0 } }
 
     private var thumbnailTitle: String {
+        if let title = displayPresentation?.title { return title }
         if item.tag.namespace == .controlCenter, item.tag.title == "com.apple.menuextra.wifi" {
             return "Wi-Fi"
         }
@@ -152,34 +155,11 @@ final class LayoutBarItemView: NSView {
         super.init(frame: CGRect(origin: .zero, size: Self.fallbackSize(for: item)))
         unregisterDraggedTypes()
 
-        self.toolTip = item.displayName
         self.isEnabled = item.isMovable
         setAccessibilityElement(true)
-        setAccessibilityLabel(item.displayName)
-        setAccessibilityHelp("Drag to reorder this menu bar item")
-        setAccessibilityCustomActions([
-            NSAccessibilityCustomAction(
-                name: "Move Left"
-            ) { [weak self] in
-                self?.moveOnePosition(left: true) ?? false
-            },
-            NSAccessibilityCustomAction(
-                name: "Move Right"
-            ) { [weak self] in
-                self?.moveOnePosition(left: false) ?? false
-            },
-            NSAccessibilityCustomAction(
-                name: "Move to Hidden"
-            ) { [weak self] in
-                self?.move(toSection: .hidden) ?? false
-            },
-            NSAccessibilityCustomAction(
-                name: "Move to Visible"
-            ) { [weak self] in
-                self?.move(toSection: .visible) ?? false
-            },
-        ])
+        refreshHidingCapability()
 
+        if #available(macOS 27.0, *) { updateApplicationIcon() }
         configureCancellables()
     }
 
@@ -188,10 +168,59 @@ final class LayoutBarItemView: NSView {
         fatalError("init(coder:) has not been implemented")
     }
 
+    private var supportsSectionEditing: Bool { appState?.menuBarManager.usesSystemOverflow != true }
+    private var hidingRestriction: String? {
+        supportsSectionEditing ? appState?.itemManager.hidingRestriction(for: item) : nil
+    }
+
+    private func refreshHidingCapability() {
+        let reason = hidingRestriction
+        toolTip = [displayPresentation?.accessibilityLabel ?? thumbnailTitle, displayPresentation?.detail, reason].compactMap { $0 }.joined(separator: "\n")
+        setAccessibilityLabel(displayPresentation?.accessibilityLabel ?? thumbnailTitle)
+        setAccessibilityHelp([displayPresentation?.detail, item.isMovable ? reason ?? String(localized: "Drag to reorder this menu bar item") : reason].compactMap { $0 }.joined(separator: "\n"))
+        guard item.isMovable else {
+            setAccessibilityCustomActions([])
+            return
+        }
+        var actions = [
+            NSAccessibilityCustomAction(name: String(localized: "Move Left")) { [weak self] in
+                self?.moveOnePosition(left: true) ?? false
+            },
+            NSAccessibilityCustomAction(name: String(localized: "Move Right")) { [weak self] in
+                self?.moveOnePosition(left: false) ?? false
+            },
+        ]
+        if supportsSectionEditing {
+            actions.append(NSAccessibilityCustomAction(name: String(localized: "Move to Visible")) { [weak self] in
+                self?.move(toSection: .visible) ?? false
+            })
+        }
+        if supportsSectionEditing && reason == nil {
+            actions.append(NSAccessibilityCustomAction(name: String(localized: "Move to Hidden")) { [weak self] in
+                self?.move(toSection: .hidden) ?? false
+            })
+            if appState?.menuBarManager.section(withName: .alwaysHidden)?.isEnabled == true {
+                actions.append(NSAccessibilityCustomAction(name: String(localized: "Move to Always Hidden")) { [weak self] in
+                    self?.move(toSection: .alwaysHidden) ?? false
+                })
+            }
+        }
+        setAccessibilityCustomActions(actions)
+        needsDisplay = true
+    }
+
     private func configureCancellables() {
         var c = Set<AnyCancellable>()
 
         if let appState {
+            appState.settings.advanced.$enableAlwaysHiddenSection
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in self?.refreshHidingCapability() }
+                .store(in: &c)
+            appState.menuBarManager.experimentalHiding.$enabled
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in self?.refreshHidingCapability() }
+                .store(in: &c)
             appState.imageCache.$images
                 .sink { [weak self] images in
                     guard let self else { return }
@@ -209,12 +238,30 @@ final class LayoutBarItemView: NSView {
     func update(item: MenuBarItem) {
         precondition(self.item.tag == item.tag)
         self.item = item
-        toolTip = item.displayName
-        setAccessibilityLabel(item.displayName)
+        if #available(macOS 27.0, *) { updateApplicationIcon() }
+        refreshHidingCapability()
         isEnabled = item.isMovable
         if cachedImage == nil {
             setFrameSize(Self.fallbackSize(for: item))
         }
+    }
+
+    func setDisplayPresentation(_ presentation: MenuBarItemDisplayLabel.Presentation?) {
+        displayPresentation = presentation
+        refreshHidingCapability()
+        needsDisplay = true
+    }
+
+    private func updateApplicationIcon() {
+        if case .string(let bundle) = item.tag.namespace,
+            let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle),
+            Bundle(url: url)?.bundleIdentifier == bundle {
+            applicationIcon = NSWorkspace.shared.icon(forFile: url.path)
+        } else {
+            applicationIcon = NSRunningApplication(processIdentifier: item.sourcePID ?? item.ownerPID)?.icon
+                ?? NSImage(systemSymbolName: "app", accessibilityDescription: item.displayName)
+        }
+        needsDisplay = true
     }
 
     private static func fallbackSize(for item: MenuBarItem) -> CGSize {
@@ -252,6 +299,7 @@ final class LayoutBarItemView: NSView {
             return false
         }
 
+        do { try appState.itemManager.validateHidingMove(item: item, to: section) } catch { NSAlert(error: error).runModal(); return false }
         let wasLayoutEditing = appState.menuBarManager.macOS27Controller.isLayoutEditing
         appState.menuBarManager.macOS27Controller.beginLayoutEditing()
         let freshItem = appState.itemManager.itemCache[address.section][address.index]
@@ -310,6 +358,8 @@ final class LayoutBarItemView: NSView {
                 return
             }
 
+            // Normal-mode cache is one physical row, including items with
+            // historical Hidden/Always Hidden assignments.
             let items = appState.itemManager.itemCache[address.section]
             let targetIndex = (address.index + requestedOffset).clamped(
                 to: items.startIndex ... max(items.startIndex, items.endIndex - 1)
@@ -331,15 +381,15 @@ final class LayoutBarItemView: NSView {
     /// Provides an alert to display when the item view is disabled.
     func provideAlertForDisabledItem() -> NSAlert {
         let alert = NSAlert()
-        alert.messageText = "Menu bar item is not movable."
-        alert.informativeText = "macOS prohibits \"\(item.displayName)\" from being moved."
+        alert.messageText = String(localized: "Menu bar item is not movable.")
+        alert.informativeText = String(localized: "macOS prohibits \"\(item.displayName)\" from being moved.")
         return alert
     }
 
     /// Provides an alert to display when a menu bar item is unresponsive.
     func provideAlertForUnresponsiveItem() -> NSAlert {
         let alert = provideAlertForDisabledItem()
-        alert.informativeText = "\(item.displayName) is unresponsive. Until it is restarted, it cannot be moved. Movement of other menu bar items may also be affected until this is resolved."
+        alert.informativeText = String(localized: "\(item.displayName) is unresponsive. Until it is restarted, it cannot be moved. Movement of other menu bar items may also be affected until this is resolved.")
         return alert
     }
 
@@ -361,6 +411,14 @@ final class LayoutBarItemView: NSView {
                     from: .zero,
                     operation: .sourceOver,
                     fraction: isEnabled ? 1.0 : 0.67
+                )
+            }
+            if #available(macOS 27.0, *), displayedImage == nil {
+                applicationIcon?.draw(
+                    in: CGRect(x: bounds.midX - 12, y: bounds.midY - 2, width: 24, height: 24),
+                    from: .zero,
+                    operation: .sourceOver,
+                    fraction: isEnabled ? 1 : 0.67
                 )
             }
             if Bridging.isProcessUnresponsive(item.ownerPID) {
@@ -390,13 +448,17 @@ final class LayoutBarItemView: NSView {
             NSBezierPath(roundedRect: bounds, xRadius: 9, yRadius: 9).fill()
         }
 
+        if hidingRestriction != nil {
+            NSImage(systemSymbolName: "exclamationmark.circle", accessibilityDescription: nil)?
+                .draw(in: CGRect(x: bounds.maxX - 17, y: bounds.maxY - 17, width: 12, height: 12))
+        }
         let preview = CGRect(
             x: bounds.midX - max(50, displayedImageSize.width + 12) / 2,
             y: bounds.midY - 7,
             width: max(50, displayedImageSize.width + 12),
             height: 34
         )
-        if displayedImage == nil {
+        if displayedImage == nil && applicationIcon == nil {
             NSColor.labelColor.withAlphaComponent(0.04).setFill()
             NSBezierPath(roundedRect: preview, xRadius: 7, yRadius: 7).fill()
             let paragraph = NSMutableParagraphStyle()
@@ -409,7 +471,7 @@ final class LayoutBarItemView: NSView {
         }
         let paragraph = NSMutableParagraphStyle()
         paragraph.alignment = .center
-        paragraph.lineBreakMode = .byTruncatingTail
+        paragraph.lineBreakMode = .byTruncatingMiddle
         (thumbnailTitle as NSString).draw(
             in: CGRect(x: 4, y: 5, width: bounds.width - 8, height: 15),
             withAttributes: [

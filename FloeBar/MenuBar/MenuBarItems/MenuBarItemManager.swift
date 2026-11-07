@@ -30,6 +30,7 @@ final class MenuBarItemManager: ObservableObject {
 
     /// Actor for managing menu bar item cache operations.
     private let cacheActor = CacheActor()
+    private var cachePublicationGeneration: UInt64 = 0
 
     /// Contexts for temporarily shown menu bar items.
     private var temporarilyShownItemContexts = [TemporarilyShownItemContext]()
@@ -48,6 +49,9 @@ final class MenuBarItemManager: ObservableObject {
     /// transaction is still being read and verified.
     private var macOS27ProjectedCache: ItemCache?
 
+    @Published private var reorderFeedbackState = NativeReorderFeedbackState()
+    var reorderFeedback: NativeReorderFeedback { reorderFeedbackState.phase }
+
     /// The latest complete Layout order requested by the user.
     ///
     /// Layout can accept another drag while MenuBarAgent is still settling the
@@ -62,6 +66,7 @@ final class MenuBarItemManager: ObservableObject {
     private var macOS27PendingMoveGenerations = [MenuBarItemTag: UInt64]()
     private var macOS27TouchedMoveTags = Set<MenuBarItemTag>()
     private var macOS27DesiredGeneration: UInt64 = 0
+    private var macOS27DisplaySession = NativeMenuBarDisplaySession()
 
     /// The single worker that turns the latest Layout state into physical menu
     /// bar order. Unlike the move semaphore, this also coalesces queued intent.
@@ -117,6 +122,7 @@ final class MenuBarItemManager: ObservableObject {
                         // the user has already begun dragging.
                         appState.menuBarManager.macOS27Controller.beginLayoutEditing()
                     } else if appState.menuBarManager.macOS27Controller.isLayoutEditing {
+                        cancelLayoutReads()
                         // A restored Settings window can change panes without
                         // constructing the old Layout view long enough for its
                         // `onDisappear` callback to run.
@@ -126,6 +132,33 @@ final class MenuBarItemManager: ObservableObject {
                 guard identifier == .menuBarLayout else { return }
                 Task {
                     await self.cacheItemsRegardless()
+                }
+            }
+            .store(in: &c)
+
+        appState.menuBarManager.experimentalHiding.$enabled
+            .dropFirst()
+            .sink { [weak self] _ in
+                guard #available(macOS 27.0, *), let self else { return }
+                let hadPendingOrder = macOS27DesiredCache != nil
+                // @Published emits in willSet. Invalidate authority and intent
+                // now, but defer callbacks that read `enabled` until didSet.
+                macOS27DisplaySession.invalidate()
+                macOS27DesiredGeneration &+= 1
+                clearMacOS27DesiredOrderCache()
+                let generation = macOS27DesiredGeneration
+                if hadPendingOrder { reorderFeedbackState.beginReadback(generation: macOS27DesiredGeneration) }
+                Task { @MainActor [weak self] in
+                    guard let self, generation == macOS27DesiredGeneration else { return }
+                    appState.menuBarManager.macOS27Controller.completePendingMove()
+                    appState.menuBarManager.macOS27Controller.endReordering()
+                    let didReadActualOrder = await cacheItemsRegardless(ignoringRecentMovement: true)
+                    guard generation == macOS27DesiredGeneration else { return }
+                    if hadPendingOrder {
+                        reorderFeedbackState.finishReadback(generation: generation, failure: .modeChanged, succeeded: didReadActualOrder)
+                    } else {
+                        reorderFeedbackState.reset(generation: generation)
+                    }
                 }
             }
             .store(in: &c)
@@ -149,7 +182,7 @@ extension MenuBarItemManager {
     /// An actor that manages menu bar item cache operations.
     private final actor CacheActor {
         /// Stored task for the current cache operation.
-        private var cacheTask: Task<Void, Never>?
+        private var cacheTask: Task<Bool, Never>?
 
         /// A list of the menu bar item window identifiers at the time
         /// of the previous cache.
@@ -160,11 +193,21 @@ extension MenuBarItemManager {
         ///
         /// If a task from a previous call to this method is currently
         /// running, that task is cancelled and replaced.
-        func runCacheTask(_ operation: @escaping () async -> Void) async {
+        private var generation: UInt64 = 0
+
+        func cancel(through generation: UInt64) {
+            guard generation >= self.generation else { return }
+            self.generation = generation
+            cacheTask.take()?.cancel()
+        }
+
+        func runCacheTask(generation: UInt64, _ operation: @escaping () async -> Bool) async -> Bool {
+            guard generation >= self.generation else { return false }
+            self.generation = generation
             cacheTask.take()?.cancel()
             let task = Task(operation: operation)
             cacheTask = task
-            await withTaskCancellationHandler {
+            return await withTaskCancellationHandler {
                 await task.value
             } onCancel: {
                 task.cancel()
@@ -390,17 +433,21 @@ extension MenuBarItemManager {
         logger.debug("Updated menu bar item cache")
     }
 
-    /// Accept a user's native Command-drag before hiding. Ice's visible button
-    /// is the sole divider: repair only our own blank item if the user dropped
-    /// between the pair, then read membership from the expanded physical order.
+    /// Verify our boundary without clicking or impersonating system controls.
     @available(macOS 27.0, *)
-    func alignNativeHidingBoundary(updatingCache: Bool, displayID: CGDirectDisplayID? = nil) async -> Bool {
+    func alignNativeHidingBoundary(
+        updatingCache: Bool,
+        displayID: CGDirectDisplayID? = nil,
+        section: MenuBarSection.Name = .hidden,
+        targetTag: MenuBarItemTag = .visibleControlItem
+    ) async -> Bool {
         guard let appState else { return false }
+        let displayGeneration = macOS27DisplaySession.generation
         let controller = appState.menuBarManager.macOS27Controller
         // An ordinary click does not need a fixed settling delay or an AX
         // walk through other applications when our native pair is already
         // ready. Never use saved positions or retained frames for this check.
-        if let displayID,
+        if let displayID, section == .hidden,
             !controller.isLayoutEditing,
             !appState.settings.advanced.enableAlwaysHiddenSection,
             !Task.isCancelled {
@@ -410,7 +457,7 @@ extension MenuBarItemManager {
                 if attempt > 0 {
                     do { try await Task.sleep(for: .milliseconds(16)) } catch { return false }
                 }
-                guard !Task.isCancelled else { return false }
+                guard !Task.isCancelled, macOS27DisplaySession.generation == displayGeneration else { return false }
                 if nativeHidingBoundaryIsReady(on: displayID) {
                     return true
                 }
@@ -419,37 +466,67 @@ extension MenuBarItemManager {
         // Reinsertion changes native hit regions before AX updates all owners.
         // Let that one layout transaction finish before resolving a drag.
         do { try await Task.sleep(for: .milliseconds(200)) } catch { return false }
+        guard macOS27DisplaySession.generation == displayGeneration else { return false }
         var snapshot = await currentMacOS27ReorderSnapshot(appState: appState)
+        guard macOS27DisplaySession.generation == displayGeneration else { return false }
         // A withdrawn boundary takes a short native layout pass to reappear.
         // Never substitute a retained (possibly concealed) frame for this read.
-        for _ in 0 ..< 6 where snapshot.first(matching: .nativeBoundary(for: .hidden)) == nil {
+        for _ in 0 ..< 6 where snapshot.first(matching: .nativeBoundary(for: section)) == nil {
             do { try await Task.sleep(for: .milliseconds(35)) } catch { return false }
             snapshot = await currentMacOS27ReorderSnapshot(appState: appState)
+            guard macOS27DisplaySession.generation == displayGeneration else { return false }
         }
         guard !Task.isCancelled,
-            let ice = snapshot.first(matching: .visibleControlItem),
-            let boundary = snapshot.first(matching: .nativeBoundary(for: .hidden)) else { return false }
+            let ice = snapshot.first(matching: targetTag),
+            let boundary = snapshot.first(matching: .nativeBoundary(for: section)) else { return false }
 
         let destination = MoveDestination.leftOfItem(ice)
-        let order = snapshot.sorted { $0.bounds.minX < $1.bounds.minX }.map(\.tag)
+        // System privacy indicators can sit between our two items without
+        // belonging to the user-managed section. Their presence is not a gap.
+        let order = snapshot.filter { $0.canBeHidden || $0.isControlItem }.sorted { $0.bounds.minX < $1.bounds.minX }.map(\.tag)
         logger.notice("Preparing native boundary \(boundary.bounds.debugDescription, privacy: .public) beside Ice \(ice.bounds.debugDescription, privacy: .public)")
         if !MacOS27NativeBoundary.isImmediatelyBefore(boundary.tag, ice.tag, in: order) {
-            guard await performMacOS27NativeMove(
+            guard controller.isLayoutEditing else {
+                logger.error("Visibility changes never synthesize input to repair a boundary")
+                return false
+            }
+            appState.menuBarManager.prepareNativeBoundaryForDragging(section: section)
+            // Resizing changes all left-hand frames. Never drag using the old
+            // narrow handle's coordinates, and allow the hosted hit map to settle.
+            var ready = false
+            for _ in 0 ..< 12 {
+                do { try await Task.sleep(for: .milliseconds(50)) } catch { return false }
+                snapshot = await currentMacOS27ReorderSnapshot(appState: appState)
+                guard macOS27DisplaySession.generation == displayGeneration else { return false }
+                guard let handle = snapshot.first(matching: boundary.tag),
+                    snapshot.first(matching: ice.tag) != nil,
+                    handle.bounds.width >= 20 else { continue }
+                ready = true
+                break
+            }
+            guard ready else {
+                let ownFrames = snapshot.filter { $0.tag.namespace == .ice }.map { "\($0.tag.title):\($0.bounds)" }.joined(separator: "; ")
+                logger.error("Native repair handle did not settle: \(ownFrames, privacy: .public)")
+                return false
+            }
+            guard (try? await performMacOS27NativeMove(
                 item: boundary,
                 destination: destination,
                 contextItems: snapshot,
-                appState: appState
-            ) else { return false }
+                appState: appState,
+                displayGeneration: displayGeneration
+            )) == true else { return false }
             snapshot = await currentMacOS27ReorderSnapshot(appState: appState)
+            guard macOS27DisplaySession.generation == displayGeneration else { return false }
         }
         guard !Task.isCancelled,
-            let currentIce = snapshot.first(matching: .visibleControlItem),
-            let currentBoundary = snapshot.first(matching: .nativeBoundary(for: .hidden)),
+            let currentIce = snapshot.first(matching: targetTag),
+            let currentBoundary = snapshot.first(matching: .nativeBoundary(for: section)),
             MacOS27NativeBoundary.side(of: currentBoundary.bounds, relativeTo: currentIce.bounds) == .left,
             MacOS27NativeBoundary.isImmediatelyBefore(
                 currentBoundary.tag,
                 currentIce.tag,
-                in: snapshot.sorted { $0.bounds.minX < $1.bounds.minX }.map(\.tag)
+                in: snapshot.filter { $0.canBeHidden || $0.isControlItem }.sorted { $0.bounds.minX < $1.bounds.minX }.map(\.tag)
             )
         else { return false }
         guard updatingCache else { return true }
@@ -465,7 +542,7 @@ extension MenuBarItemManager {
 
     @available(macOS 27.0, *)
     private func nativeHidingBoundaryIsReady(on displayID: CGDirectDisplayID) -> Bool {
-        let items = MacOS27MenuBarItemProvider.ownMenuBarItems()
+        let items = MacOS27MenuBarItemProvider.ownMenuBarItems(on: displayID)
         let boundaryTag = MenuBarItemTag.nativeBoundary(for: .hidden)
         guard NSScreen.screens.contains(where: { $0.displayID == displayID }),
             let boundary = items.first(matching: boundaryTag),
@@ -477,7 +554,7 @@ extension MenuBarItemManager {
         // system-wide hit map can still describe the previous native layout
         // after our owner geometry has settled, so it must not gate a resize.
         // Actual drag operations continue to verify their input targets.
-        let checked = MacOS27MenuBarItemProvider.ownMenuBarItems()
+        let checked = MacOS27MenuBarItemProvider.ownMenuBarItems(on: displayID)
         return checked.first(matching: boundaryTag)?.bounds == boundary.bounds &&
             checked.first(matching: .visibleControlItem)?.bounds == ice.bounds
     }
@@ -488,14 +565,22 @@ extension MenuBarItemManager {
     /// Before caching, this method ensures that the control items for
     /// the hidden and always-hidden sections are correctly ordered,
     /// arranging them into valid positions if needed.
+    @discardableResult
     func cacheItemsRegardless(
         _ currentItemWindowIDs: [CGWindowID]? = nil,
         ignoringRecentMovement: Bool = false,
         refreshingAllOwners: Bool = false
-    ) async {
-        await cacheActor.runCacheTask { [weak self] in
-            guard let self else {
-                return
+    ) async -> Bool {
+        cachePublicationGeneration &+= 1
+        let requestGeneration = cachePublicationGeneration
+        return await cacheActor.runCacheTask(generation: requestGeneration) { [weak self] in
+            guard let self, requestGeneration == cachePublicationGeneration else {
+                return false
+            }
+            defer {
+                if Task.isCancelled || requestGeneration != cachePublicationGeneration {
+                    logger.notice("Discarded cancelled/stale cache generation \(requestGeneration, privacy: .public)")
+                }
             }
 
             guard
@@ -503,15 +588,32 @@ extension MenuBarItemManager {
                     !lastMoveOperationOccurred(within: .seconds(1))
             else {
                 logger.debug("Skipping menu bar item cache due to recent item movement")
-                return
+                return false
             }
 
             let displayID = Bridging.getActiveMenuBarDisplayID()
+            let displayChanged = if #available(macOS 27.0, *) {
+                macOS27DisplaySession.select(displayID)
+            } else { false }
+            let displayGeneration = macOS27DisplaySession.generation
+            if #available(macOS 27.0, *), displayChanged {
+                let hadPendingOrder = macOS27DesiredCache != nil
+                discardMacOS27DesiredOrder()
+                if hadPendingOrder { reorderFeedbackState.beginReadback(generation: macOS27DesiredGeneration) }
+            }
+            let feedbackGeneration = macOS27DesiredGeneration
             var items: [MenuBarItem]
+            let hasFreshSnapshot = true
+            let scanContext = NativeMenuBarScanContext(purpose: "cache-\(requestGeneration)", budget: 3)
+            let interactionGeneration = appState?.menuBarManager.macOS27Controller.interactionGeneration
+            let usesSystemOverflow = appState?.menuBarManager.usesSystemOverflow
+            let requiredNamespaces = Set(appState?.menuBarManager.macOS27Controller.knownItemsForReordering().map(\.tag.namespace) ?? [])
             if
                 #available(macOS 27.0, *),
                 let controller = appState?.menuBarManager.macOS27Controller,
                 controller.isLayoutEditing,
+                !displayChanged,
+                itemCache.displayID == displayID,
                 !refreshingAllOwners
             {
                 // Refresh only this Layout session's owners while editing instead
@@ -520,46 +622,87 @@ extension MenuBarItemManager {
                 // of seconds and make a drop look as though it failed.
                 // The session keeps zero-item hosts for later republishing;
                 // entering the pane still performs one explicit full scan.
-                let knownItems = controller.knownItemsForReordering()
+                guard let displayID else { return false }
                 let (sourcePIDs, namespaces) = controller.ownersForLayoutRefresh()
                 if sourcePIDs.isEmpty && namespaces.isEmpty {
                     // Settings can restore directly into Layout at launch.
-                    items = await MenuBarItem.getMenuBarItems(option: .activeSpace)
+                    let snapshot = await MacOS27MenuBarItemProvider.menuBarItems(on: displayID, option: .activeSpace, context: scanContext, requiring: requiredNamespaces)
+                    guard let complete = snapshot.completeValue else { return false }
+                    items = complete
                 } else {
-                    let targetedItems = await Task.detached(priority: .userInitiated) {
-                        MacOS27MenuBarItemProvider.menuBarItems(
-                            sourcePIDs: sourcePIDs,
-                            namespaces: namespaces
-                        )
-                    }.value
-                    items = targetedItems.isEmpty ? knownItems : targetedItems
+                    let snapshot = await MacOS27MenuBarItemProvider.menuBarItems(
+                        sourcePIDs: sourcePIDs, namespaces: namespaces, on: displayID, context: scanContext
+                    )
+                    guard let complete = snapshot.completeValue else { return false }
+                    items = complete
                 }
+            } else if #available(macOS 27.0, *) {
+                guard let displayID else { return false }
+                let snapshot = await MacOS27MenuBarItemProvider.menuBarItems(on: displayID, option: .activeSpace, context: scanContext, requiring: requiredNamespaces)
+                guard let complete = snapshot.completeValue else { return false }
+                items = complete
             } else {
                 items = await MenuBarItem.getMenuBarItems(option: .activeSpace)
             }
 
-            guard !Task.isCancelled else { return }
+            if #available(macOS 27.0, *) {
+                guard displayID == Bridging.getActiveMenuBarDisplayID() else { return false }
+            }
+            guard !Task.isCancelled, requestGeneration == cachePublicationGeneration else { return false }
             let itemWindowIDs = currentItemWindowIDs ?? items.reversed().map { $0.windowID }
             await cacheActor.updateCachedItemWindowIDs(itemWindowIDs)
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, requestGeneration == cachePublicationGeneration else { return false }
 
             if #available(macOS 27.0, *) {
+                guard macOS27DisplaySession.generation == displayGeneration,
+                    displayID == Bridging.getActiveMenuBarDisplayID(),
+                    requestGeneration == cachePublicationGeneration,
+                    interactionGeneration == appState?.menuBarManager.macOS27Controller.interactionGeneration,
+                    usesSystemOverflow == appState?.menuBarManager.usesSystemOverflow else {
+                    logger.notice("Discarded stale AX cache request generation \(requestGeneration, privacy: .public)")
+                    return false
+                }
                 let managedItems = items.filter { item in
                     guard item.canBeHidden, !item.isSystemClone else { return false }
                     return !item.isControlItem
                 }
+                let candidates = appState?.menuBarManager.macOS27Controller.absenceCandidates(
+                    liveItems: managedItems, sourceItems: items, displayID: displayID ?? 0
+                ) ?? []
+                var confirmedAbsent = Set<String>()
+                if !candidates.isEmpty {
+                    let absence = await MacOS27MenuBarItemProvider.confirmedAbsentIdentifiers(for: candidates, context: scanContext)
+                    guard let confirmed = absence.completeValue else { return false }
+                    confirmedAbsent = confirmed
+                }
+                guard !Task.isCancelled, requestGeneration == cachePublicationGeneration,
+                    displayGeneration == macOS27DisplaySession.generation,
+                    displayID == Bridging.getActiveMenuBarDisplayID(),
+                    interactionGeneration == appState?.menuBarManager.macOS27Controller.interactionGeneration,
+                    usesSystemOverflow == appState?.menuBarManager.usesSystemOverflow else { return false }
                 let updatedCache = appState?.menuBarManager.macOS27Controller.makeCache(
                     liveItems: managedItems,
                     sourceItems: items,
-                    displayID: displayID
+                    displayID: displayID,
+                    usesSystemOverflow: appState?.menuBarManager.usesSystemOverflow == true,
+                    confirmedAbsentIdentifiers: confirmedAbsent
                 ) ?? ItemCache(displayID: displayID)
                 let cacheToPublish = macOS27DesiredCache ?? macOS27ProjectedCache ?? updatedCache
                 if itemCache != cacheToPublish {
                     itemCache = cacheToPublish
                     logger.debug("Updated macOS 27 assignment-backed menu bar item cache")
                 }
+                let publishedActualOrder = hasFreshSnapshot && macOS27DesiredCache == nil && macOS27ProjectedCache == nil
                 appState?.menuBarManager.syncNativeVisibility()
-                return
+                if displayChanged, feedbackGeneration == macOS27DesiredGeneration,
+                    reorderFeedback == .readingActualOrder {
+                    reorderFeedbackState.finishReadback(
+                        generation: feedbackGeneration,
+                        failure: .displayChanged,
+                        succeeded: publishedActualOrder
+                    )
+                }
+                return publishedActualOrder
             }
 
             guard let controlItems = ControlItemPair(items: &items) else {
@@ -567,13 +710,21 @@ extension MenuBarItemManager {
                 logger.warning("Missing control item for hidden section, clearing menu bar item cache")
                 itemCache = ItemCache(displayID: nil)
                 hasCompletedInitialCache = true
-                return
+                return false
             }
 
             await enforceControlItemOrder(controlItems: controlItems)
             await uncheckedCacheItems(items: items, controlItems: controlItems, displayID: displayID)
             hasCompletedInitialCache = true
+            return true
         }
+    }
+
+    func cancelLayoutReads() {
+        cachePublicationGeneration &+= 1
+        let generation = cachePublicationGeneration
+        Task { await cacheActor.cancel(through: generation) }
+        appState?.imageCache.cancelLayoutReads()
     }
 
     /// Caches the current menu bar items, if the items have changed
@@ -640,27 +791,27 @@ extension MenuBarItemManager {
         var errorDescription: String? {
             switch self {
             case .cannotComplete:
-                "Operation could not be completed"
+                String(localized: "Operation could not be completed")
             case .invalidEventSource:
-                "Invalid event source"
+                String(localized: "Invalid event source")
             case .missingMouseLocation:
-                "Missing mouse location"
+                String(localized: "Missing mouse location")
             case .eventCreationFailure(let item):
-                "Could not create event for \"\(item.displayName)\""
+                String(localized: "Could not create event for \"\(item.displayName)\"")
             case .eventOperationTimeout(let item):
-                "Event operation timed out for \"\(item.displayName)\""
+                String(localized: "Event operation timed out for \"\(item.displayName)\"")
             case .itemNotMovable(let item):
-                "\"\(item.displayName)\" is not movable"
+                String(localized: "\"\(item.displayName)\" is not movable")
             case .itemResponseTimeout(let item):
-                "\"\(item.displayName)\" took too long to respond"
+                String(localized: "\"\(item.displayName)\" took too long to respond")
             case .missingItemBounds(let item):
-                "Missing bounds rectangle for \"\(item.displayName)\""
+                String(localized: "Missing bounds rectangle for \"\(item.displayName)\"")
             }
         }
 
         var recoverySuggestion: String? {
             if case .itemNotMovable = self { return nil }
-            return "Please try again. If the error persists, please file a bug report."
+            return String(localized: "Please try again. If the error persists, please file a bug report.")
         }
     }
 
@@ -1153,7 +1304,7 @@ extension MenuBarItemManager {
         among snapshot: [MenuBarItem],
         requiredSection: MenuBarSection.Name? = nil
     ) -> Bool {
-        let items = snapshot.sorted { $0.bounds.minX < $1.bounds.minX }
+        let items = snapshot.filter { $0.canBeHidden || $0.isControlItem }.sorted { $0.bounds.minX < $1.bounds.minX }
 
         func index(of needle: MenuBarItem) -> Int? {
             items.firstIndex { $0.windowID == needle.windowID }
@@ -1197,7 +1348,11 @@ extension MenuBarItemManager {
         additionallyRequiring additionalTags: Set<MenuBarItemTag> = []
     ) async -> [MenuBarItem] {
         let target = destination.targetItem
-        let ordered = contextItems.sorted { $0.bounds.minX < $1.bounds.minX }
+        guard let displayID = MacOS27MenuBarItemProvider.displayID(containing: item.bounds),
+            MacOS27MenuBarItemProvider.displayID(containing: target.bounds) == displayID else { return [] }
+        let ordered = contextItems.filter {
+            MacOS27MenuBarItemProvider.displayID(containing: $0.bounds) == displayID
+        }.sorted { $0.bounds.minX < $1.bounds.minX }
         var relevantItems = [item, target]
 
         if
@@ -1234,12 +1389,10 @@ extension MenuBarItemManager {
             $0.sourcePID ?? $0.ownerPID
         })
         let namespaces = Set(relevantItems.map(\.tag.namespace))
-        return await Task.detached(priority: .userInitiated) {
-            MacOS27MenuBarItemProvider.menuBarItems(
-                sourcePIDs: sourcePIDs,
-                namespaces: namespaces
-            )
-        }.value
+        let snapshot = await MacOS27MenuBarItemProvider.menuBarItems(
+            sourcePIDs: sourcePIDs, namespaces: namespaces, on: displayID
+        )
+        return snapshot.completeValue ?? []
     }
 
     /// Refreshes the physical range touched by a user-initiated move and merges
@@ -1273,90 +1426,88 @@ extension MenuBarItemManager {
         // A just-launched owner may not have reached the controller snapshot
         // yet. Fall back to one complete walk only when a required endpoint is
         // genuinely absent from the fast path.
-        return await Task.detached(priority: .userInitiated) {
-            MacOS27MenuBarItemProvider.menuBarItems(on: nil, option: .activeSpace)
-        }.value
+        guard let displayID = MacOS27MenuBarItemProvider.displayID(containing: item.bounds) else { return [] }
+        let snapshot = await MacOS27MenuBarItemProvider.menuBarItems(
+            on: displayID, option: .activeSpace, requiring: Set(knownItems.map(\.tag.namespace))
+        )
+        return snapshot.completeValue ?? []
     }
 
-    /// Clicks MenuBarAgent's native overflow control so concealed items expose
-    /// usable hit targets before macOS 27 status-item reordering begins.
+    /// Sends one continuous native gesture. A passive receipt listener bounds
+    /// release cleanup; only fresh AX snapshots can confirm the requested order.
     @available(macOS 27.0, *)
-    private nonisolated func postMacOS27OverflowClick(at point: CGPoint) async throws {
-        try Task.checkCancellation()
-        let originalMouseLocation = try getMouseLocation()
-        let source = try getEventSource(with: .combinedSessionState)
-        try permitLocalEvents()
-        guard let mouseDown = CGEvent(
-            mouseEventSource: source,
-            mouseType: .leftMouseDown,
-            mouseCursorPosition: point,
-            mouseButton: .left
-        ), let mouseUp = CGEvent(
-            mouseEventSource: source,
-            mouseType: .leftMouseUp,
-            mouseCursorPosition: point,
-            mouseButton: .left
-        ) else { throw EventError.cannotComplete }
-        mouseDown.flags = .maskNonCoalesced
-        mouseUp.flags = .maskNonCoalesced
-        var mouseIsDown = false
-        MouseHelpers.hideCursor()
-        defer {
-            if mouseIsDown { mouseUp.post(tap: .cghidEventTap) }
-            MouseHelpers.warpCursor(to: originalMouseLocation)
-            MouseHelpers.showCursor()
-        }
-        MouseHelpers.warpCursor(to: point)
-        await eventSleep(for: .milliseconds(24))
-        mouseDown.post(tap: .cghidEventTap)
-        mouseIsDown = true
-        await eventSleep(for: .milliseconds(55))
-        mouseUp.post(tap: .cghidEventTap)
-        mouseIsDown = false
-    }
-
-    /// Posts the native Command-drag that MenuBarAgent uses for macOS 27
-    /// status-item reordering, for Layout or alignment of Ice's own boundary.
-    @available(macOS 27.0, *)
-    private nonisolated func postMacOS27CommandDrag(
+    private func postMacOS27CommandDrag(
         item: MenuBarItem,
-        destination: MoveDestination
+        destination: MoveDestination,
+        displayGeneration: UInt64
     ) async throws {
         try Task.checkCancellation()
-        let itemBounds = item.bounds
+        // A settled Layout request does not mean the physical pointer has
+        // stopped. Let the user finish their drop before taking cursor ownership.
+        let inputDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !NativeMenuBarInteraction.inputIsQuiet(
+            buttonsDown: MouseHelpers.isButtonPressed(),
+            flags: CGEventSource.flagsState(.combinedSessionState),
+            recentlyMoved: MouseHelpers.lastMovementOccurred(within: .milliseconds(200)),
+            recentlyScrolled: MouseHelpers.lastScrollWheelOccurred(within: .milliseconds(200))
+        ) {
+            try Task.checkCancellation()
+            guard ContinuousClock.now < inputDeadline else {
+                self.logger.notice("Native handoff stopped phase=waiting-for-idle reason=deadline buttons=\(MouseHelpers.isButtonPressed()) modifiers=\(!NativeMenuBarInteraction.canStartDrag(buttonsDown: false, flags: CGEventSource.flagsState(.combinedSessionState))) recent_move=\(MouseHelpers.lastMovementOccurred(within: .milliseconds(200))) recent_scroll=\(MouseHelpers.lastScrollWheelOccurred(within: .milliseconds(200)))")
+                throw NativeReorderFailure.inputInterrupted
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        logger.notice("Native handoff phase=idle-ready")
+        let start = item.bounds.center
         let targetBounds = destination.targetItem.bounds
-        let start = itemBounds.center
         let endX = switch destination {
         case .leftOfItem:
             MacOS27NativeBoundary.dragDestinationX(target: targetBounds, placingBefore: true)
         case .rightOfItem:
             MacOS27NativeBoundary.dragDestinationX(target: targetBounds, placingBefore: false)
         }
-        let end = CGPoint(
-            x: endX,
-            y: targetBounds.midY
-        )
-        let originalMouseLocation = try getMouseLocation()
+        let end = CGPoint(x: endX, y: targetBounds.midY)
         let source = try getEventSource(with: .combinedSessionState)
         try permitLocalEvents()
+        let token = Int64.random(in: 1 ... Int64.max)
+        var session = NativeMenuBarDragSession(token: token, start: start)
+        let deliveryTap = EventTap(
+            label: "Native drag delivery",
+            types: [
+                .mouseMoved, .leftMouseDown, .leftMouseDragged, .leftMouseUp,
+                .rightMouseDown, .rightMouseDragged, .rightMouseUp,
+                .otherMouseDown, .otherMouseDragged, .otherMouseUp,
+                .scrollWheel, .keyDown, .keyUp, .flagsChanged,
+            ],
+            location: .annotatedSessionEventTap,
+            placement: .tailAppendEventTap,
+            option: .listenOnly
+        ) { _, event in
+            // Foreign input is only a stop signal: never log, consume or alter it.
+            session.observe(
+                type: event.type,
+                token: event.getIntegerValueField(.eventSourceUserData),
+                point: event.location,
+                delta: CGPoint(
+                    x: CGFloat(event.getIntegerValueField(.mouseEventDeltaX)),
+                    y: CGFloat(event.getIntegerValueField(.mouseEventDeltaY))
+                )
+            )
+            return event
+        }
+        guard deliveryTap.isValid else { throw NativeReorderFailure.eventDeliveryFailed }
+        deliveryTap.enable()
+        defer { deliveryTap.disable() }
 
         guard
-            let commandDown = CGEvent(
-                keyboardEventSource: source,
-                virtualKey: 0x37,
-                keyDown: true
-            ),
-            let commandUp = CGEvent(
-                keyboardEventSource: source,
-                virtualKey: 0x37,
-                keyDown: false
-            )
-        else {
-            throw EventError.eventCreationFailure(item)
-        }
+            let commandDown = CGEvent(keyboardEventSource: source, virtualKey: 0x37, keyDown: true),
+            let commandUp = CGEvent(keyboardEventSource: source, virtualKey: 0x37, keyDown: false)
+        else { throw EventError.eventCreationFailure(item) }
         commandDown.flags = .maskCommand
-        var commandIsDown = false
-        var mouseIsDown = false
+        commandUp.flags = []
+        commandDown.setIntegerValueField(.eventSourceUserData, value: token)
+        commandUp.setIntegerValueField(.eventSourceUserData, value: token)
 
         func event(_ type: CGEventType, at point: CGPoint) throws -> CGEvent {
             guard let event = CGEvent(
@@ -1364,53 +1515,140 @@ extension MenuBarItemManager {
                 mouseType: type,
                 mouseCursorPosition: point,
                 mouseButton: .left
-            ) else {
-                throw EventError.eventCreationFailure(item)
-            }
-            // Long moves need one non-coalesced sample for every crossed
-            // insertion boundary so crossing several neighbors is one drag.
+            ) else { throw EventError.eventCreationFailure(item) }
             event.flags = [.maskCommand, .maskNonCoalesced]
+            event.setIntegerValueField(.eventSourceUserData, value: token)
             return event
         }
-
-        let mouseUp = try event(.leftMouseUp, at: end)
-        MouseHelpers.hideCursor()
+        // Construct the whole gesture, including releases, before sending input.
+        let mouseDown = try event(.leftMouseDown, at: start)
+        let mouseUp = try event(.leftMouseUp, at: start)
+        let hover = try event(.mouseMoved, at: start)
+        hover.flags = []
+        let path = try NativeMenuBarDragSession.path(from: start, to: end).map {
+            try event(.leftMouseDragged, at: $0)
+        }
+        var originalMouseLocation: CGPoint?
         defer {
-            if mouseIsDown { mouseUp.post(tap: .cghidEventTap) }
-            if commandIsDown {
-                commandUp.post(tap: .cghidEventTap)
+            if let originalMouseLocation {
+                if session.canRestoreCursor, macOS27DisplaySession.generation == displayGeneration,
+                    MouseHelpers.locationCoreGraphics == session.lastPoint,
+                    NativeMenuBarInteraction.canStartDrag(
+                        buttonsDown: MouseHelpers.isButtonPressed(),
+                        flags: CGEventSource.flagsState(.combinedSessionState)
+                    ) {
+                    MouseHelpers.warpCursor(to: originalMouseLocation)
+                }
+                MouseHelpers.showCursor()
             }
-            MouseHelpers.warpCursor(to: originalMouseLocation)
-            MouseHelpers.showCursor()
         }
 
-        MouseHelpers.warpCursor(to: start)
-        commandDown.post(tap: .cghidEventTap)
-        commandIsDown = true
-        await eventSleep(for: .milliseconds(24))
-        // Before mouse-down a cancelled request can still stop safely. Once
-        // pressed, finish the drag and release both inputs before unpinning.
-        try Task.checkCancellation()
-        try event(.leftMouseDown, at: start).post(tap: .cghidEventTap)
-        mouseIsDown = true
-        await eventSleep(for: .milliseconds(55))
-
-        let distance = abs(end.x - start.x)
-        let steps = max(12, min(42, Int(ceil(distance / 6))))
-        for index in 1 ... steps {
-            let progress = CGFloat(index) / CGFloat(steps)
-            let point = CGPoint(
-                x: start.x + (end.x - start.x) * progress,
-                y: start.y + (end.y - start.y) * progress
-            )
-            try event(.leftMouseDragged, at: point).post(tap: .cghidEventTap)
-            await eventSleep(for: .milliseconds(5))
+        func validateEndpointsAndInput() throws {
+            guard let displayID = MacOS27MenuBarItemProvider.displayID(containing: item.bounds),
+                displayID == itemCache.displayID,
+                displayID == Bridging.getActiveMenuBarDisplayID(),
+                MacOS27MenuBarItemProvider.displayID(containing: destination.targetItem.bounds) == displayID,
+                MacOS27MenuBarItemProvider.nativeHitMatches(item),
+                MacOS27MenuBarItemProvider.nativeHitMatches(destination.targetItem) else {
+                throw NativeReorderFailure.endpointUnavailable
+            }
+            guard appState?.menuBarManager.appVisibilityAccess.blocksMenuBarChanges != true else { throw NativeReorderFailure.visibilityChanging }
+            // AX can block while real input continues. Check physical state last.
+            let buttonsDown = [CGMouseButton.left, .right, .center].contains {
+                CGEventSource.buttonState(.combinedSessionState, button: $0)
+            }
+            guard macOS27DisplaySession.generation == displayGeneration,
+                displayID == Bridging.getActiveMenuBarDisplayID() else { throw NativeReorderFailure.displayChanged }
+            guard !session.interrupted else { throw NativeReorderFailure.inputInterrupted }
+            guard deliveryTap.isEnabled,
+                NativeMenuBarInteraction.canStartDrag(
+                    buttonsDown: buttonsDown,
+                    flags: CGEventSource.flagsState(.combinedSessionState)
+                ) else { throw NativeReorderFailure.inputInterrupted }
+            try Task.checkCancellation()
         }
-        await eventSleep(for: .milliseconds(28))
-        mouseUp.post(tap: .cghidEventTap)
-        mouseIsDown = false
-        commandUp.post(tap: .cghidEventTap)
-        commandIsDown = false
+
+        let gestureStart = ContinuousClock.now
+        var inputStartedAt: ContinuousClock.Instant?
+        func validateContinuation() throws {
+            try Task.checkCancellation()
+            guard macOS27DisplaySession.generation == displayGeneration else { throw NativeReorderFailure.displayChanged }
+            guard !session.interrupted else { throw NativeReorderFailure.inputInterrupted }
+            guard let inputStartedAt, deliveryTap.isEnabled,
+                inputStartedAt.duration(to: .now) < .seconds(2) else { throw NativeReorderFailure.eventDeliveryFailed }
+        }
+
+        var failure: (any Error)?
+        do {
+            try validateEndpointsAndInput()
+            originalMouseLocation = try getMouseLocation()
+            MouseHelpers.hideCursor()
+            MouseHelpers.warpCursor(to: start)
+            // Warping alone does not route a mouse-moved event to MenuBarAgent.
+            session.enter(.hover)
+            hover.post(tap: .cghidEventTap)
+            await eventSleep(for: .milliseconds(80))
+            try validateEndpointsAndInput()
+            // No suspension between final authorization and Command/mouse-down.
+            session.enter(.dragging)
+            inputStartedAt = .now
+            commandDown.post(tap: .cghidEventTap)
+            session.didPressCommand()
+            mouseDown.post(tap: .cghidEventTap)
+            session.didPressMouse()
+            logger.notice("Native gesture began id=\(token, privacy: .public) samples=\(path.count, privacy: .public)")
+            await eventSleep(for: .milliseconds(55))
+            for sample in path {
+                try validateContinuation()
+                sample.post(tap: .cghidEventTap)
+                session.didDrag(to: sample.location)
+                await eventSleep(for: .milliseconds(10))
+            }
+            await eventSleep(for: .milliseconds(28))
+            try validateContinuation()
+        } catch {
+            failure = error
+        }
+
+        // Cleanup ignores cancellation, sends each release once, and stays pinned
+        // until the receipt or deadline. It never starts another gesture.
+        session.enter(.release)
+        let releasePoint = session.takeMouseRelease()
+        if let releasePoint {
+            mouseUp.location = releasePoint
+            mouseUp.post(tap: .cghidEventTap)
+        }
+        let releasedCommand = session.takeCommandRelease()
+        if releasedCommand {
+            commandUp.post(tap: .cghidEventTap)
+        }
+        let deadline = ContinuousClock.now.advanced(by: .milliseconds(250))
+        while releasePoint != nil && !session.mouseReleaseObserved ||
+            releasedCommand && CGEventSource.flagsState(.combinedSessionState).contains(.maskCommand),
+            ContinuousClock.now < deadline {
+            await eventSleep(for: .milliseconds(2))
+        }
+        if let interruption = session.firstInterruption {
+            logger.notice("Native handoff interrupted phase=\(interruption.phase.rawValue, privacy: .public) event_type=\(interruption.type.rawValue) source=\(interruption.source, privacy: .public); no replay")
+        }
+        logger.notice("Native gesture released id=\(token, privacy: .public) observed=\(session.mouseReleaseObserved, privacy: .public) interrupted=\(session.interrupted, privacy: .public) stationary=\(session.stationaryNotifications, privacy: .public) elapsed=\(gestureStart.duration(to: .now).description, privacy: .public)")
+        if let failure { throw failure }
+        guard !session.interrupted else { throw NativeReorderFailure.inputInterrupted }
+        guard releasePoint != nil, session.mouseReleaseObserved,
+            !CGEventSource.flagsState(.combinedSessionState).contains(.maskCommand) else {
+            throw NativeReorderFailure.eventDeliveryFailed
+        }
+    }
+
+    @available(macOS 27.0, *)
+    private func macOS27EndpointIsOwned(_ item: MenuBarItem, appState: AppState) -> Bool {
+        guard case .string(let bundle) = item.tag.namespace else { return false }
+        return appState.menuBarManager.appVisibilityAccess.hasOwnedApplicationChange(bundle)
+    }
+
+    @available(macOS 27.0, *)
+    private func macOS27EndpointFailure(_ item: MenuBarItem, appState: AppState) -> NativeReorderFailure {
+        macOS27EndpointIsOwned(item, appState: appState) ? .applicationHidden : .endpointUnavailable
     }
 
     /// Layout sends a native drag, then observes the actual settled result.
@@ -1421,115 +1659,106 @@ extension MenuBarItemManager {
         destination: MoveDestination,
         contextItems: [MenuBarItem],
         appState: AppState,
-        requiredSection: MenuBarSection.Name? = nil
-    ) async -> Bool {
+        requiredSection: MenuBarSection.Name? = nil,
+        displayGeneration: UInt64? = nil
+    ) async throws -> Bool {
+        let displayGeneration = displayGeneration ?? macOS27DisplaySession.generation
         let isOwnBoundaryAlignment: Bool
         if case .leftOfItem(let target) = destination {
-            isOwnBoundaryAlignment = item.tag == .nativeBoundary(for: .hidden) && target.tag == .visibleControlItem
+            isOwnBoundaryAlignment = (item.tag == .nativeBoundary(for: .hidden) && target.tag == .visibleControlItem) ||
+                item.tag == .nativeBoundary(for: .alwaysHidden)
         } else {
             isOwnBoundaryAlignment = false
         }
-        guard appState.menuBarManager.macOS27Controller.isLayoutEditing || isOwnBoundaryAlignment else { return false }
-        do {
-            try await eventSemaphore.waitUnlessCancelled()
-        } catch {
-            return false
-        }
+        guard appState.menuBarManager.macOS27Controller.isLayoutEditing || isOwnBoundaryAlignment else { throw NativeReorderFailure.endpointUnavailable }
+        try await eventSemaphore.waitUnlessCancelled()
         defer { eventSemaphore.signal() }
 
         var snapshot = contextItems
-        for _ in 0 ..< 2 {
-            guard !Task.isCancelled,
-                var liveItem = snapshot.first(matching: item.tag),
-                var liveTarget = snapshot.first(matching: destination.targetItem.tag)
-            else { return false }
-            if !isOwnBoundaryAlignment &&
-                (!MacOS27MenuBarItemProvider.nativeHitMatches(liveItem) ||
-                    !MacOS27MenuBarItemProvider.nativeHitMatches(liveTarget)) {
-                guard let overflowBounds = MacOS27MenuBarItemProvider.nativeOverflowControlBounds() else {
-                    logger.error("Refusing native drag because an endpoint does not match the native hit map")
-                    return false
-                }
-                do {
-                    try await postMacOS27OverflowClick(at: overflowBounds.center)
-                } catch {
-                    logger.error("Could not reveal macOS 27 overflow items: \(error, privacy: .public)")
-                    return false
-                }
-                var resolvedEndpoints: (MenuBarItem, MenuBarItem)?
-                for _ in 0 ..< 12 {
-                    try? await Task.sleep(for: .milliseconds(80))
-                    guard !Task.isCancelled else { return false }
-                    snapshot = await currentMacOS27ReorderSnapshot(appState: appState)
-                    guard let candidateItem = snapshot.first(matching: item.tag),
-                        let candidateTarget = snapshot.first(matching: destination.targetItem.tag),
-                        MacOS27MenuBarItemProvider.nativeHitMatches(candidateItem),
-                        MacOS27MenuBarItemProvider.nativeHitMatches(candidateTarget) else { continue }
-                    resolvedEndpoints = (candidateItem, candidateTarget)
-                    break
-                }
-                guard let resolvedEndpoints else {
-                    logger.error("macOS 27 overflow item did not publish a usable native hit target")
-                    return false
-                }
-                (liveItem, liveTarget) = resolvedEndpoints
-            }
-            guard NSScreen.screens.contains(where: {
-                MacOS27NativeBoundary.canDrag(
-                    from: liveItem.bounds, to: liveTarget.bounds, on: CGDisplayBounds($0.displayID)
-                )
-            }) else { return false }
-            if isOwnBoundaryAlignment {
-                let hitIdentifier = AXHelpers.element(at: liveItem.bounds.center)
-                    .flatMap { AXHelpers.identifier(for: $0) }
-                guard hitIdentifier == liveItem.tag.title else {
-                    logger.error("Refusing boundary drag: hit target \(hitIdentifier ?? "none", privacy: .public) does not match Ice's boundary at \(liveItem.bounds.debugDescription, privacy: .public)")
-                    return false
-                }
-            }
-            let requested: MoveDestination = switch destination {
-            case .leftOfItem: .leftOfItem(liveTarget)
-            case .rightOfItem: .rightOfItem(liveTarget)
-            }
-            do {
-                appState.menuBarManager.beginNativeDrag()
-                defer { appState.menuBarManager.endNativeDrag() }
-                lastMoveOperationTimestamp = .now
-                try await postMacOS27CommandDrag(item: liveItem, destination: requested)
-                lastMoveOperationTimestamp = .now
-            } catch is CancellationError {
-                return false
-            } catch {
-                logger.error("Native Layout drag failed: \(error, privacy: .public)")
-                return false
-            }
-
-            var verifiedSamples = 0
-            for _ in 0 ..< 12 {
-                try? await Task.sleep(for: .milliseconds(80))
-                guard !Task.isCancelled else { return false }
-                snapshot = await currentMacOS27ReorderSnapshot(appState: appState)
-                guard let moved = snapshot.first(matching: item.tag),
-                    let target = snapshot.first(matching: destination.targetItem.tag)
-                else { continue }
-                let refreshed: MoveDestination = switch destination {
-                case .leftOfItem: .leftOfItem(target)
-                case .rightOfItem: .rightOfItem(target)
-                }
-                if macOS27ItemHasCorrectPosition(
-                    item: moved,
-                    for: refreshed,
-                    among: snapshot,
-                    requiredSection: requiredSection
-                ) {
-                    verifiedSamples += 1
-                    if verifiedSamples == 2 { return true }
-                } else {
-                    verifiedSamples = 0
-                }
+        try Task.checkCancellation()
+        guard !appState.menuBarManager.appVisibilityAccess.blocksMenuBarChanges else { throw NativeReorderFailure.visibilityChanging }
+        guard macOS27DisplaySession.generation == displayGeneration else { throw NativeReorderFailure.displayChanged }
+        guard let liveItem = snapshot.first(matching: item.tag) else { throw macOS27EndpointFailure(item, appState: appState) }
+        guard let liveTarget = snapshot.first(matching: destination.targetItem.tag) else { throw macOS27EndpointFailure(destination.targetItem, appState: appState) }
+        // A visible exact hit always follows the existing native path, even if
+        // an old journal remains after an external system display change.
+        guard MacOS27MenuBarItemProvider.nativeHitMatches(liveItem) else { throw macOS27EndpointFailure(liveItem, appState: appState) }
+        guard MacOS27MenuBarItemProvider.nativeHitMatches(liveTarget) else {
+            // A retained AX frame does not authorize clicking a system
+            // overflow button (or whatever now occupies that coordinate).
+            logger.error("Native drag requires visible endpoints; expand the system overflow manually")
+            throw macOS27EndpointFailure(liveTarget, appState: appState)
+        }
+        guard NSScreen.screens.contains(where: {
+            MacOS27NativeBoundary.canDrag(
+                from: liveItem.bounds, to: liveTarget.bounds, on: CGDisplayBounds($0.displayID)
+            )
+        }) else { throw NativeReorderFailure.endpointUnavailable }
+        if isOwnBoundaryAlignment {
+            guard MacOS27MenuBarItemProvider.nativeBoundaryHitMatches(liveItem),
+                MacOS27MenuBarItemProvider.nativeHitMatches(liveTarget) else {
+                logger.error("Refusing boundary drag: native hit map does not match the boundary or its target")
+                throw NativeReorderFailure.endpointUnavailable
             }
         }
-        return false
+        let requested: MoveDestination = switch destination {
+        case .leftOfItem: .leftOfItem(liveTarget)
+        case .rightOfItem: .rightOfItem(liveTarget)
+        }
+        do {
+            appState.menuBarManager.beginNativeDrag()
+            defer { appState.menuBarManager.endNativeDrag() }
+            lastMoveOperationTimestamp = .now
+            logger.notice("Native drag endpoints authorized; one gesture requested")
+            try await postMacOS27CommandDrag(
+                item: liveItem, destination: requested, displayGeneration: displayGeneration
+            )
+            lastMoveOperationTimestamp = .now
+        } catch {
+            logger.error("Native Layout drag failed: \(error, privacy: .public)")
+            throw error
+        }
+
+        var verifiedSamples = 0
+        for sample in 0 ..< 12 {
+            try? await Task.sleep(for: .milliseconds(80))
+            try Task.checkCancellation()
+            guard macOS27DisplaySession.generation == displayGeneration else { throw NativeReorderFailure.displayChanged }
+            snapshot = await currentMacOS27ReorderSnapshot(appState: appState)
+            guard macOS27DisplaySession.generation == displayGeneration else { throw NativeReorderFailure.displayChanged }
+            guard let moved = snapshot.first(matching: item.tag),
+                let target = snapshot.first(matching: destination.targetItem.tag)
+            else { continue }
+            let refreshed: MoveDestination = switch destination {
+            case .leftOfItem: .leftOfItem(target)
+            case .rightOfItem: .rightOfItem(target)
+            }
+            let positionMatches = macOS27ItemHasCorrectPosition(
+                item: moved,
+                for: refreshed,
+                among: snapshot,
+                requiredSection: requiredSection
+            )
+            if sample == 0 || sample == 11 {
+                logger.notice("Native verification sample=\(sample, privacy: .public) position_matches=\(positionMatches)")
+            }
+            if positionMatches {
+                verifiedSamples += 1
+                if verifiedSamples == 2 {
+                    logger.notice("Native order verified with two fresh AX samples")
+                    return true
+                }
+            } else {
+                verifiedSamples = 0
+            }
+        }
+        if isOwnBoundaryAlignment {
+            logger.error("Native boundary drag did not reach adjacency")
+        }
+        if snapshot.first(matching: item.tag) == nil || snapshot.first(matching: destination.targetItem.tag) == nil {
+            throw NativeReorderFailure.endpointUnavailable
+        }
+        throw NativeReorderFailure.verificationUnconfirmed
     }
 
     /// Waits for a menu bar item to respond to a series of previously
@@ -1703,7 +1932,7 @@ extension MenuBarItemManager {
     private struct MacOS27MoveInstruction {
         let item: MenuBarItem
         let destination: MoveDestination
-        let requiredSection: MenuBarSection.Name
+        let requiredSection: MenuBarSection.Name?
     }
 
     @available(macOS 27.0, *)
@@ -1711,11 +1940,6 @@ extension MenuBarItemManager {
         case converged
         case incomplete
         case needsMove(MenuBarItemTag)
-    }
-
-    @available(macOS 27.0, *)
-    private enum MacOS27ReorderError: Error {
-        case endpointUnavailable
     }
 
     /// Records one Layout edit in the desired cache and returns immediately.
@@ -1805,9 +2029,14 @@ extension MenuBarItemManager {
         sourceTag: MenuBarItemTag,
         touchedTags: Set<MenuBarItemTag>
     ) {
+        guard appState?.menuBarManager.appVisibilityAccess.blocksMenuBarChanges != true else {
+            logger.notice("Rejected new order while application visibility changes; no gesture queued")
+            return
+        }
         macOS27DesiredGeneration &+= 1
         let generation = macOS27DesiredGeneration
         macOS27DesiredCache = desired
+        reorderFeedbackState.begin(generation: generation)
         macOS27TouchedMoveTags.formUnion(touchedTags)
         appState?.menuBarManager.macOS27Controller.beginReordering()
         macOS27PendingMoveGenerations[sourceTag] = generation
@@ -1852,36 +2081,36 @@ extension MenuBarItemManager {
 
     @available(macOS 27.0, *)
     private func macOS27MoveInstruction(
-        for tag: MenuBarItemTag,
+        for step: NativeReorderPlan.Step<MenuBarItemTag>,
         desiredCache: ItemCache,
         appState: AppState
-    ) -> MacOS27MoveInstruction? {
-        guard let address = desiredCache.address(for: tag) else { return nil }
+    ) throws -> MacOS27MoveInstruction {
+        guard let address = desiredCache.address(for: step.source) else { throw NativeReorderFailure.endpointUnavailable }
         let items = desiredCache[address.section]
-        guard items.indices.contains(address.index) else { return nil }
+        guard items.indices.contains(address.index) else { throw NativeReorderFailure.endpointUnavailable }
         let item = items[address.index]
+        // Normal-mode rows are retained assignments, not physical partitions.
+        // Even a Visible neighbor can be left of FloeBar after native overflow.
+        let requiredSection: MenuBarSection.Name? =
+            appState.menuBarManager.usesSystemOverflow ? nil : address.section
 
-        if items.indices.contains(address.index + 1) {
+        if let anchor = step.anchor,
+            let target = desiredCache.managedItems.first(matching: anchor) {
             return MacOS27MoveInstruction(
                 item: item,
-                destination: .leftOfItem(items[address.index + 1]),
-                requiredSection: address.section
+                destination: step.placingBefore ? .leftOfItem(target) : .rightOfItem(target),
+                requiredSection: requiredSection
             )
         }
-        if items.indices.contains(address.index - 1) {
-            return MacOS27MoveInstruction(
-                item: item,
-                destination: .rightOfItem(items[address.index - 1]),
-                requiredSection: address.section
-            )
-        }
-
+        // An empty Visible row has no real neighbor; this explicit destination
+        // still means the right side of the real FloeBar control item.
+        guard requiredSection != nil || address.section == .visible else { throw NativeReorderFailure.endpointUnavailable }
         guard
             let iceItem = appState.menuBarManager.macOS27Controller
                 .knownItemsForReordering()
                 .first(matching: .nativeBoundary(for: address.section))
         else {
-            return nil
+            throw NativeReorderFailure.endpointUnavailable
         }
         return MacOS27MoveInstruction(
             item: item,
@@ -1897,21 +2126,24 @@ extension MenuBarItemManager {
     /// result: an absent hosted child must settle before a batch can pass.
     @available(macOS 27.0, *)
     private func currentMacOS27ReorderSnapshot(appState: AppState) async -> [MenuBarItem] {
+        let displayGeneration = macOS27DisplaySession.generation
+        guard let displayID = itemCache.displayID,
+            displayID == Bridging.getActiveMenuBarDisplayID() else { return [] }
         let knownItems = appState.menuBarManager.macOS27Controller.knownItemsForReordering()
         let sourcePIDs = Set(knownItems.map { $0.sourcePID ?? $0.ownerPID }).union([ProcessInfo.processInfo.processIdentifier])
         let namespaces = Set(knownItems.map(\.tag.namespace)).union([.ice])
-        let refreshed = await Task.detached(priority: .userInitiated) {
-            MacOS27MenuBarItemProvider.menuBarItems(
-                sourcePIDs: sourcePIDs,
-                namespaces: namespaces
-            )
-        }.value
+        let snapshot = await MacOS27MenuBarItemProvider.menuBarItems(
+            sourcePIDs: sourcePIDs, namespaces: namespaces, on: displayID
+        )
+        guard let refreshed = snapshot.completeValue else { return [] }
+        guard macOS27DisplaySession.generation == displayGeneration,
+            itemCache.displayID == displayID,
+            Bridging.getActiveMenuBarDisplayID() == displayID else { return [] }
         return refreshed
     }
 
-    /// Compares the complete affected model, including the Ice boundary, rather
-    /// than accepting one source/target pair that happened to be adjacent in a
-    /// transient AX snapshot.
+    /// Compares the affected order after native movement. Only the private
+    /// backend owns physical section boundaries; normal rows can interleave.
     @available(macOS 27.0, *)
     private func macOS27DesiredOrderStatus(
         desiredCache: ItemCache,
@@ -1922,53 +2154,26 @@ extension MenuBarItemManager {
             .hidden,
             .visible,
         ]
-        var seenTags = Set<MenuBarItemTag>()
-        let desiredTags: [MenuBarItemTag] = physicalSections.flatMap { section -> [MenuBarItemTag] in
-            desiredCache[section].compactMap { item -> MenuBarItemTag? in
-                guard macOS27TouchedMoveTags.contains(item.tag) else {
-                    return nil
-                }
-                return seenTags.insert(item.tag).inserted
-                    ? item.tag
-                    : nil
-            }
+        let sections = physicalSections.map { section in
+            let needsBoundary = !appState.menuBarManager.usesSystemOverflow
+            return NativeReorderVerification.Section(
+                items: desiredCache[section].map(\.tag),
+                boundary: needsBoundary ? MenuBarItemTag.nativeBoundary(for: section) : nil,
+                side: section == .visible ? .after : .before
+            )
         }
-        guard !desiredTags.isEmpty else { return .converged }
-
         let snapshot = await currentMacOS27ReorderSnapshot(appState: appState)
-        let desiredTagSet = Set(desiredTags)
-        let ordered = snapshot.sorted { $0.bounds.minX < $1.bounds.minX }
-        let liveTags = ordered.compactMap { item in
-            desiredTagSet.contains(item.tag) ? item.tag : nil
+        let result = NativeReorderVerification.evaluate(
+            sections: sections,
+            touched: macOS27TouchedMoveTags,
+            live: snapshot.sorted { $0.bounds.minX < $1.bounds.minX }.map(\.tag),
+            enforceSectionOrder: !appState.menuBarManager.usesSystemOverflow
+        )
+        return switch result {
+        case .converged: .converged
+        case .incomplete: .incomplete
+        case .needsMove(let tag): .needsMove(tag)
         }
-        guard liveTags.count == desiredTags.count else { return .incomplete }
-
-        if liveTags != desiredTags {
-            for index in desiredTags.indices where desiredTags[index] != liveTags[index] {
-                return .needsMove(desiredTags[index])
-            }
-            return .incomplete
-        }
-
-        for section in physicalSections {
-            guard let boundaryIndex = ordered.firstIndex(matching: .nativeBoundary(for: section)) else {
-                if desiredCache[section].isEmpty { continue }
-                return .incomplete
-            }
-            for item in desiredCache[section] {
-                guard macOS27TouchedMoveTags.contains(item.tag) else { continue }
-                guard let itemIndex = ordered.firstIndex(matching: item.tag) else { return .incomplete }
-                // Native hosted hit areas can overlap by a few points (notably
-                // Text Input). Use the same ordinal contract as the drag step.
-                let isOnCorrectSide = section == .visible
-                    ? itemIndex > boundaryIndex
-                    : itemIndex < boundaryIndex
-                if !isOnCorrectSide {
-                    return .needsMove(item.tag)
-                }
-            }
-        }
-        return .converged
     }
 
     @available(macOS 27.0, *)
@@ -1981,18 +2186,10 @@ extension MenuBarItemManager {
             macOS27ReorderTask = nil
             return
         }
-        // Layout's idle state has no blank slots. Expose and align our own
-        // boundary only for this explicit edit, without replacing its preview.
-        guard await alignNativeHidingBoundary(updatingCache: false) else {
-            await failMacOS27DesiredOrder(
-                generation: macOS27DesiredGeneration, appState: appState, presentsAlert: false
-            )
-            return
-        }
-
         var failedAttempts = 0
         var workerGeneration = macOS27DesiredGeneration
-        var correctionAttempts = [MenuBarItemTag: Int]()
+        var alignedDisplayGeneration: UInt64?
+        var attemptedTags = Set<MenuBarItemTag>()
 
         while !Task.isCancelled {
             guard let desiredCache = macOS27DesiredCache else {
@@ -2003,7 +2200,7 @@ extension MenuBarItemManager {
             if workerGeneration != macOS27DesiredGeneration {
                 workerGeneration = macOS27DesiredGeneration
                 failedAttempts = 0
-                correctionAttempts.removeAll()
+                attemptedTags.removeAll()
                 guard await waitForMacOS27DesiredOrderToSettle() else {
                     macOS27ReorderTask = nil
                     return
@@ -2011,21 +2208,39 @@ extension MenuBarItemManager {
                 continue
             }
 
-            if let sourceTag = macOS27PendingMoveOrder.first {
-                let sourceGeneration = macOS27PendingMoveGenerations[sourceTag]
-                guard
-                    let instruction = macOS27MoveInstruction(
-                        for: sourceTag,
-                        desiredCache: desiredCache,
-                        appState: appState
+            // An old display's alignment result never fails a newer request.
+            if !appState.menuBarManager.usesSystemOverflow,
+                alignedDisplayGeneration != macOS27DisplaySession.generation {
+                let displayGeneration = macOS27DisplaySession.generation
+                let aligned = await alignNativeHidingBoundary(updatingCache: false)
+                guard workerGeneration == macOS27DesiredGeneration,
+                    displayGeneration == macOS27DisplaySession.generation else { continue }
+                guard aligned else {
+                    await failMacOS27DesiredOrder(
+                        generation: workerGeneration, appState: appState, reason: .verificationUnconfirmed
                     )
-                else {
-                    macOS27PendingMoveOrder.removeFirst()
-                    macOS27PendingMoveGenerations[sourceTag] = nil
-                    continue
+                    return
                 }
+                alignedDisplayGeneration = displayGeneration
+            }
 
+            if let step = NativeReorderPlan.next(
+                desired: MenuBarSection.Name.allCases.map { desiredCache[$0].map(\.tag) },
+                pending: Set(macOS27PendingMoveOrder),
+                usesPhysicalBoundaries: !appState.menuBarManager.usesSystemOverflow
+            ) {
+                let sourceTag = step.source
+                let sourceGeneration = macOS27PendingMoveGenerations[sourceTag]
+                guard attemptedTags.insert(sourceTag).inserted else {
+                    await failMacOS27DesiredOrder(
+                        generation: workerGeneration, appState: appState, reason: .verificationUnconfirmed
+                    )
+                    return
+                }
                 do {
+                    let instruction = try macOS27MoveInstruction(
+                        for: step, desiredCache: desiredCache, appState: appState
+                    )
                     try await move(
                         item: instruction.item,
                         to: instruction.destination,
@@ -2044,18 +2259,11 @@ extension MenuBarItemManager {
                     if workerGeneration != macOS27DesiredGeneration {
                         continue
                     }
-                    failedAttempts += 1
-                    logger.warning(
-                        "macOS 27 desired-order step failed (attempt \(failedAttempts, privacy: .public)): \(error, privacy: .public)"
-                    )
-                    if failedAttempts < 3 {
-                        try? await Task.sleep(for: .milliseconds(180))
-                        continue
-                    }
+                    logger.warning("macOS 27 desired-order step failed without replay: \(error, privacy: .public)")
                     await failMacOS27DesiredOrder(
                         generation: workerGeneration,
                         appState: appState,
-                        presentsAlert: !(error is MacOS27ReorderError)
+                        reason: (error as? NativeReorderFailure) ?? .eventDeliveryFailed
                     )
                     return
                 }
@@ -2072,10 +2280,9 @@ extension MenuBarItemManager {
 
             switch firstStatus {
             case .needsMove(let tag):
-                correctionAttempts[tag, default: 0] += 1
-                guard correctionAttempts[tag, default: 0] <= 3 else {
+                guard !attemptedTags.contains(tag) else {
                     await failMacOS27DesiredOrder(
-                        generation: workerGeneration, appState: appState, presentsAlert: false
+                        generation: workerGeneration, appState: appState, reason: .verificationUnconfirmed
                     )
                     return
                 }
@@ -2091,7 +2298,7 @@ extension MenuBarItemManager {
                 await failMacOS27DesiredOrder(
                     generation: workerGeneration,
                     appState: appState,
-                    presentsAlert: false
+                    reason: .verificationUnconfirmed
                 )
                 return
             case .converged:
@@ -2110,10 +2317,9 @@ extension MenuBarItemManager {
                     )
                     return
                 case .needsMove(let tag):
-                    correctionAttempts[tag, default: 0] += 1
-                    guard correctionAttempts[tag, default: 0] <= 3 else {
+                    guard !attemptedTags.contains(tag) else {
                         await failMacOS27DesiredOrder(
-                            generation: workerGeneration, appState: appState, presentsAlert: false
+                            generation: workerGeneration, appState: appState, reason: .verificationUnconfirmed
                         )
                         return
                     }
@@ -2135,6 +2341,10 @@ extension MenuBarItemManager {
     ) async {
         guard generation == macOS27DesiredGeneration else { return }
         logger.notice("Committed macOS 27 desired menu bar order generation \(generation, privacy: .public)")
+        if let desired = macOS27DesiredCache,
+            (desired[.hidden] + desired[.alwaysHidden]).contains(where: { macOS27TouchedMoveTags.contains($0.tag) }) {
+            appState.menuBarManager.noteVerifiedHiddenLayoutEdit()
+        }
         macOS27PendingMoveOrder.removeAll()
         macOS27PendingMoveGenerations.removeAll()
         macOS27TouchedMoveTags.removeAll()
@@ -2144,35 +2354,115 @@ extension MenuBarItemManager {
         controller.completePendingMove()
         controller.endReordering()
         macOS27ReorderTask = nil
-        await cacheItemsRegardless(ignoringRecentMovement: true)
+        reorderFeedbackState.beginReadback(generation: generation)
+        let didReadActualOrder = await cacheItemsRegardless(ignoringRecentMovement: true)
+        guard generation == macOS27DesiredGeneration, macOS27DesiredCache == nil else { return }
+        reorderFeedbackState.finishReadback(generation: generation, succeeded: didReadActualOrder)
     }
 
     @available(macOS 27.0, *)
     private func failMacOS27DesiredOrder(
         generation: UInt64,
         appState: AppState,
-        presentsAlert: Bool
+        reason: NativeReorderFailure
     ) async {
         guard generation == macOS27DesiredGeneration else { return }
-        logger.error("Could not reconcile macOS 27 with the final desired Layout order")
+        logger.error("Could not reconcile macOS 27 desired order: \(String(describing: reason), privacy: .public)")
+        clearMacOS27DesiredOrder()
+        macOS27ReorderTask = nil
+        reorderFeedbackState.beginReadback(generation: generation)
+        let didReadActualOrder = await cacheItemsRegardless(ignoringRecentMovement: true)
+        guard generation == macOS27DesiredGeneration, macOS27DesiredCache == nil else { return }
+        reorderFeedbackState.finishReadback(generation: generation, failure: reason, succeeded: didReadActualOrder)
+    }
+
+    /// Invalidates queued intent without retaining a stale retry destination.
+    @available(macOS 27.0, *)
+    private func discardMacOS27DesiredOrder() {
+        macOS27DesiredGeneration &+= 1
+        clearMacOS27DesiredOrder()
+    }
+
+    @available(macOS 27.0, *)
+    private func clearMacOS27DesiredOrder() {
+        clearMacOS27DesiredOrderCache()
+        appState?.menuBarManager.macOS27Controller.completePendingMove()
+        appState?.menuBarManager.macOS27Controller.endReordering()
+        // Keep the worker handle until its in-flight gesture releases input.
+    }
+
+    @available(macOS 27.0, *)
+    private func clearMacOS27DesiredOrderCache() {
         macOS27PendingMoveOrder.removeAll()
         macOS27PendingMoveGenerations.removeAll()
         macOS27TouchedMoveTags.removeAll()
         macOS27DesiredCache = nil
         macOS27ProjectedCache = nil
+    }
+
+    /// A fresh user action may reveal endpoints, but never retries an old
+    /// destination. New edits, backend changes and display changes obsolete it.
+    func expandSystemOverflowForLayout() async {
+        guard #available(macOS 27.0, *), let appState,
+            appState.menuBarManager.usesSystemOverflow,
+            let displayID = itemCache.displayID,
+            displayID == Bridging.getActiveMenuBarDisplayID(),
+            macOS27DesiredCache == nil else { return }
+        let generation = macOS27DesiredGeneration
+        let displayGeneration = macOS27DisplaySession.generation
         let controller = appState.menuBarManager.macOS27Controller
-        controller.completePendingMove()
-        controller.endReordering()
-        macOS27ReorderTask = nil
-        await cacheItemsRegardless(ignoringRecentMovement: true)
-        guard
-            presentsAlert,
-            generation == macOS27DesiredGeneration,
-            macOS27DesiredCache == nil
-        else {
+        let interactionGeneration = controller.interactionGeneration
+        guard let token = reorderFeedbackState.beginOverflowExpansion(generation: generation) else { return }
+        let expanded: Bool
+        do {
+            // Serialize only native input/visibility transition with the same
+            // semaphore used by Command-drag. Release before the AX refresh.
+            try await eventSemaphore.waitUnlessCancelled()
+            defer { eventSemaphore.signal() }
+            guard generation == macOS27DesiredGeneration, macOS27DesiredCache == nil,
+                displayGeneration == macOS27DisplaySession.generation,
+                controller.isLayoutEditing, controller.interactionGeneration == interactionGeneration,
+                displayID == Bridging.getActiveMenuBarDisplayID(),
+                appState.menuBarManager.usesSystemOverflow else {
+                reorderFeedbackState.cancelOverflowExpansion(generation: generation, token: token)
+                return
+            }
+            expanded = await appState.menuBarManager.expandSystemOverflowForLayout(on: displayID)
+        } catch {
+            reorderFeedbackState.finishOverflowExpansion(generation: generation, token: token, succeeded: false)
             return
         }
-        NSAlert(error: EventError.cannotComplete).runModal()
+        guard generation == macOS27DesiredGeneration,
+            displayGeneration == macOS27DisplaySession.generation,
+            displayID == Bridging.getActiveMenuBarDisplayID(),
+            appState.menuBarManager.usesSystemOverflow,
+            controller.isLayoutEditing, controller.interactionGeneration == interactionGeneration else {
+            reorderFeedbackState.cancelOverflowExpansion(generation: generation, token: token)
+            return
+        }
+        guard expanded else {
+            reorderFeedbackState.finishOverflowExpansion(generation: generation, token: token, succeeded: false)
+            return
+        }
+        let readFreshOrder = await cacheItemsRegardless(ignoringRecentMovement: true)
+        guard generation == macOS27DesiredGeneration,
+            displayGeneration == macOS27DisplaySession.generation,
+            displayID == Bridging.getActiveMenuBarDisplayID(),
+            appState.menuBarManager.usesSystemOverflow,
+            controller.isLayoutEditing, controller.interactionGeneration == interactionGeneration else {
+            reorderFeedbackState.cancelOverflowExpansion(generation: generation, token: token)
+            return
+        }
+        reorderFeedbackState.finishOverflowExpansion(generation: generation, token: token, succeeded: readFreshOrder)
+    }
+
+    func prepareLayoutRefreshAfterOverflowFailure() -> Bool {
+        guard macOS27DesiredCache == nil else { return false }
+        return reorderFeedbackState.prepareOverflowFailureRefresh(generation: macOS27DesiredGeneration)
+    }
+
+    func endLayoutOverflowRecovery() {
+        reorderFeedbackState.cancelOverflowExpansion(generation: macOS27DesiredGeneration)
     }
 
     @available(macOS 27.0, *)
@@ -2197,6 +2487,31 @@ extension MenuBarItemManager {
     /// - Parameters:
     ///   - item: The menu bar item to move.
     ///   - destination: The destination to move the item to.
+    /// A layout assignment must never imply a hiding capability we do not have.
+    func hidingRestriction(for item: MenuBarItem) -> String? {
+        guard #available(macOS 27.0, *), let appState else { return nil }
+        if appState.menuBarManager.usesSystemOverflow {
+            return String(localized: "Normal mode supports reordering only. macOS controls overflow; individual hiding is unavailable.")
+        }
+        let bundle: String?
+        if case .string(let identifier) = item.tag.namespace { bundle = identifier } else { bundle = item.sourceApplication?.bundleIdentifier }
+        guard PrivateHidingPlan.supports(bundle: bundle, own: Constants.bundleIdentifier) else {
+            return String(localized: "Hiding unsupported: system item or unverified owner. Reordering is still available.")
+        }
+        return nil
+    }
+
+    func validateHidingMove(item: MenuBarItem, to section: MenuBarSection.Name) throws {
+        guard section != .visible,
+              itemCache.address(for: item.tag)?.section != section,
+              let reason = hidingRestriction(for: item) else { return }
+        throw NSError(
+            domain: "FloeBar.Layout",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: reason]
+        )
+    }
+
     func move(
         item: MenuBarItem,
         to destination: MoveDestination,
@@ -2214,6 +2529,13 @@ extension MenuBarItemManager {
             throw EventError.cannotComplete
         }
 
+        guard !appState.menuBarManager.appVisibilityAccess.blocksMenuBarChanges else { throw NativeReorderFailure.visibilityChanging }
+        let requiredSection = appState.menuBarManager.usesSystemOverflow ? nil : requiredSection
+        if #available(macOS 27.0, *) {
+            if let section = requiredSection ?? itemCache.address(for: destination.targetItem.tag)?.section {
+                try validateHidingMove(item: item, to: section)
+            }
+        }
         if #available(macOS 27.0, *), coordinateMacOS27Move {
             enqueueMacOS27Move(
                 item: item,
@@ -2227,6 +2549,15 @@ extension MenuBarItemManager {
             try await macOS27MoveSemaphore.waitUnlessCancelled()
             defer { macOS27MoveSemaphore.signal() }
 
+            let transactionUsesSystemOverflow = appState.menuBarManager.usesSystemOverflow
+            let transactionDisplayID = itemCache.displayID
+            let transactionDisplayGeneration = macOS27DisplaySession.generation
+            guard transactionDisplayID == Bridging.getActiveMenuBarDisplayID(),
+                MacOS27MenuBarItemProvider.displayID(containing: item.bounds) == transactionDisplayID,
+                MacOS27MenuBarItemProvider.displayID(containing: destination.targetItem.bounds) == transactionDisplayID else {
+                throw NativeReorderFailure.displayChanged
+            }
+
             // Reflect the requested order immediately while the physical move
             // is applied and verified. Layout has no animation, and a failed
             // or cancelled transaction restores this cache atomically.
@@ -2238,6 +2569,8 @@ extension MenuBarItemManager {
                 if
                     shouldRestoreProjectedCache,
                     macOS27DesiredCache == nil,
+                    macOS27DisplaySession.generation == transactionDisplayGeneration,
+                    itemCache.displayID == transactionDisplayID,
                     itemCache != cacheBeforeMove
                 {
                     itemCache = cacheBeforeMove
@@ -2259,18 +2592,13 @@ extension MenuBarItemManager {
                 destination: destination,
                 requiring: requiredTags
             )
-            guard
-                let liveItem = liveItems.first(where: { $0.tag == item.tag }),
-                let liveTarget = liveItems.first(where: {
-                    $0.tag == destination.targetItem.tag
-                })
-            else {
-                // Hosted items such as Spotlight can disappear for one AX
-                // sample while MenuBarAgent republishes them. Let the desired-
-                // order worker retry against a stable snapshot instead of
-                // treating an obsolete intermediate request as successful.
-                logger.notice("macOS 27 move endpoint is temporarily unavailable")
-                throw MacOS27ReorderError.endpointUnavailable
+            guard let liveItem = liveItems.first(where: { $0.tag == item.tag }) else {
+                logger.notice("macOS 27 move source is temporarily unavailable; no gesture")
+                throw macOS27EndpointFailure(item, appState: appState)
+            }
+            guard let liveTarget = liveItems.first(where: { $0.tag == destination.targetItem.tag }) else {
+                logger.notice("macOS 27 move target is temporarily unavailable; no gesture")
+                throw macOS27EndpointFailure(destination.targetItem, appState: appState)
             }
             func resolvedDestination(for target: MenuBarItem) -> MoveDestination {
                 switch destination {
@@ -2279,11 +2607,19 @@ extension MenuBarItemManager {
                 }
             }
             let liveDestination = resolvedDestination(for: liveTarget)
-            var didMove = macOS27ItemHasCorrectPosition(
-                item: liveItem,
-                for: liveDestination,
-                among: liveItems,
-                requiredSection: requiredSection
+            // Correct ordinal order in retained AX frames is not evidence that
+            // concealed endpoints can be interacted with, even for a no-op.
+            var didMove = try NativeReorderVerification.confirmedEndpointOrder(
+                sourceHit: MacOS27MenuBarItemProvider.nativeHitMatches(liveItem),
+                targetHit: MacOS27MenuBarItemProvider.nativeHitMatches(liveTarget),
+                alreadyOrdered: macOS27ItemHasCorrectPosition(
+                    item: liveItem,
+                    for: liveDestination,
+                    among: liveItems,
+                    requiredSection: requiredSection
+                ),
+                sourceOwned: macOS27EndpointIsOwned(liveItem, appState: appState),
+                targetOwned: macOS27EndpointIsOwned(liveTarget, appState: appState)
             )
 
             // Drag directly to the requested native neighbor. Do not insert
@@ -2313,29 +2649,44 @@ extension MenuBarItemManager {
                         moveItems = refreshedItems
                         moveItem = refreshedItem
                         moveDestination = resolvedDestination(for: refreshedTarget)
-                        didMove = macOS27ItemHasCorrectPosition(
-                            item: moveItem,
-                            for: moveDestination,
-                            among: moveItems,
-                            requiredSection: requiredSection
+                        didMove = try NativeReorderVerification.confirmedEndpointOrder(
+                            sourceHit: MacOS27MenuBarItemProvider.nativeHitMatches(moveItem),
+                            targetHit: MacOS27MenuBarItemProvider.nativeHitMatches(moveDestination.targetItem),
+                            alreadyOrdered: macOS27ItemHasCorrectPosition(
+                                item: moveItem,
+                                for: moveDestination,
+                                among: moveItems,
+                                requiredSection: requiredSection
+                            ),
+                            sourceOwned: macOS27EndpointIsOwned(moveItem, appState: appState),
+                            targetOwned: macOS27EndpointIsOwned(moveDestination.targetItem, appState: appState)
                         )
                     }
                 }
 
                 if !didMove {
-                    didMove = await performMacOS27NativeMove(
+                    didMove = try await performMacOS27NativeMove(
                         item: moveItem,
                         destination: moveDestination,
                         contextItems: moveItems,
                         appState: appState,
-                        requiredSection: requiredSection
+                        requiredSection: requiredSection,
+                        displayGeneration: transactionDisplayGeneration
                     )
                 }
             }
 
-            guard didMove else {
+            guard transactionUsesSystemOverflow == appState.menuBarManager.usesSystemOverflow else {
+                throw NativeReorderFailure.modeChanged
+            }
+            guard didMove,
+                macOS27DisplaySession.generation == transactionDisplayGeneration,
+                itemCache.displayID == transactionDisplayID,
+                Bridging.getActiveMenuBarDisplayID() == transactionDisplayID else {
                 logger.warning("Could not verify the requested macOS 27 reorder")
-                throw EventError.cannotComplete
+                throw macOS27DisplaySession.generation != transactionDisplayGeneration ||
+                    Bridging.getActiveMenuBarDisplayID() != transactionDisplayID
+                    ? NativeReorderFailure.displayChanged : .verificationUnconfirmed
             }
 
             // Persist and project only after the real AX order agrees. This
@@ -2345,7 +2696,8 @@ extension MenuBarItemManager {
                 item: liveItem,
                 to: liveDestination,
                 currentCache: cacheBeforeMove,
-                requiredSection: requiredSection
+                requiredSection: requiredSection,
+                preservingAssignment: transactionUsesSystemOverflow
             )
             if let requiredSection, resolvedSection != requiredSection {
                 logger.error("macOS 27 move resolved to an unexpected Layout section")
@@ -2418,6 +2770,8 @@ extension MenuBarItemManager {
         guard item.isMovable else {
             throw EventError.itemNotMovable(item)
         }
+        guard appState?.menuBarManager.appVisibilityAccess.blocksMenuBarChanges != true else { throw NativeReorderFailure.visibilityChanging }
+        try validateHidingMove(item: item, to: section)
         enqueueMacOS27Move(item: item, toSection: section)
     }
 }

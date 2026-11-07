@@ -5,8 +5,7 @@
 
 import Cocoa
 
-/// Hides a contiguous section by resizing an Ice-owned blank status item.
-/// macOS lays out and handles every other item, including overflow and clicks.
+/// Temporary layout drag handles only. Never hides third-party items.
 @MainActor
 final class MacOS27NativeMenuBarHiding {
     private struct Spacer {
@@ -17,11 +16,6 @@ final class MacOS27NativeMenuBarHiding {
 
     isolated deinit {
         removeAll()
-    }
-
-    func isConcealing(_ section: MenuBarSection.Name) -> Bool {
-        guard let spacer = spacers[section] else { return false }
-        return spacer.item.isVisible && spacer.item.length > 1
     }
 
     func prepare(section: MenuBarSection.Name, anchorPosition: CGFloat) {
@@ -43,11 +37,13 @@ final class MacOS27NativeMenuBarHiding {
         withdraw(item)
     }
 
-    /// AppKit reserves a real slot even for a one-point item. Publish the
-    /// narrow boundary only while an explicit operation needs a drag handle.
-    func prepareForHiding(anchorPosition: CGFloat) {
-        prepare(section: .hidden, anchorPosition: anchorPosition)
-        if let spacer = spacers[.hidden] { showNarrow(spacer.item) }
+    /// A one-point blank can be enumerated by AX without providing a native
+    /// hit target. Enlarge only our handle before a required boundary repair.
+    func prepareForDragging(section: MenuBarSection.Name = .hidden) {
+        guard let spacer = spacers[section] else { return }
+        spacer.item.length = 24
+        spacer.item.button?.isEnabled = true
+        spacer.item.isVisible = true
     }
 
     func showForLayout(anchorPosition: CGFloat, alwaysHiddenAnchor: CGFloat?) {
@@ -81,31 +77,8 @@ final class MacOS27NativeMenuBarHiding {
         if item.button?.isEnabled == true { item.button?.isEnabled = false }
     }
 
-    @available(macOS 27.0, *)
-    func setHidden(
-        _ hidden: Bool,
-        section: MenuBarSection.Name,
-        anchorPosition: CGFloat,
-        screen: NSScreen
-    ) {
-        guard hidden else {
-            guard let spacer = spacers[section] else { return }
-            withdraw(spacer.item)
-            return
-        }
-
-        // An item wider than the entire native status region is discarded on
-        // macOS 27. A width within that region makes its left neighbors overflow.
-        let regionWidth = screen.auxiliaryTopRightArea?.width
-            ?? (screen.frame.width - (screen.getApplicationMenuFrame()?.width ?? 300))
-        let length = max(32, regionWidth - 32)
-
-        prepare(section: section, anchorPosition: anchorPosition)
-        guard let spacer = spacers[section] else { return }
-
-        if spacer.item.button?.isEnabled == true { spacer.item.button?.isEnabled = false }
-        if spacer.item.length != length { spacer.item.length = length }
-        if !spacer.item.isVisible { spacer.item.isVisible = true }
+    func withdraw(section: MenuBarSection.Name) {
+        if let spacer = spacers[section] { withdraw(spacer.item) }
     }
 
     func removeAll() {

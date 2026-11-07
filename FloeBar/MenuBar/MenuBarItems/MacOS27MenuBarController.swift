@@ -23,6 +23,13 @@ final class MacOS27MenuBarController {
     private let logger = Logger(category: "MacOS27MenuBarController")
     private var layout: StoredLayout
     private var persistedLayout: StoredLayout?
+    private static let displayLayoutsKey = "MacOS27MenuBarController.displayLayouts.v1"
+    private var displayLayouts = [String: StoredLayout]()
+    private var selectedDisplayKey: String?
+    private var selectedDisplayID: CGDirectDisplayID?
+    private let defaults: UserDefaults
+    private let displayBounds: (CGDirectDisplayID) -> CGRect
+    private let displayKey: (CGDirectDisplayID) -> String
     private var snapshots = [String: MenuBarItem]()
     private var missingItemGrace = MacOS27MissingItemGrace()
     private var layoutOwners = LayoutOwners()
@@ -68,56 +75,100 @@ final class MacOS27MenuBarController {
 
     /// Concealed overflow items can report coincident AX frames. Retain the
     /// saved order until Layout has exposed their real positions again.
+    var isPrivateConcealment = false
     var isConcealingItems = false
 
-    init() {
+    init(
+        defaults: UserDefaults = .standard,
+        displayBounds: @escaping (CGDirectDisplayID) -> CGRect = CGDisplayBounds,
+        displayKey: @escaping (CGDirectDisplayID) -> String = { displayID in
+            CGDisplayCreateUUIDFromDisplayID(displayID).map {
+                CFUUIDCreateString(nil, $0.takeRetainedValue()) as String
+            } ?? "display-\(displayID)"
+        }
+    ) {
+        self.defaults = defaults
+        self.displayBounds = displayBounds
+        self.displayKey = displayKey
+        if let data = defaults.data(forKey: Self.displayLayoutsKey),
+            let stored = try? JSONDecoder().decode([String: StoredLayout].self, from: data) {
+            displayLayouts = stored.mapValues { Self.removingRuntimeIdentities(from: $0) }
+        }
         if
-            let data = UserDefaults.standard.data(forKey: Self.defaultsKey),
+            let data = defaults.data(forKey: Self.defaultsKey),
             let stored = try? JSONDecoder().decode(StoredLayout.self, from: data)
         {
             self.layout = stored
             self.persistedLayout = stored
-            // Process-local AX tokens cannot identify items after a restart.
-            layout.assignments = layout.assignments.filter {
-                !MacOS27RuntimeItemIdentity.isStoredIdentifier($0.key)
-            }
-            for section in MenuBarSection.Name.allCases {
-                layout.order[section]?.removeAll(where: MacOS27RuntimeItemIdentity.isStoredIdentifier)
-            }
+            layout = Self.removingRuntimeIdentities(from: layout)
         } else {
             self.layout = StoredLayout()
+        }
+    }
+
+    private static func removingRuntimeIdentities(from stored: StoredLayout) -> StoredLayout {
+        var result = stored
+        result.assignments = result.assignments.filter {
+            !MacOS27RuntimeItemIdentity.isStoredIdentifier($0.key)
+        }
+        for section in MenuBarSection.Name.allCases {
+            result.order[section]?.removeAll(where: MacOS27RuntimeItemIdentity.isStoredIdentifier)
+        }
+        return result
+    }
+
+    private func selectDisplay(_ displayID: CGDirectDisplayID) {
+        guard selectedDisplayID != displayID else { return }
+        persist()
+        let key = displayKey(displayID)
+        // Import the legacy single-display layout once; preserve its original key.
+        let imported = selectedDisplayKey == nil && displayLayouts.isEmpty ? layout : StoredLayout()
+        layout = displayLayouts[key] ?? imported
+        persistedLayout = displayLayouts[key]
+        selectedDisplayKey = key
+        selectedDisplayID = displayID
+        snapshots.removeAll()
+        lastSourceItems.removeAll()
+        lastLiveItems.removeAll()
+        lastManagedItems.removeAll()
+        knownBundleIdentifiers.removeAll()
+        missingItemGrace = MacOS27MissingItemGrace()
+        completePendingMove()
+        interactionGeneration &+= 1
+    }
+
+    func absenceCandidates(
+        liveItems: [MenuBarItem], sourceItems: [MenuBarItem], displayID: CGDirectDisplayID
+    ) -> [MenuBarItem] {
+        guard selectedDisplayID == displayID else { return [] }
+        let live = Set(liveItems.map { $0.tag.persistentIdentifier })
+        let canObserve = !isConcealingItems && !isReorderInProgress && sourceItems.first(matching: .visibleControlItem) != nil
+        let now = ProcessInfo.processInfo.systemUptime
+        return snapshots.compactMap { identifier, item in
+            guard !live.contains(identifier), missingItemGrace.needsVerification(identifier, canObserve: canObserve, now: now) else { return nil }
+            return item
         }
     }
 
     func makeCache(
         liveItems: [MenuBarItem],
         sourceItems: [MenuBarItem],
-        displayID: CGDirectDisplayID?
+        displayID: CGDirectDisplayID?,
+        usesSystemOverflow: Bool = false,
+        confirmedAbsentIdentifiers: Set<String> = []
     ) -> MenuBarItemManager.ItemCache {
         precondition(Thread.isMainThread)
+        guard let displayID else { return MenuBarItemManager.ItemCache(displayID: nil) }
+        selectDisplay(displayID)
+        let display = displayBounds(displayID)
+        let strip = CGRect(x: display.minX, y: display.minY, width: display.width, height: 40)
+        let sourceItems = sourceItems.filter { strip.contains($0.bounds) }
+        let liveItems = liveItems.filter { strip.contains($0.bounds) }
         migrateTextInputIdentityIfNeeded(in: liveItems)
         seedUnassignedItems(liveItems, using: sourceItems)
-        if !isReorderInProgress,
-            let iceItem = sourceItems.first(matching: .visibleControlItem) {
-            let alwaysBoundary = sourceItems.first(matching: .nativeBoundary(for: .alwaysHidden))
-            // The native bar, including manual Command-drags, is authoritative.
-            for item in liveItems {
-                let identifier = item.tag.persistentIdentifier
-                guard let side = MacOS27NativeBoundary.side(of: item.bounds, relativeTo: iceItem.bounds) else {
-                    continue // Off-bar overflow frames are not native order evidence.
-                }
-                if side == .right {
-                    layout.assignments[identifier] = .visible
-                } else if isConcealingItems {
-                    continue // Keep concealed left-hand assignments until revealed.
-                } else if let alwaysBoundary, item.bounds.minX < alwaysBoundary.bounds.minX {
-                    layout.assignments[identifier] = .alwaysHidden
-                } else if item.bounds.minX < iceItem.bounds.minX,
-                    alwaysBoundary != nil || layout.assignments[identifier] != .alwaysHidden {
-                    layout.assignments[identifier] = .hidden
-                }
-            }
-        }
+        // Existing assignments are explicit user preferences. Native overflow
+        // and backend switches can move an item across FloeBar without a
+        // section edit; only seed new items or commit an explicit section move.
         lastLiveItems = liveItems
         lastSourceItems = sourceItems
         layoutOwners.observe(owners(of: sourceItems))
@@ -169,9 +220,9 @@ final class MacOS27MenuBarController {
             }
             itemsByIdentifier[identifier] = item
         }
-        if #available(macOS 27.0, *), !candidates.isEmpty {
-            retiredIdentifiers.formUnion(MacOS27MenuBarItemProvider.confirmedAbsentIdentifiers(for: candidates))
-        }
+        // The caller's same-generation, budgeted reread is the only absence
+        // evidence. No synchronous AX walk may run from this cache mutation.
+        retiredIdentifiers.formUnion(confirmedAbsentIdentifiers.intersection(candidates.map { $0.tag.persistentIdentifier }))
         for identifier in retiredIdentifiers {
             snapshots.removeValue(forKey: identifier)
             itemsByIdentifier.removeValue(forKey: identifier)
@@ -247,14 +298,27 @@ final class MacOS27MenuBarController {
         }
 
         persist()
+        if usesSystemOverflow {
+            // Presentation is one physical row. Stored experimental assignments
+            // remain in `layout` and are never flattened into preferences.
+            var physicalCache = MenuBarItemManager.ItemCache(displayID: displayID)
+            physicalCache[.visible] = MenuBarSection.Name.allCases
+                .flatMap { cache[$0] }.sorted(by: Self.isOrderedLeftToRight)
+            return physicalCache
+        }
         return cache
+    }
+
+    func savedSection(for tag: MenuBarItemTag) -> MenuBarSection.Name {
+        layout.assignments[tag.persistentIdentifier, default: .visible]
     }
 
     func move(
         item: MenuBarItem,
         to destination: MenuBarItemManager.MoveDestination,
         currentCache: MenuBarItemManager.ItemCache,
-        requiredSection: MenuBarSection.Name? = nil
+        requiredSection: MenuBarSection.Name? = nil,
+        preservingAssignment: Bool = false
     ) -> MenuBarSection.Name {
         guard #available(macOS 27.0, *) else { return .visible }
 
@@ -264,6 +328,12 @@ final class MacOS27MenuBarController {
         let targetSection: MenuBarSection.Name
         let previousSection = layout.assignments[identifier, default: .visible]
 
+        if preservingAssignment {
+            // Native overflow owns visibility. Reordering across an old saved
+            // boundary must not reassign that item's experimental section.
+            snapshots[identifier] = item
+            return previousSection
+        }
         if let requiredSection {
             // A Layout drop already carries the destination container. Do
             // not infer it again from the target item: an empty Hidden section
@@ -486,49 +556,58 @@ final class MacOS27MenuBarController {
     }
 
     private func persist() {
-        guard layout != persistedLayout, let data = try? JSONEncoder().encode(layout) else { return }
-        UserDefaults.standard.set(data, forKey: Self.defaultsKey)
+        guard let selectedDisplayKey, layout != persistedLayout else { return }
+        displayLayouts[selectedDisplayKey] = layout
+        guard let data = try? JSONEncoder().encode(displayLayouts) else { return }
+        defaults.set(data, forKey: Self.displayLayoutsKey)
         persistedLayout = layout
     }
 
-    /// Collapses legacy input-source labels into TextInputMenuAgent's stable
-    /// Item-N identity without changing the user's section or position.
+    /// Only a single known legacy input-source label can identify a single
+    /// current child. Item-N records are distinct identities, never aliases.
     private func migrateTextInputIdentityIfNeeded(in items: [MenuBarItem]) {
-        for item in items where item.tag.namespace == .textInputMenuAgent {
-            let canonicalIdentifier = item.tag.persistentIdentifier
-            let namespacePrefix = "\(item.tag.namespace):"
-            let instanceSuffix = "#\(item.tag.instanceIndex)"
-            let aliases = Set(layout.assignments.keys.filter {
-                $0.hasPrefix(namespacePrefix) && $0.hasSuffix(instanceSuffix)
-            }).union([canonicalIdentifier])
-            guard aliases.contains(where: { $0 != canonicalIdentifier }) else { continue }
-
-            var savedLocation: (section: MenuBarSection.Name, index: Int)?
-            for section in MenuBarSection.Name.allCases {
-                if let index = layout.order[section, default: []].firstIndex(where: aliases.contains) {
-                    savedLocation = (section, index)
-                    break
+        let current = items.filter { $0.tag.namespace == .textInputMenuAgent }
+        let prefix = "\(MenuBarItemTag.Namespace.textInputMenuAgent):"
+        let legacyTitles: Set<String> = [
+            "ABC", "U.S.", "Unicode Hex Input", "简体拼音", "拼音",
+            "繁體拼音", "注音", "倉頡", "仓颉", "双拼", "雙拼",
+        ]
+        let recorded = Set(layout.assignments.keys).union(layout.order.values.flatMap { $0 })
+        for item in current {
+            let canonical = item.tag.persistentIdentifier
+            let suffix = "#\(item.tag.instanceIndex)"
+            guard item.tag.title.hasPrefix("Item-"),
+                Int(item.tag.title.dropFirst(5)) != nil,
+                current.filter({ $0.tag.instanceIndex == item.tag.instanceIndex }).count == 1 else { continue }
+            let aliases = recorded.filter { identifier in
+                guard identifier.hasPrefix(prefix), identifier.hasSuffix(suffix) else { return false }
+                let title = String(identifier.dropFirst(prefix.count).dropLast(suffix.count))
+                return legacyTitles.contains(title)
+            }
+            // An existing canonical record or multiple legacy labels is
+            // ambiguous. Preserve every preference rather than guessing.
+            guard !recorded.contains(canonical), aliases.count == 1,
+                let alias = aliases.first else { continue }
+            let locations = MenuBarSection.Name.allCases.flatMap { section in
+                layout.order[section, default: []].enumerated().compactMap { index, identifier in
+                    identifier == alias ? (section, index) : nil
                 }
             }
-            let section = savedLocation?.section
-                ?? layout.assignments[canonicalIdentifier]
-                ?? aliases.compactMap { layout.assignments[$0] }.first
-                ?? .visible
-
-            for alias in aliases {
-                layout.assignments.removeValue(forKey: alias)
+            guard locations.count <= 1 else { continue }
+            let savedSection = layout.assignments[alias]
+            guard savedSection == nil || locations.first == nil || savedSection == locations.first?.0,
+                let section = savedSection ?? locations.first?.0 else { continue }
+            layout.assignments.removeValue(forKey: alias)
+            layout.assignments[canonical] = section
+            for name in MenuBarSection.Name.allCases {
+                layout.order[name, default: []].removeAll { $0 == alias }
             }
-            layout.assignments[canonicalIdentifier] = section
-
-            for existingSection in MenuBarSection.Name.allCases {
-                layout.order[existingSection, default: []].removeAll(where: aliases.contains)
-            }
-            let insertionIndex = min(
-                savedLocation?.index ?? layout.order[section, default: []].endIndex,
-                layout.order[section, default: []].endIndex
+            let index = min(
+                locations.first?.1 ?? layout.order[section, default: []].count,
+                layout.order[section, default: []].count
             )
-            layout.order[section, default: []].insert(canonicalIdentifier, at: insertionIndex)
-            logger.notice("Migrated Text Input menu bar identity to \(canonicalIdentifier, privacy: .public)")
+            layout.order[section, default: []].insert(canonical, at: index)
+            logger.notice("Migrated Text Input menu bar identity to \(canonical, privacy: .public)")
         }
     }
 

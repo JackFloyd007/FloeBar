@@ -57,6 +57,10 @@ enum AXHelpers {
         performOnMain { try? app.attribute(.extrasMenuBar) }
     }
 
+    static func parent(for element: UIElement) -> UIElement? {
+        performOnMain { try? element.attribute(.parent) }
+    }
+
     static func children(for element: UIElement) -> [UIElement] {
         performOnMain { try? element.arrayAttribute(.children) } ?? []
     }

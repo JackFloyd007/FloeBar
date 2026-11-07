@@ -23,6 +23,28 @@ menu bar without replacing the native macOS experience.
 > with or endorsed by the upstream project. See [NOTICE.md](NOTICE.md) for full
 > attribution.
 
+## Current development build 1366
+
+Build `0.13.0-macos27.37-dev (1366)` fixes native drag ordering, application
+visibility and recovery on macOS 27. After explicitly authorizing the system
+menu bar preferences file, you can select supported third-party applications
+to hide or show. FloeBar validates system ownership and installation identity,
+including the system-declared WPS application/helper group. Unsupported items
+remain unavailable. Changes are journaled before writing and restored on normal
+quit or the next launch after a crash.
+
+Layout uses a single ordering row. Hidden applications must be shown before
+dragging their items; interrupted gestures are not automatically replayed.
+The native system overflow and its double-chevron remain. macOS 14–26 retain
+the legacy backend. Private assertion hiding remains disabled on every launch.
+
+The [implementation and acceptance record](docs/plans/native-overflow-root-fix.md)
+includes real mouse dragging, repeated WPS hide/show and normal/crash recovery.
+This build uses local Apple Development signing and is not notarized. A public
+automatic update is pending Developer ID signing, notarization and the release
+checks in [distribution](docs/distribution.md); GitHub's latest release remains
+the previous public version until those checks pass.
+
 ## Install
 
 1. Download the latest `FloeBar-*.zip` from
@@ -58,10 +80,29 @@ Permissions stay on the Mac and can be revoked at any time in System Settings.
 
 ## Compatibility
 
+**macOS 27 (development build 1366):** supported third-party applications can
+be hidden through explicitly authorized system preferences. System-declared
+groups are controlled together; unsupported or ambiguous ownership is rejected.
+The system chevron remains. See the
+[current implementation and acceptance](docs/plans/native-overflow-root-fix.md).
+
 FloeBar requires macOS 14 or later. The maintained branch includes a dedicated
 macOS 27 path that avoids global input interception and fails open when the
 native menu bar boundary cannot be verified. Known limitations and technical
 validation are documented in [MACOS27.md](MACOS27.md).
+
+## Languages and macOS 27 status
+
+FloeBar includes English, Simplified Chinese, Traditional Chinese, Japanese,
+Korean, German, French, Spanish and Brazilian Portuguese. It follows the
+language selected for the app in macOS.
+
+On macOS 27, application selection controls supported hiding and Layout arranges
+visible items. Screen capture stays off until you explicitly request previews.
+The separate Floe Bar, search, hover/scroll triggers and automatic rehiding remain
+unavailable on macOS 27. Older macOS releases, multiple displays and unsupported
+system items are outside the latest real-device acceptance. See the
+[current test record](docs/plans/native-overflow-root-fix.md) for coverage and limits.
 
 ## Build from source
 
@@ -74,6 +115,10 @@ Requirements:
 Open `FloeBar.xcodeproj`, select the `FloeBar` scheme, and build. Swift package
 dependencies are resolved by Xcode. Release signing and notarization instructions
 are in [docs/distribution.md](docs/distribution.md).
+
+Run the pure regression and localization checks with `bash scripts/test.sh`.
+These checks do not interact with the live menu bar. They do not replace
+physical-device validation of hiding and native input.
 
 ## Contributing
 

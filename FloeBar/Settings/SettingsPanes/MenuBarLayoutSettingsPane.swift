@@ -6,14 +6,55 @@
 import SwiftUI
 
 struct MenuBarLayoutSettingsPane: View {
+    private enum WorkspacePage: Hashable { case order, applications }
+
+    @EnvironmentObject var appState: AppState
+    @ObservedObject var itemManager: MenuBarItemManager
+    @State private var page = WorkspacePage.applications
+
+    var body: some View {
+        if #available(macOS 27.0, *), appState.menuBarManager.usesSystemOverflow {
+            VStack(spacing: 0) {
+                Picker("Menu Bar Layout", selection: $page) {
+                    Text("Icon Order").tag(WorkspacePage.order)
+                    Text("Application hiding").tag(WorkspacePage.applications)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 320)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 14)
+
+                Divider()
+
+                switch page {
+                case .order:
+                    MenuBarOrderSettingsPane(itemManager: itemManager, screenRecording: appState.permissions.screenRecording)
+                case .applications:
+                    SystemAppVisibilityAccessView(access: appState.menuBarManager.appVisibilityAccess)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        } else {
+            MenuBarOrderSettingsPane(itemManager: itemManager, screenRecording: appState.permissions.screenRecording)
+        }
+    }
+}
+
+/// The original ordering surface owns its AX/image tasks only while mounted.
+private struct MenuBarOrderSettingsPane: View {
     private enum LoadState {
         case loading, finished, timedOut
     }
 
     @EnvironmentObject var appState: AppState
     @ObservedObject var itemManager: MenuBarItemManager
+    @ObservedObject var screenRecording: ScreenRecordingPermission
     @State private var loadState = LoadState.loading
     @State private var refreshID = 0
+    @State private var previewRequest = MenuBarPreviewRequest()
+    @State private var previewFeedback: String?
+    @State private var isLoadingPreviews = false
 
     private var hasItems: Bool {
         !itemManager.itemCache.managedItems.isEmpty
@@ -22,6 +63,8 @@ struct MenuBarLayoutSettingsPane: View {
     var body: some View {
         if appState.menuBarManager.isMenuBarHiddenBySystemUserDefaults {
             cannotArrange
+        } else if #available(macOS 27.0, *) {
+            layoutContent
         } else if !ScreenCapture.cachedCheckPermissions() {
             missingScreenRecordingPermissions
         } else {
@@ -31,14 +74,17 @@ struct MenuBarLayoutSettingsPane: View {
 
     private var layoutContent: some View {
         IceForm(alignment: .leading, spacing: 24) {
-            header
+            if #unavailable(macOS 27.0) { header }
+            if #available(macOS 27.0, *) {
+                Label("Drag to reorder.", systemImage: "hand.draw")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            if #available(macOS 27.0, *) { previewControls }
             layoutBars
             if #available(macOS 27.0, *) {
-                Label("Hold ⌘ and drag in the menu bar. Items to the left of FloeBar are hidden.", systemImage: "command")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 4)
+                // IceForm is top-aligned. Feedback grows below the fixed item
+                // region so progress/results cannot move the next drag target.
+                reorderStatus
             }
         }
         .task(id: refreshID) {
@@ -53,9 +99,27 @@ struct MenuBarLayoutSettingsPane: View {
             )
             guard !Task.isCancelled else { return }
             loadState = .finished
-            await appState.imageCache.updateCacheWithoutChecks(
-                sections: MenuBarSection.Name.allCases
+            if #unavailable(macOS 27.0) {
+                await appState.imageCache.updateCacheWithoutChecks(sections: MenuBarSection.Name.allCases)
+            }
+        }
+        .task(id: previewRequest.id) {
+            guard previewRequest.consume(in: appState.menuBarManager.macOS27Controller.interactionGeneration) else { return }
+            isLoadingPreviews = true
+            defer { isLoadingPreviews = false }
+            let loaded = await appState.imageCache.updateCacheWithoutChecks(
+                sections: MenuBarSection.Name.allCases,
+                userInitiatedPreview: true
             )
+            guard !Task.isCancelled else { return }
+            screenRecording.refresh()
+            if !screenRecording.hasPermission {
+                previewFeedback = String(localized: "Screen Recording permission is required only for icon previews.")
+            } else {
+                previewFeedback = loaded
+                    ? String(localized: "Icon previews loaded.")
+                    : String(localized: "No icon preview was produced. You can still reorder using application icons.")
+            }
         }
         .task(id: refreshID) {
             do { try await Task.sleep(for: .seconds(8)) } catch { return }
@@ -63,50 +127,148 @@ struct MenuBarLayoutSettingsPane: View {
             if loadState == .loading { loadState = .timedOut }
         }
         .onDisappear {
+            previewRequest.discard()
+            itemManager.cancelLayoutReads()
+            itemManager.endLayoutOverflowRecovery()
             if #available(macOS 27.0, *) {
                 appState.menuBarManager.macOS27Controller.endLayoutEditing()
             }
         }
     }
 
-    @ViewBuilder
-    private var header: some View {
-        if #available(macOS 27.0, *) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Arrange your menu bar")
-                    .font(.system(size: 20, weight: .semibold))
-                Text("Drag items between sections, or change their order. Changes appear in your menu bar.")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
+    private var previewControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                if screenRecording.hasPermission {
+                    Button("Load / Refresh Icon Previews") {
+                        previewFeedback = nil
+                        appState.menuBarManager.macOS27Controller.beginLayoutEditing()
+                        previewRequest.issue(in: appState.menuBarManager.macOS27Controller.interactionGeneration)
+                    }
+                } else {
+                    Text("Screen Recording permission is required only for icon previews.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button("Request Screen Recording") {
+                        let permission = screenRecording
+                        permission.refresh()
+                        if !permission.hasPermission { permission.performRequest(openSettings: false) }
+                    }
+                }
+                if isLoadingPreviews { ProgressView().controlSize(.small) }
+            }
+            .disabled(isLoadingPreviews || loadState != .finished)
+            if let previewFeedback {
+                Text(verbatim: previewFeedback).font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            .padding(.top, 14)
-            .padding(.horizontal, 4)
-        } else {
-            IceSection {
-                VStack(spacing: 3) {
-                    Text("Drag to arrange your menu bar items into different sections.")
-                        .font(.title3.bold())
-                    Text("Items can also be arranged by ⌘ Command + dragging them in the menu bar.")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(.secondary)
-                }
-                .padding(15)
+        }
+    }
+
+    private var header: some View {
+        IceSection {
+            VStack(spacing: 3) {
+                Text("Drag to arrange your menu bar items into different sections.")
+                    .font(.title3.bold())
+                Text("Items can also be arranged by ⌘ Command + dragging them in the menu bar.")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
             }
+            .padding(15)
         }
     }
 
     @ViewBuilder
     private var layoutBars: some View {
         if hasItems {
-            VStack(spacing: 22) {
-                ForEach(MenuBarSection.Name.allCases, id: \.self) { section in
-                    layoutBar(for: section)
+            VStack(alignment: .leading, spacing: 22) {
+                if appState.menuBarManager.usesSystemOverflow {
+                    VStack(alignment: .leading, spacing: 10) {
+                        LayoutBar(
+                            imageCache: appState.imageCache,
+                            section: .visible,
+                            isEmpty: itemManager.itemCache.managedItems.isEmpty
+                        )
+                    }
+                } else {
+                    ForEach(MenuBarSection.Name.allCases, id: \.self) { section in
+                        layoutBar(for: section)
+                    }
                 }
             }
         } else {
             loadingMenuBarItems
                 .frame(maxWidth: .infinity, minHeight: 240)
+        }
+    }
+
+    @ViewBuilder
+    private var reorderStatus: some View {
+        switch itemManager.reorderFeedback {
+        case .idle:
+            EmptyView()
+        case .arranging:
+            statusLine("Arranging menu bar…", busy: true)
+        case .readingActualOrder:
+            statusLine("Reading the current menu bar order…", busy: true)
+        case .confirmed:
+            statusLine("Menu bar order confirmed.", symbol: "checkmark.circle")
+        case .stopped(let reason):
+            statusLine(statusMessage(for: reason), symbol: "info.circle")
+            if reason == .endpointUnavailable { overflowRecoveryButton }
+        case .readbackUnavailable(let reason):
+            statusLine("Order unavailable. Check the menu bar before dragging again.", symbol: "exclamationmark.circle")
+            if reason == .endpointUnavailable { overflowRecoveryButton }
+        case .expandingOverflow:
+            statusLine("Expanding macOS overflow…", busy: true)
+        case .overflowExpanded:
+            statusLine("macOS overflow is expanded. Drag again to choose a new order.", symbol: "checkmark.circle")
+        case .overflowExpansionFailed:
+            statusLine("Overflow unavailable. Refresh the list, then drag a visible item.", symbol: "info.circle")
+            Button("Refresh List") {
+                guard itemManager.prepareLayoutRefreshAfterOverflowFailure() else { return }
+                loadState = .loading
+                refreshID += 1
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var overflowRecoveryButton: some View {
+        if appState.menuBarManager.usesSystemOverflow {
+            Button("Expand macOS Overflow") {
+                Task { await itemManager.expandSystemOverflowForLayout() }
+            }
+        }
+    }
+
+    private func statusLine(_ message: LocalizedStringKey, symbol: String = "info.circle", busy: Bool = false) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            if busy { ProgressView().controlSize(.small) } else { Image(systemName: symbol) }
+            Text(message).fixedSize(horizontal: false, vertical: true)
+        }
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .accessibilityElement(children: .combine)
+    }
+
+    private func statusMessage(for reason: NativeReorderFailure) -> LocalizedStringKey {
+        switch reason {
+        case .inputInterrupted:
+            "Input interrupted the move. Release the mouse and modifier keys, then drag again."
+        case .displayChanged:
+            "Display changed. Drag again on the current display."
+        case .modeChanged:
+            "Hiding mode changed. Drag again."
+        case .visibilityChanging:
+            "Application visibility is changing. Try again after it finishes."
+        case .endpointUnavailable:
+            "Item unavailable. Show it in the menu bar, then drag again."
+        case .applicationHidden:
+            "Show the hidden applications before reordering."
+        case .verificationUnconfirmed:
+            "Order not confirmed. Check the menu bar, then drag again."
+        case .eventDeliveryFailed:
+            "Move not confirmed. Drag again when ready."
         }
     }
 
@@ -143,7 +305,7 @@ struct MenuBarLayoutSettingsPane: View {
                 Image(systemName: "menubar.rectangle")
                     .font(.system(size: 24))
                     .foregroundStyle(.secondary)
-                Text(loadState == .timedOut ? "Menu bar items are taking longer than expected." : "No movable menu bar items found.")
+                Text(loadState == .timedOut ? LocalizedStringKey("Menu bar items are taking longer than expected.") : LocalizedStringKey("No movable menu bar items found."))
                     .font(.headline)
                 Text("Try again once your menu bar apps are ready. You can check permissions in Advanced Settings.")
                     .font(.callout)
@@ -175,9 +337,11 @@ struct MenuBarLayoutSettingsPane: View {
                             .frame(width: 20, height: 20)
                         VStack(alignment: .leading, spacing: 3) {
                             Text(name.localized).font(.system(size: 13, weight: .semibold))
-                            Text(sectionDescription(name))
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
+                            if !appState.menuBarManager.usesSystemOverflow {
+                                Text(sectionDescription(name))
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                         Spacer()
                         Text(itemManager.itemCache[name].count.formatted())

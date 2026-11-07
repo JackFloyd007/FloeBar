@@ -5,6 +5,7 @@
 
 import Combine
 import Foundation
+import AppKit
 import OSLog
 
 /// A type that manages the permissions of the app.
@@ -37,6 +38,7 @@ final class AppPermissions: ObservableObject {
 
     /// Storage for internal observers.
     private var cancellable: AnyCancellable?
+    private var activationCancellable: AnyCancellable?
 
     /// The permissions required for full app functionality.
     var allPermissions: [Permission] {
@@ -56,6 +58,17 @@ final class AppPermissions: ObservableObject {
             .sink { [weak self] _ in
                 self?.updatePermissionsState()
             }
+        activationCancellable = NotificationCenter.default
+            .publisher(for: NSApplication.didBecomeActiveNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.refreshAll()
+            }
+    }
+
+    func refreshAll() {
+        for permission in allPermissions { permission.refresh() }
+        updatePermissionsState()
     }
 
     /// Updates the current permissions state.

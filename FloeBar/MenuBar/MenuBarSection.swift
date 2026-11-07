@@ -23,6 +23,15 @@ final class MenuBarSection {
             }
         }
 
+        func toggleTitle(isHidden: Bool) -> String {
+            switch (self, isHidden) {
+            case (.alwaysHidden, true): String(localized: "Show Always-Hidden Section")
+            case (.alwaysHidden, false): String(localized: "Hide Always-Hidden Section")
+            case (_, true): String(localized: "Show Hidden Section")
+            case (_, false): String(localized: "Hide Hidden Section")
+            }
+        }
+
         /// A string to use for logging purposes.
         var logString: String {
             switch self {
@@ -163,6 +172,10 @@ final class MenuBarSection {
 
     /// Shows the section.
     func show() {
+        if menuBarManager?.usesSystemOverflow == true {
+            menuBarManager?.requestSystemOverflow(expanded: true)
+            return
+        }
         guard let menuBarManager, isHidden else {
             return
         }
@@ -216,11 +229,19 @@ final class MenuBarSection {
         }
 
         menuBarManager.syncNativeVisibility()
+        if #available(macOS 27.0, *), menuBarManager.experimentalHiding.enabled {
+            // Releasing a private assertion does not expand native overflow.
+            menuBarManager.requestSystemOverflow(expanded: true)
+        }
         startRehideChecks()
     }
 
     /// Hides the section.
     func hide() {
+        if menuBarManager?.usesSystemOverflow == true {
+            menuBarManager?.requestSystemOverflow(expanded: false)
+            return
+        }
         guard let menuBarManager, canToggleVisibility, !isHidden else {
             return
         }
@@ -243,6 +264,10 @@ final class MenuBarSection {
 
     /// Toggles the visibility of the section.
     func toggle() {
+        if menuBarManager?.usesSystemOverflow == true {
+            menuBarManager?.requestSystemOverflow()
+            return
+        }
         if isHidden { show() } else { hide() }
     }
 

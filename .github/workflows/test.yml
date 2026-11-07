@@ -1,0 +1,14 @@
+name: Regression checks
+on:
+  push:
+    branches: [main]
+    paths: ['FloeBar/**', 'FloeBar.xcodeproj/**', 'MenuBarItemService/**', 'Shared/**', 'Tests/**', 'scripts/**', '.github/workflows/test.yml']
+  pull_request:
+    paths: ['FloeBar/**', 'FloeBar.xcodeproj/**', 'MenuBarItemService/**', 'Shared/**', 'Tests/**', 'scripts/**', '.github/workflows/test.yml']
+jobs:
+  regression:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run pure Swift and localization checks
+        run: bash scripts/test.sh

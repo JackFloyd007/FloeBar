@@ -25,12 +25,7 @@ struct GeneralSettingsPane: View {
     }
 
     private var rehideIntervalKey: LocalizedStringKey {
-        let formatted = settings.rehideInterval.formatted()
-        if settings.rehideInterval == 1 {
-            return LocalizedStringKey(formatted + " second")
-        } else {
-            return LocalizedStringKey(formatted + " seconds")
-        }
+        LocalizedStringKey(Duration.seconds(settings.rehideInterval).formatted(.units(allowed: [.seconds], width: .wide)))
     }
 
     var body: some View {
@@ -38,8 +33,10 @@ struct GeneralSettingsPane: View {
             IceSection {
                 appOptions
             }
-            IceSection {
-                iceIconOptions
+            if #unavailable(macOS 27.0) {
+                IceSection { iceIconOptions }
+            } else if !appState.menuBarManager.usesSystemOverflow {
+                IceSection { iceIconPicker }
             }
             if #unavailable(macOS 27.0) {
                 IceSection {
@@ -62,16 +59,18 @@ struct GeneralSettingsPane: View {
 
     @ViewBuilder
     private var appOptions: some View {
-        LaunchAtLogin.Toggle()
+        LaunchAtLogin.Toggle { Text("Launch at login") }
     }
 
     // MARK: FloeBar Icon Options
 
     @ViewBuilder
     private var iceIconOptions: some View {
-        showIceIcon
-        if settings.showIceIcon {
-            iceIconPicker
+        if #available(macOS 27.0, *) {
+            if !appState.menuBarManager.usesSystemOverflow { iceIconPicker }
+        } else {
+            showIceIcon
+            if settings.showIceIcon { iceIconPicker }
         }
     }
 
@@ -157,7 +156,7 @@ struct GeneralSettingsPane: View {
     @ViewBuilder
     private func iceIconMenuItem(for imageSet: ControlItemImageSet) -> some View {
         Label {
-            Text(imageSet.name.rawValue)
+            Text(LocalizedStringKey(imageSet.name.rawValue))
         } icon: {
             if let nsImage = imageSet.hidden.nsImage(for: appState) {
                 switch imageSet.name {
@@ -326,11 +325,15 @@ struct GeneralSettingsPane: View {
 
     private func applyTempItemSpacingOffset() {
         isApplyingItemSpacingOffset = true
-        settings.itemSpacingOffset = tempItemSpacingOffset
+        let requestedOffset = tempItemSpacingOffset
+        let previousOffset = appState.spacingManager.offset
+        appState.spacingManager.offset = Int(requestedOffset)
         Task {
             do {
                 try await appState.spacingManager.applyOffset()
+                settings.itemSpacingOffset = requestedOffset
             } catch {
+                appState.spacingManager.offset = previousOffset
                 let alert = NSAlert(error: error)
                 alert.runModal()
             }

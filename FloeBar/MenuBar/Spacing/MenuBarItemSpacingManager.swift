@@ -40,9 +40,6 @@ final class MenuBarItemSpacingManager {
     /// Logger for the menu bar item spacing manager.
     private let logger = Logger(category: "MenuBarItemSpacingManager")
 
-    /// Delay before force terminating an app.
-    private let forceTerminateDelay = 1
-
     /// The offset to apply to the default spacing and padding.
     /// Does not take effect until ``applyOffset()`` is called.
     var offset = 0
@@ -57,6 +54,9 @@ final class MenuBarItemSpacingManager {
         let task = Task.detached {
             try process.run()
             process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                throw NSError(domain: "FloeBar.Spacing", code: Int(process.terminationStatus))
+            }
         }
 
         return try await task.value
@@ -64,6 +64,19 @@ final class MenuBarItemSpacingManager {
 
     /// Removes the value for the specified key.
     private func removeValue(forKey key: Key) async throws {
+        // `defaults delete` fails for an absent key; resetting defaults is
+        // idempotent, while real synchronization/command failures still surface.
+        guard CFPreferencesSynchronize(
+            kCFPreferencesAnyApplication,
+            kCFPreferencesCurrentUser,
+            kCFPreferencesCurrentHost
+        ) else { throw NSError(domain: "FloeBar.Spacing", code: 1) }
+        guard CFPreferencesCopyValue(
+            key.rawValue as CFString,
+            kCFPreferencesAnyApplication,
+            kCFPreferencesCurrentUser,
+            kCFPreferencesCurrentHost
+        ) != nil else { return }
         try await runCommand("defaults", with: ["-currentHost", "delete", "-globalDomain", key.rawValue])
     }
 
@@ -81,36 +94,10 @@ final class MenuBarItemSpacingManager {
             logger.debug("Signaling application \"\(app.logString, privacy: .public)\" to quit")
         }
 
-        app.terminate()
-
-        var cancellable: AnyCancellable?
-        return try await withCheckedThrowingContinuation { continuation in
-            let timeoutTask = Task {
-                try await Task.sleep(for: .seconds(forceTerminateDelay))
-                if !app.isTerminated {
-                    logger.debug(
-                        """
-                        Application \"\(app.logString, privacy: .public)\" did not terminate within \
-                        \(self.forceTerminateDelay, privacy: .public) seconds, attempting to force terminate
-                        """
-                    )
-                    app.forceTerminate()
-                }
-            }
-
-            cancellable = app.publisher(for: \.isTerminated).sink { [weak self] isTerminated in
-                guard
-                    let self,
-                    isTerminated
-                else {
-                    return
-                }
-                timeoutTask.cancel()
-                cancellable?.cancel()
-                logger.debug("Application \"\(app.logString, privacy: .public)\" terminated successfully")
-                continuation.resume()
-            }
-        }
+        try await GracefulApplicationTermination.terminate(
+            request: { app.terminate() },
+            isTerminated: { app.isTerminated }
+        )
     }
 
     /// Asynchronously launches the app at the given URL.
@@ -158,7 +145,16 @@ final class MenuBarItemSpacingManager {
 
         try? await Task.sleep(for: .milliseconds(100))
 
-        let items = await MenuBarItem.getMenuBarItems(option: .activeSpace)
+        var items: [MenuBarItem] = []
+        if #available(macOS 27.0, *) {
+            // Spacing is global, so collect owners from every display even
+            // though each native AX snapshot is isolated to one display.
+            for screen in NSScreen.screens {
+                items += await MenuBarItem.getMenuBarItems(on: screen.displayID, option: .activeSpace)
+            }
+        } else {
+            items = await MenuBarItem.getMenuBarItems(option: .activeSpace)
+        }
         let pids = Set(items.map { $0.sourcePID ?? $0.ownerPID })
 
         var failedApps = [String]()
@@ -170,7 +166,7 @@ final class MenuBarItemSpacingManager {
                     app.bundleIdentifier != "com.apple.controlcenter", // ControlCenter handles its own relaunch, so skip it.
                     app != .current
                 else {
-                    break
+                    continue
                 }
                 group.addTask { @MainActor in
                     do {

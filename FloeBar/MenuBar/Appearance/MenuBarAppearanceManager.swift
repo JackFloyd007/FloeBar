@@ -98,20 +98,15 @@ final class MenuBarAppearanceManager: ObservableObject {
     /// Returns a Boolean value that indicates whether a set of overlay panels
     /// is needed for the given configuration.
     private func needsOverlayPanels(for configuration: MenuBarAppearanceConfigurationV2) -> Bool {
-        let current = configuration.current
-        if current.hasShadow {
-            return true
-        }
-        if current.hasBorder {
-            return true
-        }
         if configuration.shapeKind != .noShape {
             return true
         }
-        if current.tintKind != .noTint {
-            return true
-        }
-        return false
+        // Keep a panel ready when either dynamic appearance needs it, including
+        // the opposite appearance preview. All-off configurations still close it.
+        let variants = configuration.isDynamic
+            ? [configuration.lightModeConfiguration, configuration.darkModeConfiguration]
+            : [configuration.staticConfiguration]
+        return variants.contains { $0.hasShadow || $0.hasBorder || $0.tintKind != .noTint }
     }
 
     /// Configures the manager's overlay panels, if required by the given configuration.

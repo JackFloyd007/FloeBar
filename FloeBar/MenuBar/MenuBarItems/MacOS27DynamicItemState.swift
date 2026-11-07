@@ -34,6 +34,10 @@ struct MacOS27RuntimeItemRegistry<Element> {
 
     var count: Int { entries.count }
 
+    func element(for identity: String) -> Element? {
+        entries.first { $0.identity == identity }?.element
+    }
+
     init(capacity: Int = 512) {
         precondition(capacity > 0)
         self.capacity = capacity

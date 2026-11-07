@@ -76,7 +76,12 @@ struct SettingsView: View {
         NavigationSplitView {
             sidebar
         } detail: {
-            detailView
+            VStack(spacing: 0) {
+                if #available(macOS 27.0, *) {
+                    NativeHidingStatusView(manager: appState.menuBarManager)
+                }
+                detailView
+            }
         }
         .navigationTitle(navigationTitle)
     }
@@ -156,6 +161,23 @@ struct SettingsView: View {
             AdvancedSettingsPane(settings: appState.settings.advanced)
         case .about:
             AboutSettingsPane(updatesManager: appState.updatesManager)
+        }
+    }
+}
+
+/// Observe the manager directly: EnvironmentObject AppState does not forward
+/// changes published by nested ObservableObjects.
+private struct NativeHidingStatusView: View {
+    @ObservedObject var manager: MenuBarManager
+
+    var body: some View {
+        if manager.nativeHidingFailed {
+            Label("System overflow unavailable or unconfirmed; use the macOS double-chevron.", systemImage: "exclamationmark.triangle")
+                .font(.callout)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding()
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }

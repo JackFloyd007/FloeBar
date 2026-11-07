@@ -152,6 +152,8 @@ final class LayoutBarContainer: NSView {
         heightConstraint.constant = maxHeight
     }
 
+    private static var displayLabelRegistry = MenuBarItemDisplayLabel.Registry()
+
     /// Sets the container's arranged views with the given items.
     ///
     /// - Note: If the value of the container's ``canSetArrangedViews``
@@ -167,15 +169,35 @@ final class LayoutBarContainer: NSView {
             arrangedViews.removeAll()
             return
         }
+        let presentations: [String: MenuBarItemDisplayLabel.Presentation]
+        if #available(macOS 27.0, *) {
+            presentations = Self.displayLabelRegistry.presentations(for: items.filter { item in
+                guard !item.isControlItem, case .string(let bundle) = item.tag.namespace else { return false }
+                return !bundle.hasPrefix("com.apple.") && bundle != Constants.bundleIdentifier
+            }.map { item in
+                let bundle: String
+                if case .string(let value) = item.tag.namespace { bundle = value } else { bundle = "" }
+                let application = NSRunningApplication.runningApplications(withBundleIdentifier: bundle).first
+                let app = application?.localizedName ?? item.sourceApplication?.localizedName ?? item.displayName
+                return MenuBarItemDisplayLabel.Item(
+                    identity: item.nativeIdentityToken ?? item.tag.persistentIdentifier,
+                    group: "\(item.tag.namespace)|\(item.sourcePID ?? item.ownerPID)",
+                    app: app,
+                    semantic: MenuBarItemDisplayLabel.semantic(app: app, description: nil, title: item.title, help: item.accessibilityHelp, identifier: item.tag.title)
+                )
+            })
+        } else { presentations = [:] }
         var newViews = [LayoutBarItemView]()
         var seenTags = Set<MenuBarItemTag>()
         for item in items {
             guard seenTags.insert(item.tag).inserted else { continue }
             if let existingView = arrangedViews.first(where: { $0.item.tag == item.tag }) {
                 existingView.update(item: item)
+                existingView.setDisplayPresentation(presentations[item.nativeIdentityToken ?? item.tag.persistentIdentifier])
                 newViews.append(existingView)
             } else {
                 let view = LayoutBarItemView(appState: appState, item: item)
+                view.setDisplayPresentation(presentations[item.nativeIdentityToken ?? item.tag.persistentIdentifier])
                 newViews.append(view)
             }
         }

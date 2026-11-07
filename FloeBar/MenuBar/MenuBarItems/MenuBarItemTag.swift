@@ -16,21 +16,21 @@ struct MenuBarItemTag: Hashable, CustomStringConvertible {
     /// The title of the item identified by this tag.
     let title: String
 
-    /// A stable positional disambiguator for items from the same application
-    /// that expose the same accessibility identity on macOS 27.
+    /// A legacy discriminator retained for decoding saved layouts. New native
+    /// snapshots reject ambiguous identities instead of numbering positions.
     let instanceIndex: Int
 
     /// A Boolean value that indicates whether the item identified
     /// by this tag can be moved.
     var isMovable: Bool {
-        !MenuBarItemTag.immovableItems.contains(self)
+        !MenuBarItemTag.immovableItems.contains(where: { $0.namespace == namespace && $0.title == title })
     }
 
     /// A Boolean value that indicates whether the item identified
     /// by this tag can be hidden.
     var canBeHidden: Bool {
-        !MenuBarItemTag.immovableItems.contains(self) &&
-        !MenuBarItemTag.nonHideableItems.contains(self) &&
+        isMovable &&
+        !MenuBarItemTag.nonHideableItems.contains(where: { $0.namespace == namespace && $0.title == title }) &&
         !(namespace.isUUID && title == "AudioVideoModule")
     }
 

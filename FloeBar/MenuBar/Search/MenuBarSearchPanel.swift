@@ -18,6 +18,7 @@ final class MenuBarSearchPanel: NSPanel {
 
     /// Model for menu bar item search.
     private let model = MenuBarSearchModel()
+    private let presentation = DeferredPresentation()
 
     /// Monitor for mouse down events.
     private lazy var mouseDownMonitor = EventMonitor.universal(
@@ -116,9 +117,10 @@ final class MenuBarSearchPanel: NSPanel {
         // Important that we set the navigation state before updating the cache.
         appState.navigationState.isSearchPresented = true
 
-        Task {
+        presentation.show(after: {
             await appState.imageCache.updateCache()
-
+        }, present: { [weak self] in
+            guard let self else { return }
             let hostingView = MenuBarSearchHostingView(appState: appState, model: model, displayID: screen.displayID, panel: self)
             hostingView.setFrameSize(hostingView.intrinsicContentSize)
             setFrame(hostingView.frame, display: true)
@@ -136,16 +138,17 @@ final class MenuBarSearchPanel: NSPanel {
 
             mouseDownMonitor.start()
             keyDownMonitor.start()
-        }
+        })
     }
 
     /// Toggles the panel's visibility.
     func toggle() {
-        if isVisible { close() } else { show() }
+        if isVisible || presentation.isPending { close() } else { show() }
     }
 
     /// Dismisses the search panel.
     override func close() {
+        presentation.cancel()
         super.close()
         contentView = nil
         mouseDownMonitor.stop()
@@ -313,7 +316,7 @@ private struct MenuBarSearchContentView: View {
                 }
 
                 let headerItem = ListItem.header(id: .header(name)) {
-                    Text(name.displayString)
+                    Text(name.localized)
                         .fontWeight(.semibold)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -377,11 +380,17 @@ private struct MenuBarSearchContentView: View {
     private func performAction(for item: MenuBarItem) {
         closePanel()
         Task {
-            try await Task.sleep(for: .milliseconds(25))
-            if Bridging.isWindowOnScreen(item.windowID) {
-                try await itemManager.click(item: item, with: .left)
-            } else {
-                await itemManager.temporarilyShow(item: item, clickingWith: .left)
+            do {
+                try await Task.sleep(for: .milliseconds(25))
+                if Bridging.isWindowOnScreen(item.windowID) {
+                    try await itemManager.click(item: item, with: .left)
+                } else {
+                    await itemManager.temporarilyShow(item: item, clickingWith: .left)
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                Logger.default.error("Could not activate menu bar search result: \(error)")
             }
         }
     }
@@ -393,8 +402,7 @@ private struct SettingsButton: View {
     var body: some View {
         Button(action: action) {
             Image(.iceCubeStroke)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
+                .resizable().scaledToFit()
                 .foregroundStyle(.secondary)
                 .padding(2)
         }
@@ -420,8 +428,7 @@ private struct ShowItemButton: View {
                     .padding(.leading, 5)
 
                 Image(systemName: "return")
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
+                    .resizable().scaledToFit()
                     .frame(width: 11, height: 11)
                     .foregroundStyle(.secondary)
                     .fontWeight(.bold)
@@ -549,8 +556,7 @@ private struct MenuBarSearchItemView: View {
     private var labelIcon: some View {
         if let appIcon {
             Image(nsImage: appIcon)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
+                .resizable().scaledToFit()
                 .frame(width: dimension, height: dimension)
         } else {
             RoundedRectangle(cornerRadius: 5)
@@ -558,8 +564,7 @@ private struct MenuBarSearchItemView: View {
                 .strokeBorder(Color.primary.gradient.quaternary)
                 .overlay {
                     Image(systemName: "rectangle.topthird.inset.filled")
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
+                        .resizable().scaledToFit()
                         .foregroundStyle(.white)
                         .padding(3)
                         .shadow(radius: 2)

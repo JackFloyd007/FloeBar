@@ -1,6 +1,45 @@
 # macOS 27 native interaction
 
-Current FloeBar source version: `0.13.0-macos27.1 (1330)`. Installed-build
+Current development version: `0.13.0-macos27.37-dev (1366)`.
+
+**Current behavior:** explicitly authorized system menu bar preferences support
+hide/show for verified third-party applications and system-declared application
+groups, including WPS. Ownership, installation and fresh readback are checked;
+unsupported targets remain unavailable. A durable journal supports normal-quit
+restoration and recovery before editing on the next launch after a crash.
+
+Layout has a single native ordering row with guarded, single-gesture dragging.
+Hidden applications must be shown before their items can move. Preview capture
+is off by default. The system overflow/chevron remains, and experimental private
+assertions stay disabled on launch. No Apple-item exception is enabled.
+
+The [current plan and acceptance record](docs/plans/native-overflow-root-fix.md)
+documents real mouse sorting, repeated WPS control, normal/crash recovery and
+remaining coverage limits. The unchanged 1366 source and local Apple Development
+package passed the recorded checks; public distribution is pending Developer ID
+signing, Apple notarization, Sparkle signing and previous-release update validation.
+The records below are historical and do not describe the current normal backend.
+
+## Historical 1333 and earlier records
+
+1333 adds a **default-off, session-only experimental private hiding mode** under
+Advanced settings, with 45-second automatic release. It has separate acceptance:
+see [experimental results and limits](docs/experimental-private-hiding.md).
+Native overflow remains; full native-input compatibility is not passed.
+The following 1332 correction describes normal mode.
+
+**Correction:** A real Passwords-button misclick invalidated the previous
+overflow-proxy acceptance. Build 1332 removes all automatic system-overflow
+clicks and forbids synthetic boundary repair during ordinary visibility
+changes. Hidden drag endpoints now require manual reveal. FloeBar does not
+replace the system chevron; independent macOS 27 hiding remains unresolved.
+The [input/API audit](docs/macos27-input-safety-2026-09-20.md) supersedes the
+older success claims below. 1332 did not activate a private assessment assertion; 1333 opt-in tests do.
+See the [2026-09-20 compatibility and localization review](docs/macos27-review-2026-09-20.md)
+for current changes and validation gaps. The device records below describe the
+preceding implementation, not acceptance of this development build.
+
+Previous FloeBar source version: `0.13.0-macos27.1 (1330)`. Installed-build
 validation from before the FloeBar rename used `/Applications/Ice.app`. The
 maintained implementation removes the unnecessary full wait and stale hit-map
 prerequisite from ordinary, settled-pair hiding, and cleans up failed hiding

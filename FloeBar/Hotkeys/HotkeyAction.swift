@@ -37,6 +37,7 @@ enum HotkeyAction: String, Codable, CaseIterable {
                 appState.menuBarManager.showOnHoverAllowed = false
             }
         case .toggleAlwaysHiddenSection:
+            guard !appState.menuBarManager.usesSystemOverflow else { return }
             guard let section = appState.menuBarManager.section(withName: .alwaysHidden) else {
                 return
             }

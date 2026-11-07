@@ -9,21 +9,23 @@ import SwiftUI
 // MARK: - SettingsWindow
 
 struct SettingsWindow: Scene {
-    @ObservedObject var appState: AppState
+    @ObservedObject var appDelegate: AppDelegate
     @StateObject private var model = SettingsWindowModel()
 
     var body: some Scene {
         IceWindow(id: .settings) {
-            SettingsView(navigationState: appState.navigationState)
-                .onWindowChange { window in
-                    model.observeWindowToolbar(window)
-                }
-                .frame(minWidth: 825, maxWidth: 1150, minHeight: 500, maxHeight: 750)
+            if let appState = appDelegate.appState {
+                SettingsView(navigationState: appState.navigationState)
+                    .onWindowChange { window in
+                        model.observeWindowToolbar(window)
+                    }
+                    .frame(minWidth: 825, maxWidth: 1150, minHeight: 500, maxHeight: 750)
+                    .environmentObject(appState)
+            }
         }
         .commandsRemoved()
         .windowResizability(.contentSize)
         .defaultSize(width: 900, height: 625)
-        .environmentObject(appState)
     }
 }
 

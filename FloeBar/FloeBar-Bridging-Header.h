@@ -1,1 +1,1 @@
-// No private visibility or compositor bridge is required.
+#import "MenuBar/Experimental/FBPrivateLease.h"

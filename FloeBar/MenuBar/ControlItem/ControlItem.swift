@@ -5,6 +5,7 @@
 
 import Cocoa
 import Combine
+import OSLog
 
 // MARK: - ControlItem
 
@@ -33,8 +34,7 @@ final class ControlItem {
         /// the given hiding state.
         func length(for state: HidingState) -> CGFloat {
             if #available(macOS 27.0, *) {
-                // A separate blank native spacer handles overflow. This button
-                // keeps its normal width and remains clickable in both states.
+                // System overflow owns visibility; our control keeps a fixed width.
                 return Lengths.standard
             }
             return switch self {
@@ -214,6 +214,10 @@ final class ControlItem {
     /// Configures the internal observers for the control item.
     private func configureCancellables() {
         var c = Set<AnyCancellable>()
+        appState?.menuBarManager.experimentalHiding.$enabled
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateStatusItem() }
+            .store(in: &c)
 
         statusItem.publisher(for: \.isVisible)
             .receive(on: DispatchQueue.main)
@@ -307,7 +311,11 @@ final class ControlItem {
                         guard let self else {
                             return
                         }
-                        if shouldShow {
+                        // macOS 27 requires this visible item as a verified
+                        // native boundary anchor and as the reveal control.
+                        if #available(macOS 27.0, *) {
+                            addToMenuBar()
+                        } else if shouldShow {
                             addToMenuBar()
                         } else {
                             removeFromMenuBar()
@@ -409,7 +417,21 @@ final class ControlItem {
                 image = originalImage.resized(to: newSize)
             }
 
+            if appState.menuBarManager.usesSystemOverflow {
+                image = ControlItemImage.symbol(state == .showSection ? "chevron.right" : "chevron.left").nsImage(for: appState)
+                    ?? ControlItemImage.builtin(.chevronLarge).nsImage(for: appState)
+            }
             button.image = image
+            button.setAccessibilityLabel("FloeBar")
+            if #available(macOS 27.0, *) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                    self?.logNativeVisibility()
+                }
+            }
+            button.toolTip = appState.menuBarManager.usesSystemOverflow
+                ? (appState.menuBarManager.appVisibilityAccess.shouldRouteToApplicationVisibility
+                    ? String(localized: "Expand or collapse selected applications")
+                    : String(localized: "Toggle system overflow")) : nil
         case .hidden, .alwaysHidden:
             switch state {
             case .showSection:
@@ -441,6 +463,19 @@ final class ControlItem {
                 button.isHighlighted = false
             }
         }
+    }
+
+    /// Read-only evidence for our own native button, independent of screenshots.
+    /// A visible preference is not proof that MenuBarAgent exposed a hit target.
+    @available(macOS 27.0, *)
+    private func logNativeVisibility() {
+        guard identifier == .visible, let button = statusItem.button,
+            let screen = screen ?? NSScreen.main else { return }
+        let items = MacOS27MenuBarItemProvider.ownMenuBarItems(on: screen.displayID)
+        let matching = items.filter { $0.tag == .visibleControlItem }
+        let hit = matching.count == 1 && MacOS27MenuBarItemProvider.nativeHitMatches(matching[0])
+        let frame = matching.first.map { NSStringFromRect($0.bounds) } ?? "unavailable"
+        Logger(category: "ControlItem").notice("FloeBar arrow visible=\(self.statusItem.isVisible) image=\(button.image != nil) length=\(self.statusItem.length) ax_count=\(matching.count) frame=\(frame, privacy: .public) exact_hit=\(hit)")
     }
 
     /// Updates the visibility of the status item.
@@ -550,6 +585,10 @@ final class ControlItem {
             return
         }
 
+        if menuBarManager.usesSystemOverflow, menuBarManager.appVisibilityAccess.shouldRouteToApplicationVisibility {
+            menuBarManager.appVisibilityAccess.changeSelected(expanded: nil)
+            return
+        }
         if
             let section = menuBarManager.section(withName: sectionName),
             section.canToggleVisibility
@@ -568,17 +607,22 @@ final class ControlItem {
         let menu = NSMenu(title: "FloeBar")
 
         let settingsItem = NSMenuItem(
-            title: "FloeBar Settings…",
+            title: String(localized: "FloeBar Settings…"),
             action: #selector(AppDelegate.openSettingsWindow),
             keyEquivalent: ","
         )
         settingsItem.keyEquivalentModifierMask = .command
         menu.addItem(settingsItem)
+        if appState.menuBarManager.nativeHidingFailed {
+            let warning = NSMenuItem(title: String(localized: "The system overflow control is unavailable or expansion could not be confirmed."), action: nil, keyEquivalent: "")
+            warning.isEnabled = false
+            menu.addItem(warning)
+        }
 
         menu.addItem(.separator())
 
         let searchItem = NSMenuItem(
-            title: "Search Menu Bar Items",
+            title: String(localized: "Search Menu Bar Items"),
             action: #selector(showSearchPanel),
             keyEquivalent: ""
         )
@@ -598,6 +642,7 @@ final class ControlItem {
 
         // Add items to toggle the hidden and always-hidden sections.
         for name: MenuBarSection.Name in [.hidden, .alwaysHidden] {
+            if appState.menuBarManager.usesSystemOverflow && name == .alwaysHidden { continue }
             guard
                 let section = appState.menuBarManager.section(withName: name),
                 section.canToggleVisibility
@@ -605,7 +650,10 @@ final class ControlItem {
                 continue
             }
             let item = NSMenuItem(
-                title: "\(section.isHidden ? "Show" : "Hide") \(name.displayString) Section",
+                title: appState.menuBarManager.usesSystemOverflow
+                    ? (appState.menuBarManager.appVisibilityAccess.shouldRouteToApplicationVisibility
+                        ? String(localized: "Expand or collapse selected applications") : String(localized: "Toggle system overflow"))
+                    : name.toggleTitle(isHidden: section.isHidden),
                 action: #selector(toggleMenuBarSection),
                 keyEquivalent: ""
             )
@@ -624,7 +672,7 @@ final class ControlItem {
         menu.addItem(.separator())
 
         let checkForUpdatesItem = NSMenuItem(
-            title: "Check for Updates…",
+            title: String(localized: "Check for Updates…"),
             action: #selector(checkForUpdates),
             keyEquivalent: ""
         )
@@ -634,7 +682,7 @@ final class ControlItem {
         menu.addItem(.separator())
 
         let quitItem = NSMenuItem(
-            title: "Quit FloeBar",
+            title: String(localized: "Quit FloeBar"),
             action: #selector(NSApp.terminate),
             keyEquivalent: "q"
         )
@@ -643,6 +691,8 @@ final class ControlItem {
 
         return menu
     }
+
+    func showNativeOverflowUnavailableMenu() { showMenu() }
 
     /// Shows the control item's menu.
     private func showMenu() {
@@ -656,6 +706,10 @@ final class ControlItem {
     /// Toggles the menu bar section associated with the given menu item.
     @objc private func toggleMenuBarSection(for menuItem: NSMenuItem) {
         guard let section = menuItem.representedObject as? MenuBarSection else {
+            return
+        }
+        if let manager = appState?.menuBarManager, manager.usesSystemOverflow, manager.appVisibilityAccess.shouldRouteToApplicationVisibility {
+            manager.appVisibilityAccess.changeSelected(expanded: nil)
             return
         }
         appState?.menuBarManager.prepareForControlToggle()

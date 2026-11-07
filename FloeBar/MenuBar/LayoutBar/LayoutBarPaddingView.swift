@@ -32,6 +32,10 @@ final class LayoutBarPaddingView: NSView {
     }
 
     func showLocalDropIndicator(for item: MenuBarItem, at windowPoint: CGPoint) {
+        guard (try? container.appState?.itemManager.validateHidingMove(item: item, to: container.section)) != nil else {
+            clearLocalDropIndicator()
+            return
+        }
         let insertion = localInsertion(for: item, at: windowPoint)
         let x = insertion.views.indices.contains(insertion.index)
             ? insertion.views[insertion.index].frame.minX - LayoutBarContainer.itemSpacing / 2
@@ -57,6 +61,7 @@ final class LayoutBarPaddingView: NSView {
 
     func acceptLocalDrop(item: MenuBarItem, at windowPoint: CGPoint) {
         guard let appState = container.appState else { return }
+        do { try appState.itemManager.validateHidingMove(item: item, to: container.section) } catch { NSAlert(error: error).runModal(); return }
         let insertion = localInsertion(for: item, at: windowPoint)
         // Dropping an item back into its own position is a no-op, including
         // an otherwise empty row. Never start a native drag for this case.

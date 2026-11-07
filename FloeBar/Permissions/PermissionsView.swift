@@ -33,6 +33,7 @@ struct PermissionsView: View {
             headerView
                 .padding(.vertical)
 
+            SystemAppVisibilityRecoveryView(access: appState.menuBarManager.appVisibilityAccess)
             permissionsStack
 
             footerView
@@ -51,8 +52,7 @@ struct PermissionsView: View {
         } icon: {
             if let nsImage = NSImage(named: NSImage.applicationIconName) {
                 Image(nsImage: nsImage)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
+                    .resizable().scaledToFit()
                     .frame(width: 85, height: 85)
             }
         }

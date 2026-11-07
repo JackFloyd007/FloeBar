@@ -38,6 +38,35 @@ enum MacOS27NativeBoundary {
         case left, right
     }
 
+    /// Leave the anchor and all trailing visible items outside the spacer.
+    /// The system adds item spacing, so reserve a small inset at the leading edge.
+    static func concealmentLength(leftEdge: CGFloat, rightEdge: CGFloat) -> CGFloat? {
+        guard leftEdge.isFinite, rightEdge.isFinite, rightEdge - leftEdge >= 8 else { return nil }
+        return rightEdge - leftEdge - 6
+    }
+
+    /// Identical hosted presentations describe one control; different frames
+    /// can be a transition or another display and must not be guessed between.
+    static func unambiguousFrame(_ frames: [CGRect]) -> CGRect? {
+        guard let first = frames.first, frames.allSatisfy({ $0 == first }) else { return nil }
+        return first
+    }
+
+    /// A hit on a child is usable only when an ancestor proves the exact
+    /// process, identity and geometry of our boundary. A same-process neighbor
+    /// or a stale frame is never sufficient authorization for a native drag.
+    static func matchesOwnedHit(
+        pid: Int32?,
+        expectedPID: Int32,
+        identifier: String?,
+        expectedIdentifier: String,
+        frame: CGRect?,
+        point: CGPoint
+    ) -> Bool {
+        pid == expectedPID && identifier == expectedIdentifier &&
+            frame?.contains(point) == true
+    }
+
     /// Conservative quick-path geometry for the native narrow handle. This
     /// is only for resizing our own item, never for targeting mouse input.
     /// Callers reject ambiguous owner variants and recheck frames. Wider gaps,
@@ -82,14 +111,17 @@ enum MacOS27NativeBoundary {
 
     /// MenuBarAgent's automatic overflow control has no stable identifier and
     /// its description is localized. Its compact button geometry and lack of a
-    /// descendant identifier distinguish it from real Control Center extras.
+    /// descendant identifier are only an enumeration hint, never click authority.
+    /// Titled or foreign-owned buttons (including Passwords) must be retained.
     static func isSystemOverflowControl(
         frame: CGRect,
         hasIdentifier: Bool,
         hasDescription: Bool,
-        isButton: Bool
+        isButton: Bool,
+        isAgentOwned: Bool,
+        hasTitle: Bool
     ) -> Bool {
-        !hasIdentifier && hasDescription && isButton &&
+        isAgentOwned && !hasTitle && !hasIdentifier && hasDescription && isButton &&
             frame.width > 0 && frame.width <= 22 &&
             frame.height >= 28 && frame.height <= 34
     }

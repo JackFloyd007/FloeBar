@@ -13,6 +13,24 @@ FloeBar is distributed independently from the upstream Ice project.
 The Sparkle private key stays in the maintainer's login keychain. Never commit
 an exported private key to this repository.
 
+## 2026-11-07 closeout
+
+The accepted development candidate is `0.13.0-macos27.37-dev (1366)`.
+Its source matches the frozen validation manifest and its local package uses
+Apple Development signing. The current Mac has no valid Developer ID Application
+identity and no notarytool credential profile named `FloeBar`.
+
+The maintainer chose to supply those credentials before publishing a formal
+automatic update. Source closeout can proceed independently. Keep the current
+public release and Sparkle feed unchanged until the checklist below passes;
+do not publish the development package as a notarized release. The accepted
+1366 app and existing evidence remain preserved under the ignored `build/` tree.
+
+Import the project's Developer ID Application identity, including its private
+key, into the login keychain and configure notarytool credentials under the
+profile name `FloeBar`. Keep all secrets local. Prepare a new release version
+and build number after credentials are available, then follow the checklist.
+
 ## Release checklist
 
 1. Increment both `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION`.

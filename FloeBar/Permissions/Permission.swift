@@ -56,8 +56,8 @@ class Permission: ObservableObject, Identifiable {
         check: @escaping () -> Bool,
         request: @escaping () -> Void
     ) {
-        self.title = title
-        self.details = details
+        self.title = NSLocalizedString(title, comment: "Permission title")
+        self.details = details.map { NSLocalizedString($0, comment: "Permission purpose") }
         self.isRequired = isRequired
         self.settingsURL = settingsURL
         self.check = check
@@ -68,6 +68,7 @@ class Permission: ObservableObject, Identifiable {
 
     /// Sets up the internal observers for the permission.
     private func configureCancellables() {
+        timerCancellable?.cancel()
         timerCancellable = Timer.publish(every: 1, on: .main, in: .default)
             .autoconnect()
             .merge(with: Just(.now))
@@ -75,17 +76,23 @@ class Permission: ObservableObject, Identifiable {
                 guard let self else {
                     return
                 }
-                let granted = check()
-                if hasPermission != granted { hasPermission = granted }
+                refresh()
             }
     }
 
-    /// Performs the request and opens the System Settings app to the appropriate pane.
-    func performRequest() {
+    /// Performs an explicit request, optionally opening the matching settings pane.
+    func performRequest(openSettings: Bool = true) {
         request()
-        if let settingsURL {
+        configureCancellables()
+        if openSettings, let settingsURL {
             NSWorkspace.shared.open(settingsURL)
         }
+    }
+
+    /// Refreshes both the UI state and the shared capture permission cache.
+    func refresh() {
+        let granted = check()
+        if hasPermission != granted { hasPermission = granted }
     }
 
     /// Asynchronously waits for the app to be granted this permission.

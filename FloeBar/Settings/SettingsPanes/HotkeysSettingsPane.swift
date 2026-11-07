@@ -13,7 +13,9 @@ struct HotkeysSettingsPane: View {
         IceForm {
             IceSection("Menu Bar Sections") {
                 hotkeyRecorder(forSection: .hidden)
-                hotkeyRecorder(forSection: .alwaysHidden)
+                if !appState.menuBarManager.usesSystemOverflow {
+                    hotkeyRecorder(forSection: .alwaysHidden)
+                }
             }
             if #unavailable(macOS 27.0) {
                 IceSection("Menu Bar Items") {
@@ -33,7 +35,11 @@ struct HotkeysSettingsPane: View {
             HotkeyRecorder(hotkey: hotkey) {
                 switch action {
                 case .toggleHiddenSection:
-                    Text("Toggle the hidden section")
+                    if appState.menuBarManager.usesSystemOverflow {
+                        Text("Toggle system overflow")
+                    } else {
+                        Text("Toggle the hidden section")
+                    }
                 case .toggleAlwaysHiddenSection:
                     Text("Toggle the always-hidden section")
                 case .searchMenuBarItems:

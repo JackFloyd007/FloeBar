@@ -16,7 +16,6 @@ struct AboutSettingsPane: View {
     }
 
     private var contributeURL: URL {
-        // swiftlint:disable:next force_unwrapping
         URL(string: "https://github.com/JackFloyd007/FloeBar")!
     }
 
@@ -25,7 +24,6 @@ struct AboutSettingsPane: View {
     }
 
     private var upstreamURL: URL {
-        // swiftlint:disable:next force_unwrapping
         URL(string: "https://github.com/jordanbaird/Ice")!
     }
 
@@ -33,7 +31,7 @@ struct AboutSettingsPane: View {
         if let date = updatesManager.lastUpdateCheckDate {
             date.formatted(date: .abbreviated, time: .standard)
         } else {
-            "Never"
+            String(localized: "Never")
         }
     }
 
@@ -79,8 +77,7 @@ struct AboutSettingsPane: View {
             HStack(spacing: 10) {
                 if let nsImage = NSImage(named: NSImage.applicationIconName) {
                     Image(nsImage: nsImage)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
+                        .resizable().scaledToFit()
                         .frame(width: 230)
                 }
 

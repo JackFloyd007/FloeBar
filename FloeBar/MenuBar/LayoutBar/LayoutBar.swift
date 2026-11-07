@@ -50,7 +50,7 @@ struct LayoutBar: View {
                 .frame(maxWidth: .infinity)
                 .background(.primary.opacity(0.025))
                 .overlay(alignment: .leading) {
-                    if isEmpty {
+                    if isEmpty && !appState.menuBarManager.usesSystemOverflow {
                         Label("Drop an item here", systemImage: "plus")
                             .font(.system(size: 12))
                             .foregroundStyle(.tertiary)

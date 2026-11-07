@@ -62,6 +62,7 @@ final class MenuBarItemImageCache: ObservableObject {
         /// Cached pixels for these tags came from a different native hit target
         /// and must not be retained while the real item is overflowed.
         var invalidatedTags = Set<MenuBarItemTag>()
+        var isComplete = true
     }
 
     /// The cached item images, keyed by their corresponding tags.
@@ -70,8 +71,9 @@ final class MenuBarItemImageCache: ObservableObject {
     /// Logger for the menu bar item image cache.
     private let logger = Logger(category: "MenuBarItemImageCache")
 
-    @MainActor private var isUpdating = false
-    @MainActor private var pendingSections = Set<MenuBarSection.Name>()
+    @MainActor private var refreshQueue = NativeMenuBarRefreshQueue<MenuBarSection.Name>()
+    @MainActor private var activeCaptureTask: Task<Bool, Never>?
+    @MainActor private var capturePublicationGeneration: UInt64 = 0
 
     /// Image capture options.
     private let captureOption: CGWindowImageOption = [.boundsIgnoreFraming, .bestResolution]
@@ -211,13 +213,7 @@ final class MenuBarItemImageCache: ObservableObject {
 
     /// Captures the images of the given menu bar items and returns the result.
     private nonisolated func captureImages(of items: [MenuBarItem], scale: CGFloat, appState: AppState) async -> CaptureResult {
-        if #available(macOS 27.0, *) {
-            let displayID = await appState.itemManager.itemCache.displayID ?? CGMainDisplayID()
-            return await captureMacOS27Images(
-                of: items,
-                displayID: displayID
-            )
-        }
+        if #available(macOS 27.0, *) { return CaptureResult() }
 
         // Use individual capture after a move operation, since composite capture
         // doesn't account for overlapping items.
@@ -252,48 +248,55 @@ final class MenuBarItemImageCache: ObservableObject {
     @available(macOS 27.0, *)
     private nonisolated func captureMacOS27Images(
         of items: [MenuBarItem],
-        displayID: CGDirectDisplayID
+        displayID: CGDirectDisplayID,
+        userInitiatedPreview: Bool,
+        isCurrent: @escaping @MainActor () -> Bool
     ) async -> CaptureResult {
         let capturable = items.filter { !$0.isControlItem || $0.tag == .visibleControlItem }
         guard !capturable.isEmpty else { return CaptureResult() }
 
         var result = CaptureResult()
 
-        if ScreenCapture.cachedCheckPermissions() {
+        if userInitiatedPreview {
             // Layout reveals all sections before this pass. Refresh only the
             // participating owners so crop geometry follows each item's live
             // position without another full running-application AX scan.
             let sourcePIDs = Set(capturable.map { $0.sourcePID ?? $0.ownerPID })
             let namespaces = Set(capturable.map(\.tag.namespace))
-            let refreshedItems = await Task.detached(priority: .userInitiated) {
-                MacOS27MenuBarItemProvider.menuBarItems(
-                    sourcePIDs: sourcePIDs,
-                    namespaces: namespaces
-                )
-            }.value
+            let context = NativeMenuBarScanContext(purpose: "capture", budget: 3)
+            let before = await MacOS27MenuBarItemProvider.menuBarItems(
+                sourcePIDs: sourcePIDs, namespaces: namespaces, on: displayID, context: context
+            )
+            guard let refreshedItems = before.completeValue, !Task.isCancelled else { return CaptureResult(isComplete: false) }
             let refreshedByTag = Dictionary(
                 refreshedItems.map { ($0.tag, $0) },
                 uniquingKeysWith: { current, _ in current }
             )
             let liveItems = capturable.compactMap { refreshedByTag[$0.tag] }
-            if let capture = await ScreenCapture.captureMenuBarDisplayStrip(displayID: displayID),
+            if let capture = await ScreenCapture.captureMenuBarDisplayStrip(displayID: displayID, userInitiated: userInitiatedPreview, isCurrent: isCurrent),
                 isPlausibleMacOS27Capture(capture) {
                 // A drag can occur while the screenshot is being produced.
                 // Only associate pixels with an item whose frame stayed put.
-                let afterCapture = await Task.detached(priority: .userInitiated) {
-                    MacOS27MenuBarItemProvider.menuBarItems(sourcePIDs: sourcePIDs, namespaces: namespaces)
-                }.value
-                let stableItems = liveItems.filter { item in
-                    afterCapture.first(matching: item.tag)?.bounds == item.bounds &&
-                        MacOS27MenuBarItemProvider.nativeHitMatches(item)
+                let after = await MacOS27MenuBarItemProvider.menuBarItems(
+                    sourcePIDs: sourcePIDs, namespaces: namespaces, on: displayID, context: context
+                )
+                guard let afterCapture = after.completeValue, !Task.isCancelled else { return CaptureResult(isComplete: false) }
+                var stableItems = [MenuBarItem]()
+                for item in liveItems {
+                    guard !Task.isCancelled, context.termination == nil else { return CaptureResult(isComplete: false) }
+                    // Retain the existing exact physical-hit check; yield
+                    // between probes and reject its result after cancellation.
+                    let matches = await MainActor.run { MacOS27MenuBarItemProvider.nativeHitMatches(item) }
+                    guard !Task.isCancelled, context.termination == nil else { return CaptureResult(isComplete: false) }
+                    if !matches { result.invalidatedTags.insert(item.tag) }
+                    if matches && afterCapture.first(matching: item.tag)?.bounds == item.bounds { stableItems.append(item) }
+                    await Task.yield()
                 }
-                result.invalidatedTags.formUnion(liveItems.filter {
-                    !MacOS27MenuBarItemProvider.nativeHitMatches($0)
-                }.map(\.tag))
                 appendMacOS27Crops(
                     for: stableItems, from: capture, into: &result
                 )
             }
+            guard !Task.isCancelled, context.termination == nil else { return CaptureResult(isComplete: false) }
         }
 
         // Never substitute an application icon or a guessed symbol for the
@@ -402,35 +405,56 @@ final class MenuBarItemImageCache: ObservableObject {
     /// Updates the cache for the given sections, without checking whether
     /// caching is necessary.
     @MainActor
-    func updateCacheWithoutChecks(sections: [MenuBarSection.Name]) async {
-        guard !Task.isCancelled else { return }
-        pendingSections.formUnion(sections)
-        guard !isUpdating else { return }
-        isUpdating = true
+    @discardableResult
+    func updateCacheWithoutChecks(sections: [MenuBarSection.Name], userInitiatedPreview: Bool = false) async -> Bool {
+        if #available(macOS 27.0, *), !userInitiatedPreview { return false }
+        guard !Task.isCancelled else { return false }
+        guard refreshQueue.request(Set(sections)) else { return false }
+        var succeeded = false
+        let updateGeneration = capturePublicationGeneration
         defer {
-            isUpdating = false
-            pendingSections.removeAll()
+            let remaining = refreshQueue.finish()
+            if !remaining.isEmpty {
+                Task { @MainActor [weak self] in
+                    await self?.updateCacheWithoutChecks(sections: Array(remaining), userInitiatedPreview: userInitiatedPreview)
+                }
+            }
         }
-        // Activation, Layout appearance and the timer share one capture. A
-        // request that arrives during it is coalesced into the next pass.
-        while !pendingSections.isEmpty, !Task.isCancelled {
-            let requested = Array(pendingSections)
-            pendingSections.removeAll()
-            await captureAndUpdate(sections: requested)
+        // A later session is handed to a fresh task after this owner exits.
+        while !refreshQueue.pending.isEmpty, !Task.isCancelled,
+            updateGeneration == capturePublicationGeneration {
+            let requested = Array(refreshQueue.takePending())
+            let task = Task { @MainActor in await self.captureAndUpdate(sections: requested, userInitiatedPreview: userInitiatedPreview) }
+            activeCaptureTask = task
+            let passSucceeded = await withTaskCancellationHandler {
+                await task.value
+            } onCancel: {
+                task.cancel()
+            }
+            succeeded = passSucceeded || succeeded
+            activeCaptureTask = nil
         }
+        return !Task.isCancelled && succeeded
     }
 
     @MainActor
-    private func captureAndUpdate(sections: [MenuBarSection.Name]) async {
+    func cancelLayoutReads() {
+        capturePublicationGeneration &+= 1
+        activeCaptureTask?.cancel()
+        refreshQueue.cancelPending()
+    }
+
+    @MainActor
+    private func captureAndUpdate(sections: [MenuBarSection.Name], userInitiatedPreview: Bool) async -> Bool {
         guard let appState else {
-            return
+            return false
         }
 
         guard
             let displayID = appState.itemManager.itemCache.displayID,
             let screen = NSScreen.screens.first(where: { $0.displayID == displayID })
         else {
-            return
+            return false
         }
 
         let scale = screen.backingScaleFactor
@@ -438,20 +462,32 @@ final class MenuBarItemImageCache: ObservableObject {
         var invalidatedTags = Set<MenuBarItemTag>()
         let controller = appState.menuBarManager.macOS27Controller
         let generation = controller.interactionGeneration
+        let captureGeneration = capturePublicationGeneration
 
         if #available(macOS 27.0, *) {
-            guard controller.isLayoutEditing, !controller.isReorderInProgress else { return }
+            guard controller.isLayoutEditing, !controller.isReorderInProgress else { return false }
             let allItems = sections.flatMap { section in
                 appState.itemManager.itemCache.managedItems(for: section)
             }
             let result = await captureMacOS27Images(
                 of: allItems,
-                displayID: displayID
+                displayID: displayID,
+                userInitiatedPreview: userInitiatedPreview,
+                isCurrent: { [weak self] in
+                    guard let self else { return false }
+                    return controller.isLayoutEditing && !controller.isReorderInProgress
+                        && controller.interactionGeneration == generation
+                        && self.capturePublicationGeneration == captureGeneration
+                        && appState.itemManager.itemCache.displayID == displayID
+                        && appState.menuBarManager.isSettingsWindowVisible
+                        && appState.navigationState.settingsNavigationIdentifier == .menuBarLayout
+                }
             )
+            guard result.isComplete, !Task.isCancelled else { return false }
             newImages = result.images
             invalidatedTags = result.invalidatedTags
         } else {
-            guard appState.hasPermission(.screenRecording) else { return }
+            guard appState.hasPermission(.screenRecording) else { return false }
 
             for section in sections {
                 guard !appState.itemManager.itemCache[section].isEmpty else {
@@ -469,10 +505,11 @@ final class MenuBarItemImageCache: ObservableObject {
             }
         }
 
-        guard !Task.isCancelled, appState.itemManager.itemCache.displayID == displayID else { return }
+        guard !Task.isCancelled, captureGeneration == capturePublicationGeneration,
+            appState.itemManager.itemCache.displayID == displayID else { return false }
         if #available(macOS 27.0, *) {
             guard controller.isLayoutEditing, !controller.isReorderInProgress,
-                controller.interactionGeneration == generation else { return }
+                controller.interactionGeneration == generation else { return false }
         }
         let validTags = Set(appState.itemManager.itemCache.managedItems.map(\.tag))
         var updatedImages = images.filter {
@@ -490,6 +527,7 @@ final class MenuBarItemImageCache: ObservableObject {
         if updatedImages != images {
             images = updatedImages
         }
+        return !newImages.isEmpty
     }
 
     /// Updates the cache for the given sections, if necessary.

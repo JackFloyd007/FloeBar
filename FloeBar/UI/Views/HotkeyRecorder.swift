@@ -24,6 +24,7 @@ struct HotkeyRecorder<Label: View>: View {
         } label: {
             label
         }
+        .onDisappear { model.stopRecording() }
         .alert(
             "Hotkey is reserved by macOS",
             isPresented: $model.isPresentingSystemReservedError
@@ -112,16 +113,14 @@ struct HotkeyRecorder<Label: View>: View {
             .resizable()
             .aspectRatio(1, contentMode: .fit)
             .padding(padding)
-            .accessibilityLabel(label)
+            .accessibilityLabel(LocalizedStringKey(label))
     }
 }
 
 // MARK: - HotkeyRecorderModel
 
 @MainActor
-private final class HotkeyRecorderModel: ObservableObject {
-    @EnvironmentObject private var appState: AppState
-
+final class HotkeyRecorderModel: ObservableObject {
     @Published private(set) var isRecording = false
 
     @Published var isPresentingSystemReservedError = false
@@ -150,6 +149,12 @@ private final class HotkeyRecorderModel: ObservableObject {
             .sink { [weak self] in
                 self?.objectWillChange.send()
             }
+            .store(in: &c)
+
+        NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)
+            .merge(with: NotificationCenter.default.publisher(for: NSWindow.willCloseNotification))
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.stopRecording() }
             .store(in: &c)
 
         cancellables = c
