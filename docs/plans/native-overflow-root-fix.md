@@ -705,7 +705,7 @@ Developer ID Application。导入-25294为目标钥匙串不存在；证书公�
 - [x] 官方2.8 generate_appcast生成单一全量更新，精确tag URL/1367/最低14.0/字节数/
   Ed签名均核对。原生SUAppcast+稳定频道/OS过滤+bestItem从1330选择1367，1test0failure。
   工具副本只改缓存路径以留在外置SSD；未修改发行框架或放宽信任校验。
-- [ ] 将精确发行源码推至GitHub、发布tag/ZIP/appcast/SHA256、核对公网latest更新源
+- [x] 将精确发行源码推至GitHub、发布tag/ZIP/appcast/SHA256、核对公网latest更新源
   与本地已验证字节一致。延续现有发布授权，不另发开发包。
 
 root唯一writer，release_review独立只读分析Sparkle信任/安装/发现原链。实际模型/
@@ -713,3 +713,9 @@ effort未提供，unknown；首次全流程非成功：钥匙串时间戳重试�
 旧工程10.13与Xcode27部署范围、NSData工厂拼写有返工，生产逻辑无新增修补。回归及
 实机复用不变代码已有证据；最终耗时及GitHub结果续记build/release-1367发行收据，
 token/cost unknown。旧系统、多屏等原覆盖限制保留。
+
+最终发布：v0.13.0-macos27.38标记Latest，精确源码4d8220b；本次云端Regression checks
+通过，未变Swift代码沿用此前严格lint通过证据。公网ZIP/appcast/SHA256SUMS重新下载
+与本地已验证资产逐字节一致，latest/download/appcast.xml指向1367。公开源码tag也已
+只读核对并拉取，工作包与source tag一致。证据public-verification.json与原生测试结果
+保留build/release-1367；未启动、替换或安装到用户当前运行目录。
