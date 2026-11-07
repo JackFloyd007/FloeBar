@@ -670,3 +670,12 @@ untracked文件已保全至 `build/release-closeout-20261107/before.tar.gz`，�
 本轮root唯一文档写入、release_review独立只读审查；实际root/审查模型与effort运行时
 未提供，记录unknown。回归/lint首跑通过；命令行认证失败后切换连接器，非全流程首试
 成功。墙钟耗时续记本目录closeout证据；token/cost unknown。未新增生产逻辑或修改TCC。
+
+云端首跑续接：源码已由a270b29进入main，本地树与远端树完全一致。CI旧Swift5容器
+报告15条lint错误，而本机0.65.1为0；改为官方0.65.1 portable包、固定官方SHA256并
+显式检查版本，保留原strict规则。纯回归云端在InstallationProof fixture顶层deadline
+失败；原fixture把健康重试也限制到60ms，并用固定150ms sleep假设worker仍未完成。
+改为有界信号量握手、健康重试2s、overlap默认12s及有界harness等待。60ms真超时、
+所有completionBudget数值边界、未完成slot占位/旧waiter隔离/最多两个worker断言均
+保留，生产12s门禁及源码不变。定向fixture重编译/运行通过；再次云端验证继续跟进，
+不把首轮失败记录改写为通过。CI完整app/XPC构建仍未新增。

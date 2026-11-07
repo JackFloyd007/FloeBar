@@ -49,15 +49,25 @@ struct SystemAppInstallationProofTests {
         // A late completed timeout is discarded before lookup: one new call,
         // rather than a third user attempt, starts a genuinely fresh proof.
         let lateCount = ProofCounter()
-        let late = P(deadline: 0.06, inspect: { request, _, _ in
+        let lateGate = DispatchSemaphore(value: 0)
+        let late = P(deadline: 2, inspect: { request, _, _ in
             let call = lateCount.begin(); defer { lateCount.end() }
-            Thread.sleep(forTimeInterval: call == 1 ? 0.15 : 0.001)
+            if call == 1 {
+                guard lateGate.wait(timeout: .now() + 30) == .success else { throw P.Failure.unavailable }
+            }
             return P.Receipt(binding: request.expected!, stamp: "late-retry")
         })
-        do { _ = try await late.verify(request, fresh: true); preconditionFailure() } catch P.Failure.deadline {} catch { preconditionFailure() }
+        let lateFirst = Task { try await late.verify(request, fresh: true) }
+        let beganDeadline = ContinuousClock.now.advanced(by: .seconds(12))
+        while lateCount.counts.0 == 0 {
+            precondition(ContinuousClock.now < beganDeadline)
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        do { _ = try await lateFirst.value; preconditionFailure() } catch P.Failure.deadline {} catch { preconditionFailure() }
         do { _ = try await late.verify(request, fresh: true); preconditionFailure() } catch P.Failure.deadline {} catch { preconditionFailure() }
         precondition(lateCount.counts.0 == 1, "unfinished expired work still occupies its slot")
-        let lateDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        lateGate.signal()
+        let lateDeadline = ContinuousClock.now.advanced(by: .seconds(12))
         while late.unfinishedWorkerCount != 0 {
             precondition(ContinuousClock.now < lateDeadline)
             try await Task.sleep(for: .milliseconds(5))
@@ -69,13 +79,14 @@ struct SystemAppInstallationProofTests {
         let counts = ProofCounter()
         let firstGate = DispatchSemaphore(value: 0)
         let restGate = DispatchSemaphore(value: 0)
-        let overlap = P(deadline: 2, inspect: { request, _, _ in
+        let overlap = P(inspect: { request, _, _ in
             let call = counts.begin(); defer { counts.end() }
-            if call == 1 { firstGate.wait() } else { restGate.wait() }
+            let gate = call == 1 ? firstGate : restGate
+            guard gate.wait(timeout: .now() + 30) == .success else { throw P.Failure.unavailable }
             return P.Receipt(binding: request.expected!, stamp: "overlap")
         })
         func waitForCalls(_ target: Int) async throws {
-            let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+            let deadline = ContinuousClock.now.advanced(by: .seconds(12))
             while counts.counts.0 < target {
                 precondition(ContinuousClock.now < deadline)
                 try await Task.sleep(for: .milliseconds(1))
@@ -84,7 +95,7 @@ struct SystemAppInstallationProofTests {
         let first = Task { try await overlap.verify(request, fresh: true) }
         try await waitForCalls(1)
         firstGate.signal()
-        let overlapDeadline = ContinuousClock.now.advanced(by: .seconds(1))
+        let overlapDeadline = ContinuousClock.now.advanced(by: .seconds(12))
         while overlap.unfinishedWorkerCount != 0 {
             precondition(ContinuousClock.now < overlapDeadline)
             try await Task.sleep(for: .milliseconds(1))
