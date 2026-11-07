@@ -23,9 +23,9 @@ menu bar without replacing the native macOS experience.
 > with or endorsed by the upstream project. See [NOTICE.md](NOTICE.md) for full
 > attribution.
 
-## Current development build 1366
+## Version 0.13.0-macos27.38
 
-Build `0.13.0-macos27.37-dev (1366)` fixes native drag ordering, application
+Build `0.13.0-macos27.38 (1367)` fixes native drag ordering, application
 visibility and recovery on macOS 27. After explicitly authorizing the system
 menu bar preferences file, you can select supported third-party applications
 to hide or show. FloeBar validates system ownership and installation identity,
@@ -40,10 +40,11 @@ the legacy backend. Private assertion hiding remains disabled on every launch.
 
 The [implementation and acceptance record](docs/plans/native-overflow-root-fix.md)
 includes real mouse dragging, repeated WPS hide/show and normal/crash recovery.
-This build uses local Apple Development signing and is not notarized. A public
-automatic update is pending Developer ID signing, notarization and the release
-checks in [distribution](docs/distribution.md); GitHub's latest release remains
-the previous public version until those checks pass.
+The universal release is Developer ID signed, notarized by Apple and stapled.
+Its Sparkle signing key is rotated through the existing Developer ID team;
+native update validation and file installation from the published 1330 release
+were checked on isolated copies, including rejection of an invalid signature.
+See [distribution](docs/distribution.md) for signing and update requirements.
 
 ## Install
 
@@ -80,7 +81,7 @@ Permissions stay on the Mac and can be revoked at any time in System Settings.
 
 ## Compatibility
 
-**macOS 27 (development build 1366):** supported third-party applications can
+**macOS 27 (build 1367):** supported third-party applications can
 be hidden through explicitly authorized system preferences. System-declared
 groups are controlled together; unsupported or ambiguous ownership is rejected.
 The system chevron remains. See the

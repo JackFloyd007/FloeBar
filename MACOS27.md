@@ -1,6 +1,6 @@
 # macOS 27 native interaction
 
-Current development version: `0.13.0-macos27.37-dev (1366)`.
+Current version: `0.13.0-macos27.38 (1367)`.
 
 **Current behavior:** explicitly authorized system menu bar preferences support
 hide/show for verified third-party applications and system-declared application
@@ -15,9 +15,12 @@ assertions stay disabled on launch. No Apple-item exception is enabled.
 
 The [current plan and acceptance record](docs/plans/native-overflow-root-fix.md)
 documents real mouse sorting, repeated WPS control, normal/crash recovery and
-remaining coverage limits. The unchanged 1366 source and local Apple Development
-package passed the recorded checks; public distribution is pending Developer ID
-signing, Apple notarization, Sparkle signing and previous-release update validation.
+remaining coverage limits. The accepted 1366 application logic is unchanged in
+1367. The universal Release archive is Developer ID signed, notarized by Apple
+and stapled. Native Sparkle validation and file installation from a copy of
+public build 1330 passed with the rotated update key, including rejection of an
+invalid signature. This does not extend the recorded real-device coverage to
+older macOS or multiple displays.
 The records below are historical and do not describe the current normal backend.
 
 ## Historical 1333 and earlier records

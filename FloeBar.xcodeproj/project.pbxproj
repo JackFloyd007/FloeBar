@@ -421,7 +421,7 @@
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1366;
+				CURRENT_PROJECT_VERSION = 1367;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_ASSET_PATHS = "";
 				ENABLE_APP_SANDBOX = NO;
@@ -437,7 +437,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = "0.13.0-macos27.37-dev";
+				MARKETING_VERSION = "0.13.0-macos27.38";
 				PRODUCT_BUNDLE_IDENTIFIER = io.github.jackfloyd007.IceEric;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_OBJC_BRIDGING_HEADER = "FloeBar/FloeBar-Bridging-Header.h";
@@ -456,7 +456,7 @@
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Developer ID Application";
 				CODE_SIGN_STYLE = Manual;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1366;
+				CURRENT_PROJECT_VERSION = 1367;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_ASSET_PATHS = "";
 				ENABLE_APP_SANDBOX = NO;
@@ -472,7 +472,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = "0.13.0-macos27.37-dev";
+				MARKETING_VERSION = "0.13.0-macos27.38";
 				PRODUCT_BUNDLE_IDENTIFIER = io.github.jackfloyd007.IceEric;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_OBJC_BRIDGING_HEADER = "FloeBar/FloeBar-Bridging-Header.h";

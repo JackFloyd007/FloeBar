@@ -679,3 +679,37 @@ untracked文件已保全至 `build/release-closeout-20261107/before.tar.gz`，�
 所有completionBudget数值边界、未完成slot占位/旧waiter隔离/最多两个worker断言均
 保留，生产12s门禁及源码不变。定向fixture重编译/运行通过；再次云端验证继续跟进，
 不把首轮失败记录改写为通过。CI完整app/XPC构建仍未新增。
+
+### 2026-11-07 · 正式自动更新包 1367
+
+用户继续授权配置签名/公证并正式发布。App Store Connect只读确认当前账号同时是
+账户持有人与管理，Developer门户team=JD8S6QP43G、会员有效；此前仅凭Xcode的Admin
+推断非持有人不准确，已向用户纠正。用户在本机生成RSA2048 CSR并经Apple签发新
+Developer ID Application。导入-25294为目标钥匙串不存在；证书公钥与本机CSR完全
+一致后，明确导入现有login钥匙串，得到有效身份。notarytool FloeBar配置由用户亲自
+生成专用密码并隐藏输入，本轮只验证请求成功，不读取/导出其密码或私钥。
+
+- [x] 保全1366旧包与所有证据，版本递增至0.13.0-macos27.38 (1367)。双架构Release
+  archive与Developer ID export通过，主app/XPC均arm64+x86_64；生产Swift/ObjC逻辑
+  不变。首轮签名长期等待安全服务后报时间戳差279s；保留失败结果，重试成功。
+- [x] 导出程序满足公开1330原始designated requirement。原Ice_eric更新私钥缺失，
+  用户确认无备份并授权此验证后按官方机制轮换；新独立账号FloeBar-release-20261107
+  私钥只存本机钥匙串，新公钥嵌入源码并再次归档导出，不覆盖历史钥匙。
+- [x] Apple公证Accepted：f624d568-a99e-4563-a3ca-96b2939852bc；staple/validate、
+  deep strict all-arch及spctl Notarized Developer ID均通过。最终ZIP 6781163字节，
+  SHA256 cfed9a35d2de79a9de9e4dca48c580a2f2f7c08c9ef747f0bc024844fd6f4faa。
+- [x] 在独立Sparkle2.8官方hostless XCTest中跑真实SUUpdateValidator：旧DR接受新签名，
+  旧Ed公钥拒绝新签名、新公钥验同ZIP通过、全零坏签名拒绝；真实SUPlainInstaller仅
+  将build下1330副本更新1367，并核对新公钥与签名。未启动旧/新FloeBar或改变现用
+  defaults/TCC/隐藏journal；不声称覆盖当前用户升级UI、退出与重启。
+- [x] 官方2.8 generate_appcast生成单一全量更新，精确tag URL/1367/最低14.0/字节数/
+  Ed签名均核对。原生SUAppcast+稳定频道/OS过滤+bestItem从1330选择1367，1test0failure。
+  工具副本只改缓存路径以留在外置SSD；未修改发行框架或放宽信任校验。
+- [ ] 将精确发行源码推至GitHub、发布tag/ZIP/appcast/SHA256、核对公网latest更新源
+  与本地已验证字节一致。延续现有发布授权，不另发开发包。
+
+root唯一writer，release_review独立只读分析Sparkle信任/安装/发现原链。实际模型/
+effort未提供，unknown；首次全流程非成功：钥匙串时间戳重试，独立夹具只读副本权限、
+旧工程10.13与Xcode27部署范围、NSData工厂拼写有返工，生产逻辑无新增修补。回归及
+实机复用不变代码已有证据；最终耗时及GitHub结果续记build/release-1367发行收据，
+token/cost unknown。旧系统、多屏等原覆盖限制保留。
